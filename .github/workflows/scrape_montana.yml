@@ -1,0 +1,54 @@
+name: Scrape Montana Resorts
+
+on:
+  # schedule:
+  #   - cron: '0 14 * * *'  # 7 AM MT (14:00 UTC) - DISABLED until ski season
+  workflow_dispatch:  # Manual trigger only
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Create data directory
+      run: mkdir -p ~/snow_reports/data ~/snow_reports/logs
+      
+    - name: Set up OAuth credentials
+      env:
+        GMAIL_CREDENTIALS: ${{ secrets.GMAIL_CREDENTIALS_JSON }}
+        GMAIL_TOKEN: ${{ secrets.GMAIL_TOKEN_JSON }}
+      run: |
+        echo "$GMAIL_CREDENTIALS" > credentials.json
+        echo "$GMAIL_TOKEN" > token.json
+        
+    - name: Set up subscribers list
+      env:
+        SUBSCRIBER_EMAILS: ${{ secrets.SUBSCRIBER_EMAILS }}
+      run: |
+        echo "email,resorts" > ~/snow_reports/data/snow_report_subscribers.csv
+        echo "$SUBSCRIBER_EMAILS" >> ~/snow_reports/data/snow_report_subscribers.csv
+        
+    - name: Run scraper
+      env:
+        GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+        GMAIL_CREDENTIALS_PATH: credentials.json
+        GMAIL_TOKEN_PATH: token.json
+      run: python snow_report_scraper_oauth.py
+      
+    - name: Clean up credentials
+      if: always()
+      run: |
+        rm -f credentials.json token.json
