@@ -41,14 +41,21 @@ jobs:
         echo "email,resorts" > ~/snow_reports/data/snow_report_subscribers.csv
         echo "$SUBSCRIBER_EMAILS" >> ~/snow_reports/data/snow_report_subscribers.csv
         
-    - name: Run scraper
+    - name: Set up Firebase credentials
+      env:
+        FIREBASE_CREDS: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+      run: |
+        echo "$FIREBASE_CREDS" > firebase-service-account.json
+        
+    - name: Run scraper with Firebase
       env:
         GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
         GMAIL_CREDENTIALS_PATH: credentials.json
         GMAIL_TOKEN_PATH: token.json
-      run: python snow_report_scraper_oauth.py
+        FIREBASE_SERVICE_ACCOUNT: firebase-service-account.json
+      run: python run_scraper_with_firebase.py
       
     - name: Clean up credentials
       if: always()
       run: |
-        rm -f credentials.json token.json
+        rm -f credentials.json token.json firebase-service-account.json
