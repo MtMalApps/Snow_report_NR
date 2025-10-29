@@ -1,0 +1,18 @@
+# Core dependencies
+requests>=2.31.0
+pandas>=2.0.0
+beautifulsoup4>=4.12.0
+python-dotenv>=1.0.0
+
+# Gmail API (OAuth2)
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+google-api-python-client>=2.100.0
+
+# Optional: Firebase integration (uncomment when ready to use)
+# firebase-admin>=6.2.0
+
+# Development dependencies (optional)
+# pytest>=7.4.0
+# black>=23.0.0
