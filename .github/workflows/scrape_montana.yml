@@ -1,9 +1,9 @@
 name: Scrape Montana Resorts
 
 on:
-  # schedule:
-  #   - cron: '0 14 * * *'  # 7 AM MT (14:00 UTC) - DISABLED until ski season
-  workflow_dispatch:  # Manual trigger only
+  schedule:
+    - cron: '0 14 * * *'  # 7 AM MT (14:00 UTC) - DISABLED until ski season
+  workflow_dispatch:  # also allow manual trigger
 
 jobs:
   scrape:
