@@ -1,47 +1,72 @@
 #!/usr/bin/env python3
-"""Run scraper and upload to Firebase"""
-import subprocess
+"""
+Run scraper and upload to Firebase.
+Modified to upload data directly during scraping, not from CSV files.
+"""
 import sys
 import os
-import pandas as pd
 
-DATA_DIR = os.path.expanduser("~/snow_reports/data")
+# Import the scraper modules
+from snow_report_scraper_oauth import *
+import firebase_uploader
 
-print("Step 1: Running scraper...")
-result = subprocess.run([sys.executable, "snow_report_scraper_oauth.py"])
-
-if result.returncode != 0:
-    print("Scraper failed!")
-    sys.exit(1)
-
-print("\nStep 2: Uploading to Firebase...")
-try:
-    import firebase_uploader
+def main():
+    """Run scraper with Firebase uploads."""
     
-    if firebase_uploader.initialize_firebase():
-        # Read CSV files and upload
-        resorts = ['Snowbowl', 'Discovery', 'LookoutPass', 'BigMountain', 
-                   'LostTrail', 'TetonPass', 'Showdown', 'Blacktail']
+    # Initialize Firebase first
+    if not firebase_uploader.initialize_firebase():
+        print("⚠️ Firebase not available - continuing with email only")
+    
+    # Initialize scrapers
+    scrapers = [
+        SnowbowlScraper(),
+        DiscoveryScraper(),
+        LookoutPassScraper(),
+        BigMountainScraper(),
+        LostTrailScraper(),
+        TetonPassScraper(),
+        ShowdownScraper(),
+        BlacktailScraper(),
+    ]
+    
+    # Run scrapers and collect data
+    resort_data_list = []
+    for scraper in scrapers:
+        print(f"Fetching data for {scraper.resort_name}...")
+        snow_data = scraper.get_snow_report()
         
-        uploaded = 0
-        for resort in resorts:
-            csv_file = os.path.join(DATA_DIR, f"{resort}_snow_report.csv")
-            if os.path.exists(csv_file):
-                try:
-                    df = pd.read_csv(csv_file)
-                    # Upload the most recent row
-                    if not df.empty:
-                        latest_data = df.iloc[-1].to_dict()
-                        if firebase_uploader.save_resort_data_to_firestore(latest_data):
-                            uploaded += 1
-                except Exception as e:
-                    print(f"Error uploading {resort}: {e}")
+        if snow_data:
+            resort_data_list.append(snow_data)
+            scraper.save_to_csv(snow_data)
+            
+            # Upload to Firebase immediately
+            if firebase_uploader.db:
+                firebase_uploader.save_resort_data_to_firestore(snow_data)
+            
+            print(f"✅ {scraper.resort_name} complete")
+        else:
+            print(f"⚠️ No data for {scraper.resort_name}")
+    
+    # Send consolidated email report
+    if resort_data_list:
+        print("\n📧 Sending email report...")
+        gmail_address = os.environ.get('GMAIL_ADDRESS')
+        credentials_path = os.environ.get('GMAIL_CREDENTIALS_PATH', 'credentials.json')
+        token_path = os.environ.get('GMAIL_TOKEN_PATH', 'token.json')
         
-        print(f"\n✅ Uploaded {uploaded}/{len(resorts)} resorts to Firebase")
-    else:
-        print("⚠️  Firebase not configured")
+        messenger = EmailSnowReportMessenger(
+            gmail_address=gmail_address,
+            credentials_path=credentials_path,
+            token_path=token_path
+        )
         
-except Exception as e:
-    print(f"⚠️  Firebase upload skipped: {e}")
+        try:
+            messenger.send_consolidated_report(resort_data_list)
+            print("✅ Email sent successfully")
+        except Exception as e:
+            print(f"❌ Email failed: {e}")
+    
+    print("\n✅ Complete!")
 
-print("\n✅ Complete!")
+if __name__ == "__main__":
+    main()
