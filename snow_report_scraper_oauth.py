@@ -305,8 +305,12 @@ class BaseSnowReportScraper(ABC):
             df = df.drop_duplicates(subset='date', keep='last')
     
             # Convert datetime back to string for saving
-            df['date'] = df['date'].dt.strftime('%Y-%m-%d')
-            df['last_updated'] = df['last_updated'].dt.strftime('%Y-%m-%d %I:%M %p')
+
+            if pd.api.types.is_datetime64_any_dtype(df['date']):
+                df['date'] = df['date'].dt.strftime('%Y-%m-%d')
+            
+            if pd.api.types.is_datetime64_any_dtype(df['last_updated']):
+                df['last_updated'] = df['last_updated'].dt.strftime('%Y-%m-%d %I:%M %p')
     
             # Save to CSV
             df.to_csv(self.csv_filename, index=False, encoding='utf-8-sig')
@@ -342,6 +346,7 @@ class SnowbowlScraper(BaseSnowReportScraper):
                 comment_pattern = r''
                 polling_data = re.search(comment_pattern, response.text, re.DOTALL)
                 
+                if polling_data:
                 if polling_data:
                     data_string = polling_data.group(1)
                     pairs = data_string.split('|~')
