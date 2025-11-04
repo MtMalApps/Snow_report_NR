@@ -346,7 +346,7 @@ class SnowbowlScraper(BaseSnowReportScraper):
                 comment_pattern = r''
                 polling_data = re.search(comment_pattern, response.text, re.DOTALL)
                 
-                if polling_data:
+
                 if polling_data:
                     data_string = polling_data.group(1)
                     pairs = data_string.split('|~')
