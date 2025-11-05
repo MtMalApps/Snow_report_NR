@@ -35,6 +35,7 @@ from nws_storm_outlook_v3 import NWSStormOutlook
 from googleapiclient.errors import HttpError
 
 
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -1313,24 +1314,30 @@ class EmailSnowReportMessenger:
         return name_map.get(resort_name, resort_name)
 
     def _check_powder_alert(self, resort_data_list: List[Dict]) -> bool:
-        """Check if any resort has powder alert worthy snow."""
-        today = datetime.now().date()
-        for resort_data in resort_data_list:
-            last_updated_str = resort_data.get('last_updated', '')
-            if not last_updated_str:
-                continue
-            last_updated_date = None
-            if last_updated_str:
-                for fmt in ('%Y-%m-%d %I:%M %p', '%Y-%m-%d %H:%M %p'):
-                    try:
-                        last_updated_date = datetime.strptime(last_updated_str, fmt).date()
-                        break
-                    except ValueError:
-                        continue
-            if last_updated_date and (today - last_updated_date).days <= 1:
-                if self.get_24hr_snow(resort_data) >= POWDER_ALERT_THRESHOLD:
-                    return True
-        return False
+            """Check if any resort has powder alert worthy snow."""
+            today = datetime.now().date()
+            for resort_data in resort_data_list:
+                last_updated_str = resort_data.get('last_updated', '')
+                if not last_updated_str:
+                    continue
+                last_updated_date = None
+                if last_updated_str:
+                    for fmt in ('%Y-%m-%d %I:%M %p', '%Y-%m-%d %H:%M %p'):
+                        try:
+                            last_updated_date = datetime.strptime(last_updated_str, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                
+                # --- THIS IS THE FIX ---
+                # It now checks if the date is EXACTLY today.
+                is_current = last_updated_date == today if last_updated_date else False
+    
+                if is_current:
+                # --- END OF FIX ---
+                    if self.get_24hr_snow(resort_data) >= POWDER_ALERT_THRESHOLD:
+                        return True # Found a current powder day, no need to check others
+            return False
         
     
     # -------------------------------------------------------------------------
@@ -1428,6 +1435,14 @@ class EmailSnowReportMessenger:
                 today = datetime.now()
                 title = "POWDER ALERT - Daily Snow Report" if is_powder_alert else "Daily Snow Report"
                 
+                # --- THIS IS THE FIX ---
+                # Create the date string for the visible badge
+                date_string = today.strftime('%A, %B %d, %Y')
+                
+                # This is a zero-width non-joiner. It's an invisible character
+                # that "fills" the preheader space, stopping Gmail from previewing the body.
+                preheader_text = "&zwnj;&nbsp;"
+                
                 return f"""<!DOCTYPE html>
         <html lang="en">
         <head>
@@ -1484,7 +1499,7 @@ class EmailSnowReportMessenger:
         </head>
         <body style="margin:0; padding:0; background:{EmailTheme.BG_OUTER}; color:{EmailTheme.BG_OUTER};">
           <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent; mso-hide:all;">
-            Northern Rockies daily snow report – sortable summary, powder alerts, and per‑resort details.
+            {preheader_text}
           </div>
           <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:{EmailTheme.BG_OUTER};">
             <tr>
@@ -1500,7 +1515,7 @@ class EmailSnowReportMessenger:
                           </td>
                           <td class="stack center-sm" style="vertical-align:middle; text-align:right;">
                             <span style="display:inline-block; background:{EmailTheme.BG_OUTER}; color:{EmailTheme.ACCENT_BLUE}; font-family:Arial, Helvetica, sans-serif; font-size:12px; padding:8px 12px; border-radius:999px; border:1px solid {EmailTheme.DATE_BADGE_BORDER};">
-                              {today.strftime('%A, %B %d, %Y')}
+                              {date_string}
                             </span>
                           </td>
                         </tr>
@@ -1508,7 +1523,6 @@ class EmailSnowReportMessenger:
                     </td>
                   </tr>
         """
-
 
     # -------------------------------------------------------------------------
     # HTML GENERATION - Powder Alert
@@ -1532,8 +1546,12 @@ class EmailSnowReportMessenger:
                     except ValueError:
                         continue
                 
-                # Check if data is from today or yesterday
-                if last_updated_date and (today - last_updated_date).days <= 1:
+                # --- THIS IS THE FIX ---
+                # It now checks if the date is EXACTLY today.
+                is_current = last_updated_date == today if last_updated_date else False
+                
+                if is_current:
+                # --- END OF FIX ---
                     snow_amount = self.get_24hr_snow(resort_data)
                     if snow_amount >= POWDER_ALERT_THRESHOLD:
                         powder_resorts.append({
@@ -1569,7 +1587,7 @@ class EmailSnowReportMessenger:
                 </td>
               </tr>
             """
-    
+        
     # -------------------------------------------------------------------------
     # HTML GENERATION - SUMMARY TABLE WITH CHARTS
     # -------------------------------------------------------------------------
@@ -2162,104 +2180,119 @@ class EmailSnowReportMessenger:
     # EMAIL SENDING
     # -------------------------------------------------------------------------
     def send_consolidated_report(self, resort_data_list: List[Dict]):
-        """Send consolidated snow report email via Gmail API OAuth2."""
-        if not os.path.exists(self.subscribers_file):
-            print(f"No subscribers file found at {self.subscribers_file}")
-            return
-        try:
-            subscribers_df = pd.read_csv(self.subscribers_file)
-            recipients = subscribers_df['email'].tolist()
-        except Exception as e:
-            print(f"Error reading subscribers: {e}")
-            return
-        if not recipients:
-            print("No subscribers found")
-            return
-        
-        # Sort resorts
-        sorted_resorts = sorted(resort_data_list, key=self.get_master_sort_key)
-        
-        # Check powder alert
-        is_powder_alert = self._check_powder_alert(sorted_resorts)
-        
-        # Build NWS outlooks
-        snotel = SNOTELDataFetcher()
-        nws_outlooks = []
-        for resort_data in sorted_resorts:
-            resort_name = resort_data["resort"]
-            coords = RESORT_COORDS.get(resort_name)
-            if coords:
-                try:
-                    outlook = self.nws_outlook.get_outlook(coords["lat"], coords["lon"])
-                    nws_outlooks.append({"resort_name": resort_name, "outlook": outlook})
-                except Exception:
-                    nws_outlooks.append({"resort_name": resort_name, "outlook": None})
-                time.sleep(0.3)
-            else:
-                nws_outlooks.append({"resort_name": resort_name, "outlook": None})
-        
-        # Build email HTML
-        email_html = self._build_email_html(sorted_resorts, snotel, is_powder_alert, nws_outlooks)
-        
-        # === DEBUG: write out the EXACT html we are about to send ===
-        debug_path = os.path.expanduser("~/email_last_sent.html")
-        with open(debug_path, "w", encoding="utf-8") as f:
-            f.write(email_html)
-        print("EMAIL DEBUG | Theme CHART_COLORS:", EmailTheme.CHART_COLORS)
-        print("EMAIL DEBUG | Wrote exact outgoing HTML to:", debug_path)
-        
-        # Subject
-        if is_powder_alert:
-            max_snow = max(self.get_24hr_snow(r) for r in sorted_resorts)
-            best_resort = max(sorted_resorts, key=lambda x: self.get_24hr_snow(x))['resort']
-            subject = f"POWDER ALERT: {int(max_snow)}\" at {self._get_display_name(best_resort)} - Daily Snow Report (ColorTest {datetime.now().strftime('%H%M%S')})"
-        else:
-            subject = f"Daily Snow Report (ColorTest {datetime.now().strftime('%H%M%S')})"
-        
-        # Gmail API send
-        try:
-            creds = None
-            if os.path.exists(self.token_path):
-                creds = Credentials.from_authorized_user_file(self.token_path)
+            """
+            Send consolidated snow report email via Gmail API OAuth2.
+            (PRODUCTION-SAFE: Use this in your GitHub script)
+            """
+            if not os.path.exists(self.subscribers_file):
+                print(f"No subscribers file found at {self.subscribers_file}")
+                return
+            try:
+                subscribers_df = pd.read_csv(self.subscribers_file)
+                recipients = subscribers_df['email'].tolist()
+            except Exception as e:
+                print(f"Error reading subscribers: {e}")
+                return
+            if not recipients:
+                print("No subscribers found")
+                return
             
-            if not creds or not creds.valid:
-                if creds and creds.expired and creds.refresh_token:
-                    creds.refresh(Request())
-                    with open(self.token_path, 'w') as token:
-                        token.write(creds.to_json())
+            # Sort resorts
+            sorted_resorts = sorted(resort_data_list, key=self.get_master_sort_key)
+            
+            # Check powder alert
+            is_powder_alert = self._check_powder_alert(sorted_resorts)
+            
+            # Build NWS outlooks
+            snotel = SNOTELDataFetcher()
+            nws_outlooks = []
+            for resort_data in sorted_resorts:
+                resort_name = resort_data["resort"]
+                coords = RESORT_COORDS.get(resort_name)
+                if coords:
+                    try:
+                        outlook = self.nws_outlook.get_outlook(coords["lat"], coords["lon"])
+                        nws_outlooks.append({"resort_name": resort_name, "outlook": outlook})
+                    except Exception:
+                        nws_outlooks.append({"resort_name": resort_name, "outlook": None})
+                    time.sleep(0.3)
                 else:
-                    raise ValueError("OAuth credentials invalid. Please re-authenticate.")
+                    nws_outlooks.append({"resort_name": resort_name, "outlook": None})
             
-            service = build('gmail', 'v1', credentials=creds)
+            # Build email HTML
+            email_html = self._build_email_html(sorted_resorts, snotel, is_powder_alert, nws_outlooks)
             
-            message = MIMEMultipart('alternative')
-            message['Subject'] = subject
-            message['From'] = self.gmail_address
-            message['To'] = ', '.join(recipients)
+            # === DEBUG: write out the EXACT html we are about to send ===
+            debug_path = os.path.expanduser("~/email_last_sent.html")
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(email_html)
+            print("EMAIL DEBUG | Theme CHART_COLORS:", EmailTheme.CHART_COLORS)
+            print("EMAIL DEBUG | Wrote exact outgoing HTML to:", debug_path)
             
-            html_part = MIMEText(email_html, 'html')
-            message.attach(html_part)
-            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+
+            # Create the date string here
+            date_string = datetime.now().strftime('%A, %B %d, %Y')
+    
+            # Subject
+            if is_powder_alert:
+                max_snow = max(self.get_24hr_snow(r) for r in sorted_resorts)
+                best_resort = max(sorted_resorts, key=lambda x: self.get_24hr_snow(x))['resort']
+                # Add the date string to the subject
+                subject = f"POWDER ALERT: {int(max_snow)}\" at {self._get_display_name(best_resort)} - {date_string}"
+            else:
+                # Add the date string to the subject
+                subject = f"Daily Snow Report - {date_string}"
+            # --- END OF FIX ---
             
-            service.users().messages().send(userId='me', body={'raw': raw_message}).execute()
-            
-            print(f"Report sent successfully to {len(recipients)} recipients")
-        except HttpError as error:
-            print(f"Gmail API error: {error}")
-        except Exception as e:
-            print(f"Error sending email: {e}")
-# -----------------------------------------------------------------------------
-# Email color and theme constants for snow/weather HTML reports
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# Email color and theme constants for snow/weather HTML reports
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# Email color and theme constants for snow/weather HTML reports
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# Email color and theme constants for snow/weather HTML reports (v7 palette)
-# -----------------------------------------------------------------------------
+            # Gmail API send
+            try:
+                creds = None
+                SCOPES = ['https://www.googleapis.com/auth/gmail.send'] # Define scope
+                
+                if os.path.exists(self.token_path):
+                    creds = Credentials.from_authorized_user_file(self.token_path, SCOPES)
+                
+                # --- PRODUCTION-SAFE AUTH LOGIC ---
+                if not creds or not creds.valid:
+                    if creds and creds.expired and creds.refresh_token:
+                        print("Refreshing expired token...")
+                        creds.refresh(Request())
+                        # Save the refreshed token back to the file
+                        with open(self.token_path, 'w') as token:
+                            token.write(creds.to_json())
+                    else:
+                        # If there's no token or no refresh_token, it MUST fail.
+                        # It cannot ask the user to log in.
+                        print(f"FATAL: No valid token.json found at {self.token_path}")
+                        print("This script must be run with a valid token.json file.")
+                        print("Please generate one locally and add it to GitHub Secrets.")
+                        return # <-- This "return" is the important part
+                # --- END OF PRODUCTION-SAFE LOGIC ---
+    
+                service = build('gmail', 'v1', credentials=creds)
+                
+                message = MIMEMultipart('alternative')
+                message['Subject'] = subject
+                message['From'] = self.gmail_address
+                message['To'] = ', '.join(recipients)
+                
+                html_part = MIMEText(email_html, 'html')
+                message.attach(html_part)
+                raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+                
+                service.users().messages().send(userId='me', body={'raw': raw_message}).execute()
+                
+                print(f"Report sent successfully to {len(recipients)} recipients")
+                
+            except HttpError as error:
+                print(f"Gmail API error: {error}")
+                # If the grant is invalid, the secret in GitHub is bad
+                if 'invalid_grant' in str(error):
+                    print("FATAL: invalid_grant. The token in GitHub Secrets is expired or revoked.")
+                    print("Please generate a new token.json locally and update the GMAIL_TOKEN_JSON secret.")
+            except Exception as e:
+                print(f"Error sending email: {e}")
+
 # =============================================================================
 # Email color and theme constants for snow/weather HTML reports (v7)
 # =============================================================================
