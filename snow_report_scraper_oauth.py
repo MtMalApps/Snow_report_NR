@@ -26,6 +26,7 @@ import logging
 import json
 from math import ceil
 import base64
+import sys
 import warnings  # to suppress Pandas warnings in output
 # Gmail API imports
 from google.auth.transport.requests import Request
@@ -83,51 +84,58 @@ def normalize_text(s: str) -> str:
 # =============================================================================
 # BASE SCRAPER CLASS
 # =============================================================================
+# =============================================================================
+# BASE SCRAPER CLASS
+# =============================================================================
 class BaseSnowReportScraper(ABC):
     """
     Abstract base class for ski resort snow report scrapers.
     All resort-specific scrapers inherit from this class.
     """
     
-    # Standardized schema - all scrapers must return these fields
+    # --- MODIFIED SECTION: Added nws_forecast and snotel_data ---
     STANDARD_COLUMNS = [
         # Core metadata
-        'resort',                 # Resort name
-        'date',                   # Date data were accessed (YYYY-MM-DD)
-        'timestamp',              # Time data were accessed (YYYY-MM-DD HH:MM:SS)
-        'last_updated',           # Resort's reported last update time
+        'resort',               # Resort name
+        'date',                 # Date data were accessed (YYYY-MM-DD)
+        'timestamp',            # Time data were accessed (YYYY-MM-DD HH:MM:SS)
+        'last_updated',         # Resort's reported last update time
         
         # Snowfall measurements (NEW SNOW)
-        'snow_overnight',         # Overnight snowfall (since lifts closed)
-        'snow_24h_base',          # 24-hour snowfall at base
-        'snow_24h_summit',        # 24-hour snowfall at summit
-        'snow_48h_base',          # 48-hour snowfall at base
-        'snow_48h_summit',        # 48-hour snowfall at summit
-        'snow_7day',              # 7-day snowfall total (for future)
+        'snow_overnight',       # Overnight snowfall (since lifts closed)
+        'snow_24h_base',        # 24-hour snowfall at base
+        'snow_24h_summit',      # 24-hour snowfall at summit
+        'snow_48h_base',        # 48-hour snowfall at base
+        'snow_48h_summit',      # 48-hour snowfall at summit
+        'snow_7day',            # 7-day snowfall total (for future)
         
         # Snow depth measurements (TOTAL BASE DEPTH)
-        'base_depth',             # Base depth (settled base)
-        'summit_depth',           # Summit depth (settled base)
+        'base_depth',           # Base depth (settled base)
+        'summit_depth',         # Summit depth (settled base)
         
         # Temperature
-        'temp_base',              # Base temperature
-        'temp_summit',            # Summit temperature
+        'temp_base',            # Base temperature
+        'temp_summit',          # Summit temperature
         
         # Wind conditions
-        'wind_speed',             # Wind speed measurement
+        'wind_speed',           # Wind speed measurement
         
         # Conditions
-        'conditions_surface',     # Surface conditions (powder, packed, etc.)
-        'weather_current',        # Current weather description
+        'conditions_surface',   # Surface conditions (powder, packed, etc.)
+        'weather_current',      # Current weather description
         
         # Operations
-        'lifts_open',             # Number/fraction of lifts operating
-        'runs_open',              # Number/fraction of runs open
+        'lifts_open',           # Number/fraction of lifts operating
+        'runs_open',            # Number/fraction of runs open
         
         # Additional info
-        'comments',               # Additional notes/forecast/comments
+        'comments',             # Additional notes/forecast/comments
         
-        # Future NWS forecast fields (populated later)
+        # --- THESE ARE THE NEW COLUMNS FOR THE DASHBOARD ---
+        'nws_forecast',         # The full NWS forecast object
+        'snotel_data',          # The full SNOTEL data object
+
+        # Old NWS fields (can be deprecated later if dashboard uses the object)
         'forecast_base_temp_high',    # Forecasted high temp at base
         'forecast_base_temp_low',     # Forecasted low temp at base
         'forecast_summit_temp_high',  # Forecasted high temp at summit
@@ -135,6 +143,8 @@ class BaseSnowReportScraper(ABC):
         'forecast_precipitation',     # Forecasted precipitation
         'forecast_snow',              # Forecasted snow amount
     ]
+    # --- END OF MODIFIED SECTION ---
+
     def __init__(self, resort_name: str):
         self.resort_name = resort_name
         self.csv_filename = os.path.join(DATA_DIR, f"{resort_name}_snow_report.csv")
@@ -316,14 +326,12 @@ class BaseSnowReportScraper(ABC):
     
             # Save to CSV
             df.to_csv(self.csv_filename, index=False, encoding='utf-8-sig')
-            print(f"Data saved to {self.csv_filename}")
+            # print(f"Data saved to {self.csv_filename}") # This is now logged in main()
     
         except Exception as e:
             print(f"Error saving to CSV: {e}")
             import traceback
             traceback.print_exc()
-    
-
 
             
 # =============================================================================
@@ -2057,7 +2065,11 @@ class EmailSnowReportMessenger:
                 def inches(value, fallback='0"'):
                     if value in (None, '', 'N/A'): return fallback
                     try:
-                        if isinstance(value, (int, float)): return f'{value:.2f}"'.rstrip('0').rstrip('.') + '"'
+                        # --- THIS IS THE FIX ---
+                        # Removed the redundant `+ '"'` at the end of this line
+                        if isinstance(value, (int, float)): return f'{value:.2f}"'.rstrip('0').rstrip('.')
+                        # --- END OF FIX ---
+                        
                         if isinstance(value, str) and value.endswith('"'): return value
                         digits = ''.join(c for c in str(value) if c.isdigit() or c in ".-")
                         return f'{digits}"' if digits else fallback
@@ -2094,7 +2106,7 @@ class EmailSnowReportMessenger:
                               <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">24-hr Snow Δ</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; text-align:right;">{snow_depth_display}</td></tr>
                               <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">24-hr SWE Δ</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{swe_display}</td></tr>
                               <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Density</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{density_display}</td></tr>
-                              <tr><td style="padding:8px 10px; border-bottom:0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Latest Obs</td><td style="padding:8px 10px; border-bottom:0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{snotel_data.get('latest_observation', 'N/A')}</td></tr>
+                              <tr><td style="padding:8px 10px; border-bottom:0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Latest Obs</td><td style="padding:8px 1An 10px; border-bottom:0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{snotel_data.get('latest_observation', 'N/A')}</td></tr>
                             </table>
                           </td>
                         </tr>
@@ -2130,59 +2142,55 @@ class EmailSnowReportMessenger:
     # -------------------------------------------------------------------------
     # MAIN EMAIL ASSEMBLY
     # -------------------------------------------------------------------------
-    def _build_email_html(self, sorted_resorts: List[Dict], snotel: SNOTELDataFetcher, is_powder_alert: bool = False, nws_outlooks: List[Dict] = None) -> str:
-        """Build complete HTML email with dark theme."""
-        html_parts = []
-        
-        # Header
-        html_parts.append(self._generate_email_header(is_powder_alert))
-        
-        # Powder alert banner
-        if is_powder_alert:
-            html_parts.append(self._generate_powder_alert_banner(sorted_resorts))
-        
-        # Summary table with charts
-        chart_data = self._prepare_chart_data(sorted_resorts)
-        html_parts.append(self._generate_summary_table(sorted_resorts, chart_data))
-        
-        # NWS storm banner (if applicable)
-        if nws_outlooks:
-            html_parts.append(self._generate_nws_storm_banner(nws_outlooks))
-        
-        # Detailed resort sections
-        snotel_available = (os.getenv("DISABLE_SNOTEL") not in ("1","true","TRUE"))
-        
-        for resort_data in sorted_resorts:
-            resort_name = resort_data['resort']
-            
-            print(f"Fetching SNOTEL for: {resort_name}")
-            # Get SNOTEL data
-            if snotel_available:
-                try:
-                    snotel_data = snotel.get_snowfall_report(resort_name)
-                except Exception:
-                    snotel_data = {"unavailable": True, "error_reason": "timeout"}
-            else:
-                snotel_data = {"unavailable": True, "error_reason": "service_down"}
 
-            station_info = snotel.get_station_info(resort_name)
-            # Get NWS outlook for this resort
-            nws_outlook = next((item for item in nws_outlooks if item['resort_name'] == resort_name), None) if nws_outlooks else None
+    def _build_email_html(self, sorted_resorts: List[Dict], snotel: SNOTELDataFetcher, is_powder_alert: bool = False, nws_outlooks: List[Dict] = None) -> str:
+            """Build complete HTML email with dark theme."""
+            html_parts = []
             
-            html_parts.append(self._generate_detailed_section(resort_data, snotel_data, nws_outlook, station_info))
-        
-        # Footer
-        html_parts.append(self._generate_footer())
-        
-        return ''.join(html_parts)
+            # Header
+            html_parts.append(self._generate_email_header(is_powder_alert))
+            
+            # Powder alert banner
+            if is_powder_alert:
+                html_parts.append(self._generate_powder_alert_banner(sorted_resorts))
+            
+            # Summary table with charts
+            chart_data = self._prepare_chart_data(sorted_resorts)
+            html_parts.append(self._generate_summary_table(sorted_resorts, chart_data))
+            
+            # NWS storm banner (if applicable)
+            if nws_outlooks:
+                html_parts.append(self._generate_nws_storm_banner(nws_outlooks))
+            
+            # Detailed resort sections
+            for resort_data in sorted_resorts:
+                resort_name = resort_data['resort']
+                
+                # --- MODIFIED SECTION ---
+                # Get SNOTEL data *from the object we already fetched*
+                snotel_data = resort_data.get('snotel_data') 
+                # --- END MODIFICATION ---
+    
+                station_info = snotel.get_station_info(resort_name)
+                # Get NWS outlook for this resort
+                nws_outlook = next((item for item in nws_outlooks if item['resort_name'] == resort_name), None) if nws_outlooks else None
+                
+                html_parts.append(self._generate_detailed_section(resort_data, snotel_data, nws_outlook, station_info))
+            
+            # Footer
+            html_parts.append(self._generate_footer())
+            
+            return ''.join(html_parts)
     
     # -------------------------------------------------------------------------
     # EMAIL SENDING
     # -------------------------------------------------------------------------
+
     def send_consolidated_report(self, resort_data_list: List[Dict]):
             """
             Send consolidated snow report email via Gmail API OAuth2.
             (PRODUCTION-SAFE: Use this in your GitHub script)
+            Data is now pre-compiled with NWS and SNOTEL info.
             """
             if not os.path.exists(self.subscribers_file):
                 print(f"No subscribers file found at {self.subscribers_file}")
@@ -2197,30 +2205,28 @@ class EmailSnowReportMessenger:
                 print("No subscribers found")
                 return
             
-            # Sort resorts
+            # Sort resorts (resort_data_list already contains full NWS/SNOTEL data)
             sorted_resorts = sorted(resort_data_list, key=self.get_master_sort_key)
             
             # Check powder alert
             is_powder_alert = self._check_powder_alert(sorted_resorts)
             
-            # Build NWS outlooks
-            snotel = SNOTELDataFetcher()
-            nws_outlooks = []
-            for resort_data in sorted_resorts:
-                resort_name = resort_data["resort"]
-                coords = RESORT_COORDS.get(resort_name)
-                if coords:
-                    try:
-                        outlook = self.nws_outlook.get_outlook(coords["lat"], coords["lon"])
-                        nws_outlooks.append({"resort_name": resort_name, "outlook": outlook})
-                    except Exception:
-                        nws_outlooks.append({"resort_name": resort_name, "outlook": None})
-                    time.sleep(0.3)
-                else:
-                    nws_outlooks.append({"resort_name": resort_name, "outlook": None})
+            # --- MODIFIED SECTION ---
+            # We just need to create the objects the email builder expects.
+            # The SNOTEL object is needed for the .get_station_info() method.
+            snotel_fetcher_for_email = SNOTELDataFetcher() 
             
+            nws_outlooks_for_email = []
+            for resort_data in sorted_resorts:
+                # Re-create the simple list format that _build_email_html expects
+                nws_outlooks_for_email.append({
+                    "resort_name": resort_data["resort"],
+                    "outlook": resort_data.get("nws_forecast") # Get the data we saved
+                })
+            # --- END OF MODIFIED SECTION ---
+    
             # Build email HTML
-            email_html = self._build_email_html(sorted_resorts, snotel, is_powder_alert, nws_outlooks)
+            email_html = self._build_email_html(sorted_resorts, snotel_fetcher_for_email, is_powder_alert, nws_outlooks_for_email)
             
             # === DEBUG: write out the EXACT html we are about to send ===
             debug_path = os.path.expanduser("~/email_last_sent.html")
@@ -2229,8 +2235,7 @@ class EmailSnowReportMessenger:
             print("EMAIL DEBUG | Theme CHART_COLORS:", EmailTheme.CHART_COLORS)
             print("EMAIL DEBUG | Wrote exact outgoing HTML to:", debug_path)
             
-
-            # Create the date string here
+            # --- Create the date string here ---
             date_string = datetime.now().strftime('%A, %B %d, %Y')
     
             # Subject
@@ -2242,7 +2247,6 @@ class EmailSnowReportMessenger:
             else:
                 # Add the date string to the subject
                 subject = f"Daily Snow Report - {date_string}"
-            # --- END OF FIX ---
             
             # Gmail API send
             try:
@@ -2261,12 +2265,10 @@ class EmailSnowReportMessenger:
                         with open(self.token_path, 'w') as token:
                             token.write(creds.to_json())
                     else:
-                        # If there's no token or no refresh_token, it MUST fail.
-                        # It cannot ask the user to log in.
                         print(f"FATAL: No valid token.json found at {self.token_path}")
                         print("This script must be run with a valid token.json file.")
                         print("Please generate one locally and add it to GitHub Secrets.")
-                        return # <-- This "return" is the important part
+                        return 
                 # --- END OF PRODUCTION-SAFE LOGIC ---
     
                 service = build('gmail', 'v1', credentials=creds)
@@ -2286,7 +2288,6 @@ class EmailSnowReportMessenger:
                 
             except HttpError as error:
                 print(f"Gmail API error: {error}")
-                # If the grant is invalid, the secret in GitHub is bad
                 if 'invalid_grant' in str(error):
                     print("FATAL: invalid_grant. The token in GitHub Secrets is expired or revoked.")
                     print("Please generate a new token.json locally and update the GMAIL_TOKEN_JSON secret.")
@@ -2381,11 +2382,18 @@ def main():
     
     """Main execution function."""
     log_file = os.path.join(LOG_DIR, "snow_report.log")
+    
+    # --- THIS IS THE UPDATED LOGGING CONFIG ---
+    # We import sys at the top of the script for this
     logging.basicConfig(
-        filename=log_file,
+        handlers=[
+            logging.FileHandler(log_file),      # Saves to file
+            logging.StreamHandler(sys.stdout)   # Prints to console
+        ],
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
+    # --- END OF UPDATE ---
     
     try:
         logging.info("Starting snow report script")
@@ -2413,6 +2421,10 @@ def main():
         else:
             logging.warning("Subscribers file not found - will create new one")
         
+        # Initialize SNOTEL/NWS fetchers
+        snotel_fetcher = SNOTELDataFetcher()
+        nws_fetcher = NWSStormOutlook()
+
         # Initialize scrapers
         scrapers = [
             SnowbowlScraper(),
@@ -2432,9 +2444,34 @@ def main():
             snow_data = scraper.get_snow_report()
             
             if snow_data:
+                resort_name = snow_data["resort"]
+                
+                # 1. Get SNOTEL data and add it to the main object
+                logging.info(f"Fetching SNOTEL for: {resort_name}")
+                try:
+                    snow_data['snotel_data'] = snotel_fetcher.get_snowfall_report(resort_name)
+                except Exception as e:
+                    logging.warning(f"SNOTEL fetch failed for {resort_name}: {e}")
+                    snow_data['snotel_data'] = None
+
+                # 2. Get NWS data and add it to the main object
+                logging.info(f"Fetching NWS for: {resort_name}")
+                coords = RESORT_COORDS.get(resort_name)
+                if coords:
+                    try:
+                        snow_data['nws_forecast'] = nws_fetcher.get_outlook(coords["lat"], coords["lon"])
+                        time.sleep(0.3) # Respect NWS API rate limits
+                    except Exception as e:
+                        logging.warning(f"NWS fetch failed for {resort_name}: {e}")
+                        snow_data['nws_forecast'] = None
+                else:
+                    snow_data['nws_forecast'] = None
+
                 resort_data_list.append(snow_data)
-                scraper.save_to_csv(snow_data)
-                logging.info(f"Data saved for {scraper.resort_name}")
+                
+                # Now save the *complete* data to the CSV
+                scraper.save_to_csv(snow_data) 
+                logging.info(f"Complete data saved to CSV for {scraper.resort_name}")
             else:
                 logging.warning(f"No data retrieved for {scraper.resort_name}")
         
@@ -2442,6 +2479,7 @@ def main():
         if resort_data_list:
             logging.info("Sending consolidated report...")
             try:
+                # Pass the *complete* list to the messenger
                 messenger.send_consolidated_report(resort_data_list)
                 logging.info("Consolidated report sent successfully")
             except Exception as e:

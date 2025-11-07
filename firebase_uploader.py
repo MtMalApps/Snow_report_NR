@@ -1,12 +1,11 @@
 """
 Firebase Uploader for Snow Report Data
 
-This script uploads scraped snow report data to Firebase Firestore.
-It works alongside the main scraper without modifying it.
+This script reads the most recent data from all CSVs in the data directory
+and uploads them to Firebase Firestore.
 
 Usage:
     Call this after the main scraper runs to upload data to Firestore.
-    Data is passed as a list of resort dictionaries.
 
 Environment Variables Required:
     FIREBASE_SERVICE_ACCOUNT: Path to Firebase service account JSON
@@ -14,6 +13,8 @@ Environment Variables Required:
 
 import os
 import json
+import sys
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import firebase_admin
@@ -21,6 +22,9 @@ from firebase_admin import credentials, firestore
 
 # Global Firebase client
 db = None
+
+# --- We must define the data directory here ---
+DATA_DIR = os.path.expanduser("~/snow_reports/data")
 
 
 def initialize_firebase() -> Optional[firestore.Client]:
@@ -81,10 +85,25 @@ def save_resort_data_to_firestore(resort_data: Dict) -> bool:
             print(f"⚠️  Missing required fields (resort or date)")
             return False
         
-        # Collection: snow_reports
+        # --- NEW LOGIC TO CONVERT STRING DATA TO OBJECTS ---
+        # Pandas reads the object columns as strings, we need to convert them back
+        for key in ['nws_forecast', 'snotel_data']:
+            if isinstance(resort_data.get(key), str):
+                try:
+                    # Convert the string '{"key": "value"}' into a real object
+                    # We use eval() here because it handles Python dicts (like {'key': None})
+                    # which json.loads would fail on.
+                    resort_data[key] = eval(resort_data[key])
+                except Exception:
+                    # If it's a bad string (like "nan"), just set it to None
+                    print(f"⚠️  Could not parse {key} string, setting to null.")
+                    resort_data[key] = None
+        # --- END NEW LOGIC ---
+
+        # Collection: snow_reports (Your original, correct collection)
         collection_ref = db.collection('snow_reports')
         
-        # Document ID: resort_YYYY-MM-DD_HH-MM-SS
+        # Document ID: resort_YYYY-MM-DD_HH-MM-SS (Your original, correct ID)
         doc_id = f"{resort_name}_{timestamp_str.replace(' ', '_').replace(':', '-')}"
         
         # Check for existing entries on the same date (prevent duplicates)
@@ -109,25 +128,19 @@ def save_resort_data_to_firestore(resort_data: Dict) -> bool:
         traceback.print_exc()
         return False
 
-
 def upload_all_resorts(resort_data_list: List[Dict]) -> Dict[str, int]:
     """
     Upload multiple resorts' data to Firestore.
-    
-    Args:
-        resort_data_list: List of dictionaries containing resort data
-        
-    Returns:
-        Dictionary with success/failure counts
     """
     if not resort_data_list:
         print("⚠️  No resort data to upload")
         return {'success': 0, 'failed': 0}
     
-    # Initialize Firebase
-    if initialize_firebase() is None:
-        print("❌ Failed to initialize Firebase - aborting upload")
-        return {'success': 0, 'failed': len(resort_data_list)}
+    # Initialize Firebase (should already be done, but good to check)
+    if db is None:
+        if initialize_firebase() is None:
+            print("❌ Failed to initialize Firebase - aborting upload")
+            return {'success': 0, 'failed': len(resort_data_list)}
     
     success_count = 0
     failed_count = 0
@@ -145,164 +158,62 @@ def upload_all_resorts(resort_data_list: List[Dict]) -> Dict[str, int]:
     return {'success': success_count, 'failed': failed_count}
 
 
-def get_historical_data(resort_name: str, days: int = 5) -> List[Dict]:
-    """
-    Retrieve historical data for a resort from Firestore.
-    
-    Args:
-        resort_name: Name of the resort
-        days: Number of days of history to retrieve
-        
-    Returns:
-        List of dictionaries containing historical data
-    """
-    if db is None:
-        if initialize_firebase() is None:
-            return []
-    
-    try:
-        # Calculate date range
-        today = datetime.now().date()
-        start_date = today - timedelta(days=days)
-        
-        # Query Firestore
-        collection_ref = db.collection('snow_reports')
-        query = collection_ref.where('resort', '==', resort_name).where('date', '>=', start_date.strftime('%Y-%m-%d')).order_by('date', direction=firestore.Query.DESCENDING)
-        
-        docs = query.stream()
-        
-        results = []
-        for doc in docs:
-            data = doc.to_dict()
-            results.append(data)
-        
-        print(f"📊 Retrieved {len(results)} historical records for {resort_name}")
-        return results
-        
-    except Exception as e:
-        print(f"❌ Error retrieving historical data for {resort_name}: {e}")
-        return []
-
-
-def get_chart_data_from_firestore(resort_name: str, days: int = 5, max_age_days: int = 7) -> Dict:
-    """
-    Get chart-ready data for a resort from Firestore.
-    
-    Args:
-        resort_name: Name of the resort
-        days: Number of days to include in chart
-        max_age_days: Maximum age of data to consider "current" (default 7 days)
-        
-    Returns:
-        Dictionary with chart data (values, dates, totals)
-    """
-    from datetime import datetime, timedelta
-    
-    historical_data = get_historical_data(resort_name, days)
-    
-    # Filter out data that's too old (likely stale/cached)
-    today = datetime.now().date()
-    cutoff_date = today - timedelta(days=max_age_days)
-    
-    filtered_data = []
-    for record in historical_data:
-        record_date_str = record.get('date')
-        if record_date_str:
-            try:
-                record_date = datetime.strptime(record_date_str, '%Y-%m-%d').date()
-                if record_date >= cutoff_date:
-                    filtered_data.append(record)
-            except:
-                pass
-    
-    historical_data = filtered_data
-    
-    if not historical_data:
-        today = datetime.now().date()
-        return {
-            'resort': resort_name,
-            'values': [0] * days,
-            'date_labels': [(today - timedelta(days=i)) for i in range(days)],
-            'total': 0,
-            'has_current_data': False,
-            'most_recent_update': None
-        }
-    
-    # Build chart data
-    today = datetime.now().date()
-    date_labels = [(today - timedelta(days=i)) for i in range(days)]
-    values = [0] * days
-    
-    # Create date-to-data mapping
-    data_by_date = {}
-    for record in historical_data:
-        record_date_str = record.get('date')
-        if record_date_str:
-            try:
-                record_date = datetime.strptime(record_date_str, '%Y-%m-%d').date()
-                data_by_date[record_date] = record
-            except:
-                pass
-    
-    # Fill in values for each day
-    for i, date in enumerate(date_labels):
-        if date in data_by_date:
-            record = data_by_date[date]
-            # Try summit first, then base
-            snow = record.get('snow_24h_summit') or record.get('snow_24h_base') or '0'
-            if isinstance(snow, str):
-                snow = snow.replace('"', '').strip()
-            try:
-                snow_float = float(snow)
-                # Check for NaN
-                if snow_float != snow_float:  # NaN check
-                    values[i] = 0
-                else:
-                    values[i] = snow_float
-            except:
-                values[i] = 0
-    
-    # Get most recent update
-    most_recent_update = None
-    if historical_data:
-        latest_record = historical_data[0]
-        last_updated_str = latest_record.get('date')
-        if last_updated_str:
-            try:
-                most_recent_update = datetime.strptime(last_updated_str, '%Y-%m-%d').date()
-            except:
-                pass
-    
-    days_since_update = (today - most_recent_update).days if most_recent_update else 999
-    
-    # Only consider data "current" if it's from the last 3 days
-    has_current = days_since_update < 3
-    
-    return {
-        'resort': resort_name,
-        'values': values,
-        'date_labels': date_labels,
-        'total': sum(values),
-        'has_current_data': has_current,
-        'most_recent_update': most_recent_update,
-        'days_since_update': days_since_update
-    }
-
-
 if __name__ == "__main__":
-    # Test Firebase connection
-    print("🧪 Testing Firebase connection...")
+    """
+    Main execution block:
+    1. Initialize Firebase
+    2. Find all CSV files
+    3. Read the *last row* of each CSV
+    4. Upload that data to Firestore
+    """
     
-    if initialize_firebase():
-        print("✅ Firebase connection successful!")
+    # We need pandas and sys for this main block to work
+    import pandas as pd
+    import sys 
+    
+    # --- We must define the data directory here ---
+    DATA_DIR = os.path.expanduser("~/snow_reports/data")
+    
+    print("🚀 Starting Firebase Uploader...")
+    
+    # 1. Initialize Firebase
+    if initialize_firebase() is None:
+        print("❌ Firebase connection failed. Exiting.")
+        sys.exit(1) # Exit the script with an error
+    
+    # 2. Find all the CSV files in the data directory
+    try:
+        all_files = os.listdir(DATA_DIR)
+        # Find only the CSV files that are *not* in a sub-directory
+        csv_files = [f for f in all_files if f.endswith('_snow_report.csv') and os.path.isfile(os.path.join(DATA_DIR, f))]
         
-        # Test query
-        print("\n🔍 Testing data retrieval...")
-        test_data = get_historical_data('Snowbowl', days=7)
-        print(f"Found {len(test_data)} records for Snowbowl")
+        if not csv_files:
+            print(f"⚠️  No CSV files found in {DATA_DIR}")
+            sys.exit(0)
+            
+        print(f"🔍 Found {len(csv_files)} CSV files to process.")
+
+        # 3. Read each CSV and convert to a list of dictionaries
+        all_resort_data = []
+        for csv_file in csv_files:
+            try:
+                csv_path = os.path.join(DATA_DIR, csv_file)
+                # Use na_filter=False to prevent "nan" strings for null values
+                df = pd.read_csv(csv_path, na_filter=False) 
+                
+                # Get the most recent row (which is the last row)
+                latest_data = df.iloc[-1].to_dict()
+                all_resort_data.append(latest_data)
+            except Exception as e:
+                print(f"❌ Error reading {csv_file}: {e}")
         
-        if test_data:
-            print("\nSample record:")
-            print(json.dumps(test_data[0], indent=2, default=str))
-    else:
-        print("❌ Firebase connection failed")
+        # 4. Upload all data to Firestore
+        if all_resort_data:
+            upload_all_resorts(all_resort_data)
+        
+        print("\n✅ Firebase Uploader finished.")
+
+    except Exception as e:
+        print(f"❌ An unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
