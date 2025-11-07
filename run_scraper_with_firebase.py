@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
 Run scraper and upload to Firebase.
-Modified to upload data directly during scraping, not from CSV files.
+This is the main production script for GitHub Actions.
+It gathers all data, saves it to CSV, and uploads the
+complete data to Firebase.
 """
 import sys
 import os
+import time
 
-# Import the scraper modules
-from snow_report_scraper_oauth import *
-import firebase_uploader
+# Import all our library modules
+from snow_report_scraper_oauth import * # Imports all scrapers, EmailTheme, etc.
+import firebase_uploader # Imports our uploader functions
 
 def main():
     """Run scraper with Firebase uploads."""
@@ -17,6 +20,11 @@ def main():
     if not firebase_uploader.initialize_firebase():
         print("⚠️ Firebase not available - continuing with email only")
     
+    # --- Initialize all fetchers ---
+    snotel_fetcher = SNOTELDataFetcher()
+    nws_fetcher = NWSStormOutlook()
+    # ---
+
     # Initialize scrapers
     scrapers = [
         SnowbowlScraper(),
@@ -32,14 +40,46 @@ def main():
     # Run scrapers and collect data
     resort_data_list = []
     for scraper in scrapers:
-        print(f"Fetching data for {scraper.resort_name}...")
+        print(f"--- Fetching data for {scraper.resort_name} ---")
         snow_data = scraper.get_snow_report()
         
         if snow_data:
+            resort_name = snow_data["resort"]
+
+            # --- GATHER ALL DATA ---
+            # 1. Get SNOTEL data and add it to the main object
+            print(f"Fetching SNOTEL for: {resort_name}")
+            try:
+                snow_data['snotel_data'] = snotel_fetcher.get_snowfall_report(resort_name)
+            except Exception as e:
+                print(f"⚠️ SNOTEL fetch failed for {resort_name}: {e}")
+                snow_data['snotel_data'] = None
+
+            # 2. Get NWS data and add it to the main object
+            print(f"Fetching NWS for: {resort_name}")
+            coords = RESORT_COORDS.get(resort_name)
+            if coords:
+                try:
+                    snow_data['nws_forecast'] = nws_fetcher.get_outlook(coords["lat"], coords["lon"])
+                    time.sleep(0.3) # Respect NWS API rate limits
+                except Exception as e:
+                    print(f"⚠️ NWS fetch failed for {resort_name}: {e}")
+                    snow_data['nws_forecast'] = None
+            else:
+                snow_data['nws_forecast'] = None
+            # --- END OF DATA GATHERING ---
+
+            # Add to the list for the email
             resort_data_list.append(snow_data)
-            scraper.save_to_csv(snow_data)
             
-            # Upload to Firebase immediately
+            # 3. Save the *complete* data to the CSV
+            try:
+                scraper.save_to_csv(snow_data)
+                print(f"✅ Complete data saved to CSV for {scraper.resort_name}")
+            except Exception as e:
+                print(f"❌ Error saving CSV for {scraper.resort_name}: {e}")
+            
+            # 4. Upload the *complete* data to Firebase
             if firebase_uploader.db:
                 firebase_uploader.save_resort_data_to_firestore(snow_data)
             
@@ -61,6 +101,7 @@ def main():
         )
         
         try:
+            # Pass the complete data to the sender (it no longer fetches)
             messenger.send_consolidated_report(resort_data_list)
             print("✅ Email sent successfully")
         except Exception as e:
