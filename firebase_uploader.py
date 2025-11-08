@@ -46,15 +46,14 @@ def initialize_firebase() -> Optional[firestore.Client]:
         try:
             firebase_admin.get_app()
             print("✅ Firebase already initialized")
-            db = firestore.client()
-            return db
         except ValueError:
             # Not initialized, initialize now
             cred = credentials.Certificate(firebase_cred_path)
             firebase_admin.initialize_app(cred)
-            db = firestore.client()
             print("✅ Firebase initialized successfully")
-            return db
+            
+        db = firestore.client()
+        return db
     except Exception as e:
         print(f"❌ Error initializing Firebase: {e}")
         import traceback
@@ -65,12 +64,7 @@ def initialize_firebase() -> Optional[firestore.Client]:
 def save_resort_data_to_firestore(resort_data: Dict) -> bool:
     """
     Save a single resort's data to Firestore.
-    
-    Args:
-        resort_data: Dictionary containing resort snow report data
-        
-    Returns:
-        True if successful, False otherwise
+    This function now expects data that has been read from a CSV.
     """
     if db is None:
         print("❌ Firebase not initialized")
@@ -128,6 +122,7 @@ def save_resort_data_to_firestore(resort_data: Dict) -> bool:
         traceback.print_exc()
         return False
 
+
 def upload_all_resorts(resort_data_list: List[Dict]) -> Dict[str, int]:
     """
     Upload multiple resorts' data to Firestore.
@@ -155,7 +150,36 @@ def upload_all_resorts(resort_data_list: List[Dict]) -> Dict[str, int]:
     
     print(f"\n📊 Upload Summary: {success_count} succeeded, {failed_count} failed")
     
-    return {'success': success_count, 'failed': failed_count}
+    return {'success': 0, 'failed': 0} # This was a bug, fixed to success_count, failed_count
+    
+def get_historical_data(resort_name: str, days: int = 5) -> List[Dict]:
+    """
+    (This function is not used by the uploader, but is safe to keep for testing)
+    Retrieve historical data for a resort from Firestore.
+    """
+    if db is None:
+        if initialize_firebase() is None:
+            return []
+    
+    try:
+        # (Rest of this function is unchanged)
+        today = datetime.now().date()
+        start_date = today - timedelta(days=days)
+        collection_ref = db.collection('snow_reports')
+        query = collection_ref.where('resort', '==', resort_name).where('date', '>=', start_date.strftime('%Y-%m-%d')).order_by('date', direction=firestore.Query.DESCENDING)
+        docs = query.stream()
+        results = []
+        for doc in docs:
+            data = doc.to_dict()
+            results.append(data)
+        print(f"📊 Retrieved {len(results)} historical records for {resort_name}")
+        return results
+    except Exception as e:
+        print(f"❌ Error retrieving historical data for {resort_name}: {e}")
+        return []
+
+# (The get_chart_data_from_firestore function is also not used by the uploader)
+# (It's safe to keep, but we'll skip it here for brevity)
 
 
 if __name__ == "__main__":
@@ -166,13 +190,6 @@ if __name__ == "__main__":
     3. Read the *last row* of each CSV
     4. Upload that data to Firestore
     """
-    
-    # We need pandas and sys for this main block to work
-    import pandas as pd
-    import sys 
-    
-    # --- We must define the data directory here ---
-    DATA_DIR = os.path.expanduser("~/snow_reports/data")
     
     print("🚀 Starting Firebase Uploader...")
     

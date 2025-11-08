@@ -13,60 +13,78 @@ import firebase_uploader
 def main():
     """Run scraper with Firebase uploads."""
     
-    # Initialize Firebase first
-    if not firebase_uploader.initialize_firebase():
-        print("⚠️ Firebase not available - continuing with email only")
+    # --- This script's MAIN is now just a wrapper ---
+    # --- It calls the main() function from the other script ---
     
-    # Initialize scrapers
-    scrapers = [
-        SnowbowlScraper(),
-        DiscoveryScraper(),
-        LookoutPassScraper(),
-        BigMountainScraper(),
-        LostTrailScraper(),
-        TetonPassScraper(),
-        ShowdownScraper(),
-        BlacktailScraper(),
-    ]
+    # We must import the main scraper script itself
+    import snow_report_scraper_oauth
     
-    # Run scrapers and collect data
-    resort_data_list = []
-    for scraper in scrapers:
-        print(f"Fetching data for {scraper.resort_name}...")
-        snow_data = scraper.get_snow_report()
+    # Call the main function from the scraper script
+    # This will do all the work:
+    # 1. Scrape data
+    # 2. Fetch NWS/SNOTEL
+    # 3. Save complete CSVs
+    # 4. Send the email
+    snow_report_scraper_oauth.main()
+    
+    # After the main scraper runs, the CSVs are complete.
+    # Now, we run the uploader script.
+    
+    # We can't just call firebase_uploader.main() because it's not a function.
+    # We must run it as a separate process, or copy its `if __name__ == "__main__":` logic.
+    # Easiest way: just call the uploader.
+    
+    print("\n--- Running Firebase Uploader ---")
+    # This assumes firebase_uploader.py is in the same directory
+    # and that the venv is active.
+    
+    # This is a bit of a hack, but it will work in GitHub Actions
+    # We will re-initialize and call the upload_all_resorts function
+    
+    # We need pandas for this
+    import pandas as pd
+    
+    DATA_DIR = os.path.expanduser("~/snow_reports/data")
+    
+    print("🚀 Starting Firebase Uploader...")
+    
+    # 1. Initialize Firebase
+    if firebase_uploader.initialize_firebase() is None:
+        print("❌ Firebase connection failed. Exiting.")
+        sys.exit(1) # Exit the script with an error
+    
+    # 2. Find all the CSV files in the data directory
+    try:
+        all_files = os.listdir(DATA_DIR)
+        csv_files = [f for f in all_files if f.endswith('_snow_report.csv') and os.path.isfile(os.path.join(DATA_DIR, f))]
         
-        if snow_data:
-            resort_data_list.append(snow_data)
-            scraper.save_to_csv(snow_data)
+        if not csv_files:
+            print(f"⚠️  No CSV files found in {DATA_DIR}")
+            sys.exit(0)
             
-            # Upload to Firebase immediately
-            if firebase_uploader.db:
-                firebase_uploader.save_resort_data_to_firestore(snow_data)
-            
-            print(f"✅ {scraper.resort_name} complete")
-        else:
-            print(f"⚠️ No data for {scraper.resort_name}")
-    
-    # Send consolidated email report
-    if resort_data_list:
-        print("\n📧 Sending email report...")
-        gmail_address = os.environ.get('GMAIL_ADDRESS')
-        credentials_path = os.environ.get('GMAIL_CREDENTIALS_PATH', 'credentials.json')
-        token_path = os.environ.get('GMAIL_TOKEN_PATH', 'token.json')
+        print(f"🔍 Found {len(csv_files)} CSV files to process.")
+
+        # 3. Read each CSV and convert to a list of dictionaries
+        all_resort_data = []
+        for csv_file in csv_files:
+            try:
+                csv_path = os.path.join(DATA_DIR, csv_file)
+                df = pd.read_csv(csv_path, na_filter=False) 
+                latest_data = df.iloc[-1].to_dict()
+                all_resort_data.append(latest_data)
+            except Exception as e:
+                print(f"❌ Error reading {csv_file}: {e}")
         
-        messenger = EmailSnowReportMessenger(
-            gmail_address=gmail_address,
-            credentials_path=credentials_path,
-            token_path=token_path
-        )
+        # 4. Upload all data to Firestore
+        if all_resort_data:
+            firebase_uploader.upload_all_resorts(all_resort_data)
         
-        try:
-            messenger.send_consolidated_report(resort_data_list)
-            print("✅ Email sent successfully")
-        except Exception as e:
-            print(f"❌ Email failed: {e}")
-    
-    print("\n✅ Complete!")
+        print("\n✅ Firebase Uploader finished.")
+
+    except Exception as e:
+        print(f"❌ An unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()

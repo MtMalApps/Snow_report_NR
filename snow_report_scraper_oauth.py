@@ -998,45 +998,52 @@ class BlacktailScraper(BaseSnowReportScraper):
             data['comments'] = entry_content.get_text(strip=True)
         
         return data
+
 # =============================================================================
-# SNOTEL DATA INTEGRATION
+# SNOTEL DATA INTEGRATION (NEW API VERSION)
+# =============================================================================
+
+# =============================================================================
+# SNOTEL DATA INTEGRATION (NEW API VERSION - v2)
 # =============================================================================
 # =============================================================================
-# SNOTEL DATA INTEGRATION (DROP-IN REPLACEMENT)
+# SNOTEL DATA INTEGRATION (NEW REST API VERSION)
 # =============================================================================
 class SNOTELDataFetcher:
     """
-    Fetches backcountry snow data from SNOTEL stations via the reportGenerator CSV endpoint.
-    Computes 24h (or 48h) depth and SWE changes, density, and a qualitative snow category.
-    Hardened with retries, backoff, per-run cache, and friendly fallbacks.
+    Fetches backcountry snow data from SNOTEL stations via the AWDB REST API.
+    Computes 24h depth/SWE changes, density, % of median, and snow category.
+    Hardened with retries, backoff, and per-run cache.
     """
     STATION_INFO = {
-        "Showdown":    {"triplet": "437:MT:SNTL",  "name": "Deadman Creek",  "lat": 46.79, "lon": -110.68, "elevation": 6440},
-        "TetonPass":   {"triplet": "649:MT:SNTL",  "name": "Mount Lockhart", "lat": 47.92, "lon": -112.82, "elevation": 6430},
-        "Discovery":   {"triplet": "850:MT:SNTL",  "name": "Warm Springs",   "lat": 46.27, "lon": -113.16, "elevation": 7840},
-        "LostTrail":   {"triplet": "727:MT:SNTL",  "name": "Saddle Mountain","lat": 45.69, "lon": -113.97, "elevation": 7890},
-        "Snowbowl":    {"triplet": "901:MT:SNTL",  "name": "Stuart Peak",    "lat": 47.00, "lon": -113.93, "elevation": 7270},
-        "LookoutPass": {"triplet": "594:ID:SNTL",  "name": "Lookout",        "lat": 47.46, "lon": -115.70, "elevation": 5180},
-        "Blacktail":   {"triplet": "1144:MT:SNTL", "name": "Blacktail Mtn",  "lat": 47.98, "lon": -114.35, "elevation": 5660},
-        "BigMountain": {"triplet": "469:MT:SNTL",  "name": "Emery Creek",    "lat": 48.43, "lon": -113.94, "elevation": 4340},
+        "Showdown":    {"triplet": "437:MT:SNTL",  "name": "Deadman Creek",   "lat": 46.79, "lon": -110.68, "elevation": 6440},
+        "TetonPass":   {"triplet": "649:MT:SNTL",  "name": "Mount Lockhart",  "lat": 47.92, "lon": -112.82, "elevation": 6430},
+        "Discovery":   {"triplet": "850:MT:SNTL",  "name": "Warm Springs",    "lat": 46.27, "lon": -113.16, "elevation": 7840},
+        "LostTrail":   {"triplet": "727:MT:SNTL",  "name": "Saddle Mountain", "lat": 45.69, "lon": -113.97, "elevation": 7890},
+        "Snowbowl":    {"triplet": "901:MT:SNTL",  "name": "Stuart Mountain", "lat": 47.00, "lon": -113.93, "elevation": 7270},
+        "LookoutPass": {"triplet": "594:ID:SNTL",  "name": "Lookout",         "lat": 47.46, "lon": -115.70, "elevation": 5180},
+        "Blacktail":   {"triplet": "1144:MT:SNTL", "name": "Blacktail Mtn",   "lat": 47.98, "lon": -114.35, "elevation": 5660},
+        "BigMountain": {"triplet": "469:MT:SNTL",  "name": "Emery Creek",     "lat": 48.43, "lon": -113.94, "elevation": 4340},
     }
+    
     def __init__(self):
         import os
         import logging
         from requests import Session
         from requests.adapters import HTTPAdapter
         try:
-            # urllib3 location depends on version; handle both
             from urllib3.util.retry import Retry
         except Exception:
-            from requests.packages.urllib3.util.retry import Retry  # fallback
+            from requests.packages.urllib3.util.retry import Retry # fallback
+        
         self._log = logging.getLogger(__name__)
-        # Tunables via env (sane defaults provided)
+        
         connect_timeout = float(os.getenv("SNOTEL_TIMEOUT_CONNECT", "10"))
         read_timeout    = float(os.getenv("SNOTEL_TIMEOUT_READ",    "25"))
-        total_retries   = int(os.getenv("SNOTEL_RETRIES",           "4"))
+        total_retries   = int(os.getenv("SNOTEL_RETRIES",         "4"))
         backoff_factor  = float(os.getenv("SNOTEL_BACKOFF",         "1.2"))
         self._timeout = (connect_timeout, read_timeout)
+        
         retry = Retry(
             total=total_retries,
             connect=total_retries,
@@ -1051,187 +1058,360 @@ class SNOTELDataFetcher:
         adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
         sess = Session()
         sess.headers.update({
-            "User-Agent": "Mozilla/5.0 (SnowReportBot/1.0; +https://example.com) requests",
-            "Accept": "text/csv, text/plain, */*",
+            "User-Agent": "Mozilla/5.0 (SnowReportBot/2.0; +https://github.com/jriddering/Northern-Rockies-snow-reports)",
+            "Accept": "application/json",
             "Connection": "keep-alive",
         })
         sess.mount("https://", adapter)
-        sess.mount("http://", adapter)
         self.session = sess
-        self._cache = {}  # per-run cache by triplet
-    
+        self._cache = {} # per-run cache by triplet
+
     def get_station_info(self, resort_name: str) -> Optional[Dict]:
         return self.STATION_INFO.get(resort_name)
-    
+
     @staticmethod
     def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        """Great-circle distance between two points, in miles."""
-        from math import radians, sin, cos, asin, sqrt
-        R = 3958.7613  # miles
+        from math import radians, sin, cos, asin, sqrt # Keep imports local
+        R = 3958.7613 # miles
         phi1, lam1, phi2, lam2 = map(radians, [lat1, lon1, lat2, lon2])
         dphi, dlam = (phi2 - phi1), (lam2 - lam1)
         a = sin(dphi/2)**2 + cos(phi1) * cos(phi2) * sin(dlam/2)**2
         c = 2 * asin(sqrt(a))
         return R * c
-    
+
     @staticmethod
     def _snow_category(density_pct: float) -> str:
         """Classify snow quality by density."""
-        if density_pct < 6:
-            return "Blower Powder"
-        elif density_pct < 10:
-            return "Light Powder"
-        elif density_pct < 15:
-            return "Medium Powder"
-        elif density_pct < 25:
-            return "Heavy Powder"
-        elif density_pct < 40:
-            return "Wet Snow"
-        else:
-            return "Slush"
-    
-    @staticmethod
-    def _parse_report_csv(text: str):
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if any('# Stations do not exist' in ln for ln in lines):
-            return []
-        try:
-            start_idx = next(i for i, ln in enumerate(lines) if ln.startswith('Date,'))
-        except StopIteration:
-            return []
-        data = []
-        for ln in lines[start_idx + 1:]:
-            if ln.startswith('#') or not ln:
-                continue
-            parts = ln.split(',')
-            if len(parts) < 3:
-                continue
-            date_str = parts[0]
-            try:
-                wteq = float(parts[1]) if parts[1] not in ('', 'NA', 'null') else None
-            except ValueError:
-                wteq = None
-            try:
-                snwd = float(parts[2]) if parts[2] not in ('', 'NA', 'null') else None
-            except ValueError:
-                snwd = None
-            data.append({'date': date_str, 'WTEQ': wteq, 'SNWD': snwd})
-        return data
-    
-    def _create_empty_report(self, station_name=None, latest_observation=None, error_reason=None):
+        if density_pct is None: return "N/A"
+        if density_pct < 6:   return "Blower Powder"
+        if density_pct < 10:  return "Light Powder"
+        if density_pct < 15:  return "Medium Powder"
+        if density_pct < 25:  return "Heavy Powder"
+        if density_pct < 40:  return "Wet Snow"
+        return "Slush"
+
+    def _create_empty_report(self, station_name=None, latest_observation=None, error_reason=None, triplet=None):
         """Return an empty-but-informative report structure."""
         return {
             'station_name': station_name or 'SNOTEL',
-            'snow_depth': 'melting/settling',
-            'swe': 0,
+            'triplet': triplet,
+            'snow_depth': 'N/A', # Use original key
+            'swe': 'N/A',        # Use original key
             'density': 'N/A',
+            'percent_of_median': 'N/A', 
             'snow_category': 'N/A',
-            'temp_min': None,
-            'temp_max': None,
             'latest_observation': latest_observation,
-            'latest_temp': None,
             'unavailable': bool(error_reason),
-            'error_reason': error_reason  # 'timeout', 'http', 'empty', 'insufficient', 'no_station'
+            'error_reason': error_reason 
         }
-    
-    def _fetch_daily_series(self, triplet: str):
+
+    def _fetch_from_rest_api(self, triplet: str) -> Dict:
         """
-        Robust fetch with session retries, small jitter, and per-run cache.
-        Raises on final failure; caller handles graceful fallback.
+        Fetches SNOTEL data from the new REST API.
+        Gets WTEQ, SNWD, and WTEQ_MEDIAN for the last 2 days.
         """
         if triplet in self._cache:
             return self._cache[triplet]
         
-        import time
-        import random
-        
+        # We need yesterday and today. beginDate=-1 gets yesterday and today.
         url = (
-            "https://wcc.sc.egov.usda.gov/reportGenerator/view_csv/"
-            f"customSingleStationReport/daily/{triplet}%7Cid=%22%22%7Cname/"
-            "POR_BEGIN,POR_END/WTEQ::value,SNWD::value"
+            "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
+            f"?stationTriplets={triplet}"
+            "&elements=WTEQ,SNWD"
+            "&duration=DAILY"
+            "&beginDate=-1" # Gets yesterday and today
+            "&endDate=0"   # Gets up to today
+            "&centralTendencyType=MEDIAN"
         )
         
-        # Jitter to avoid bursty simultaneous hits across many resorts
-        time.sleep(0.2 + random.random() * 0.6)
+        resp = self.session.get(url, timeout=self._timeout)
+        resp.raise_for_status() 
+        api_data = resp.json()
+
+        results = {
+            'today': {'date': None, 'snwd': None, 'wteq': None, 'wteq_median': None},
+            'yesterday': {'date': None, 'snwd': None, 'wteq': None}
+        }
+
+        if not api_data or 'data' not in api_data[0]:
+            raise ValueError("No 'data' field in API response.")
+
+        # Loop through the elements (WTEQ, SNWD)
+        for element_data in api_data[0].get('data', []):
+            element_code = element_data['stationElement']['elementCode'].lower() # 'wteq' or 'snwd'
+            values = element_data.get('values', [])
+            
+            if len(values) == 2:
+                # We have yesterday and today
+                yest_data = values[0]
+                today_data = values[1]
+
+                results['today']['date'] = today_data['date']
+                results['yesterday']['date'] = yest_data['date']
+
+                if element_code == 'wteq':
+                    results['today']['wteq'] = today_data.get('value')
+                    results['today']['wteq_median'] = today_data.get('median')
+                    results['yesterday']['wteq'] = yest_data.get('value')
+                elif element_code == 'snwd':
+                    results['today']['snwd'] = today_data.get('value')
+                    results['yesterday']['snwd'] = yest_data.get('value')
+            
+            elif len(values) == 1:
+                # Only one day of data (probably start of season)
+                today_data = values[0]
+                results['today']['date'] = today_data['date']
+                if element_code == 'wteq':
+                    results['today']['wteq'] = today_data.get('value')
+                    results['today']['wteq_median'] = today_data.get('median')
+                elif element_code == 'snwd':
+                    results['today']['snwd'] = today_data.get('value')
         
-        resp = self.session.get(url, timeout=(6,8))
-        resp.raise_for_status()
-        parsed = self._parse_report_csv(resp.text)
-        self._cache[triplet] = parsed
-        return parsed
-    
-    def get_snowfall_report(self, resort_name: str, days: int = 1):
+        self._cache[triplet] = results
+        return results
+
+    def get_snowfall_report(self, resort_name: str):
         """
-        Safe wrapper that resolves station, fetches with retries,
-        and returns a payload suitable for display even on failure.
+        Safe wrapper that resolves station, fetches with REST API,
+        calculates metrics, and returns a payload.
         """
-        from datetime import datetime
         info = self.get_station_info(resort_name)
         if not info:
             return self._create_empty_report(station_name='SNOTEL', error_reason='no_station')
         
         station_name = info['name']
+        triplet = info['triplet']
         
         try:
-            series = self._fetch_daily_series(info['triplet'])
+            api_results = self._fetch_from_rest_api(triplet)
         except Exception as e:
-            # Log once per failure path; keep email output clean
-            self._log.warning("SNOTEL fetch error for %s (%s): %s", resort_name, info['triplet'], str(e))
-            return self._create_empty_report(station_name=station_name, error_reason='timeout')
+            self._log.warning("SNOTEL API fetch error for %s (%s): %s", resort_name, triplet, str(e))
+            return self._create_empty_report(station_name=station_name, error_reason='timeout', triplet=triplet)
         
-        if not series:
-            return self._create_empty_report(station_name=station_name, error_reason='empty')
+        # --- Perform Calculations ---
+        today = api_results.get('today', {})
+        yesterday = api_results.get('yesterday', {})
+
+        # 1. 24-Hour Change
+        snow_change = None
+        swe_change = None
+        if today.get('snwd') is not None and yesterday.get('snwd') is not None:
+            snow_change = round(today['snwd'] - yesterday['snwd'], 1)
         
-        # Require both WTEQ and SNWD
-        rows = [r for r in series if r['WTEQ'] is not None and r['SNWD'] is not None]
-        if len(rows) < 2:
-            latest_dt = rows[-1]['date'] if rows else None
-            return self._create_empty_report(station_name=station_name, latest_observation=latest_dt, error_reason='insufficient')
+        if today.get('wteq') is not None and yesterday.get('wteq') is not None:
+            swe_change = round(today['wteq'] - yesterday['wteq'], 3)
+
+        # 2. Density
+        density = None
+        if snow_change is not None and swe_change is not None and snow_change > 0 and swe_change > 0.001:
+            density = round((swe_change / snow_change) * 100, 1)
         
-        # Chronological sort best-effort
-        try:
-            rows.sort(key=lambda r: datetime.strptime(r['date'], '%Y-%m-%d'))
-        except Exception:
-            pass
-        
-        # Clamp days to 1–2 due to daily granularity
-        step = max(1, min(int(days), 2))
-        end = rows[-1]
-        start = rows[-(step + 1)] if len(rows) > step else rows[0]
-        
-        snow_change = round(end['SNWD'] - start['SNWD'], 1)
-        swe_change  = round(end['WTEQ'] - start['WTEQ'], 3)
-        
-        # Thresholds to treat it as actual new snow
+        # 3. Percent of Median
+        percent_of_median = None
+        if today.get('wteq') is not None and today.get('wteq_median') is not None:
+            if today['wteq_median'] > 0:
+                percent_of_median = round((today['wteq'] / today['wteq_median']) * 100)
+            elif today['wteq'] > 0: # Median is 0 but we have snow
+                percent_of_median = 999 # Use 999 to show it's way above median
+            else: # Both are 0
+                percent_of_median = 100 # 0 is 100% of 0
+
+        # Check for new snow
         SNOW_THRESHOLD = 0.5
         SWE_THRESHOLD  = 0.01
-        is_new_snow = (snow_change > SNOW_THRESHOLD and swe_change > SWE_THRESHOLD)
+        is_new_snow = (snow_change is not None and swe_change is not None and
+                       snow_change >= SNOW_THRESHOLD and swe_change >= SWE_THRESHOLD)
+
+        # Use the original key 'snow_depth' for the 24-hour *change*
+        # Use the original key 'swe' for the 24-hour *change*
+        # This maintains compatibility with your email template and uploader
         
         if not is_new_snow:
-            # Not an error: explicitly indicate no net new snow
-            report = self._create_empty_report(
-                station_name=station_name,
-                latest_observation=end['date'],
-                error_reason=None
-            )
-            return report
-        
-        density  = round((swe_change / snow_change) * 100, 1) if snow_change else 0.0
-        category = self._snow_category(density)
+            return {
+                'station_name': station_name,
+                'triplet': triplet,
+                'snow_depth': snow_change if snow_change is not None else 'N/A',
+                'swe': swe_change if swe_change is not None else 'N/A',
+                'density': 'N/A',
+                'percent_of_median': percent_of_median,
+                'snow_category': 'N/A',
+                'latest_observation': today.get('date'),
+                'unavailable': False,
+                'error_reason': "No new snow"
+            }
         
         return {
             'station_name': station_name,
-            'snow_depth': snow_change,
+            'triplet': triplet,
+            'snow_depth': snow_change, 
             'swe': swe_change,
             'density': density,
-            'snow_category': category,
-            'temp_min': None,
-            'temp_max': None,
-            'latest_observation': end['date'],
-            'latest_temp': None,
+            'percent_of_median': percent_of_median,
+            'snow_category': self._snow_category(density),
+            'latest_observation': today.get('date'),
             'unavailable': False,
             'error_reason': None
         }
+
+
+    def get_all_snowfall_reports(self) -> Dict[str, Dict]:
+            """
+            Fetches SNOTEL data for ALL stations in STATION_INFO in a single batch API call.
+            
+            Processes all calculations and returns a dictionary mapped by RESORT NAME.
+            e.g. {"Showdown": {report...}, "Discovery": {report...}}
+            """
+            self._log.info("Starting batch SNOTEL API fetch...")
+            
+            # 1. Create a map of triplet -> resort_name for easy lookup
+            triplet_to_resort = {v['triplet']: k for k, v in self.STATION_INFO.items()}
+            
+            # 2. Get a comma-separated list of all triplets
+            all_triplets = ",".join(triplet_to_resort.keys())
+            
+            url = (
+                "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
+                f"?stationTriplets={all_triplets}"
+                "&elements=WTEQ,SNWD"
+                "&duration=DAILY"
+                "&beginDate=-1" # Gets yesterday and today
+                "&endDate=0"   # Gets up to today
+                "&centralTendencyType=MEDIAN"
+            )
+            
+            # This will hold the final reports, keyed by resort_name
+            final_reports = {}
+    
+            try:
+                # 3. Make the SINGLE API call
+                resp = self.session.get(url, timeout=self._timeout)
+                resp.raise_for_status()
+                api_data_list = resp.json()
+                
+                if not api_data_list:
+                    raise ValueError("API response was empty.")
+    
+                # 4. Process the response (it's a list of station data)
+                for station_data in api_data_list:
+                    triplet = station_data.get('stationTriplet')
+                    resort_name = triplet_to_resort.get(triplet)
+                    
+                    if not resort_name:
+                        self._log.warning(f"Got data for unknown triplet {triplet}, skipping.")
+                        continue
+                    
+                    station_name = self.STATION_INFO[resort_name]['name']
+                    
+                    # --- This is the same logic from _fetch_from_rest_api ---
+                    results = {
+                        'today': {'date': None, 'snwd': None, 'wteq': None, 'wteq_median': None},
+                        'yesterday': {'date': None, 'snwd': None, 'wteq': None}
+                    }
+                    
+                    if 'data' not in station_data:
+                        self._log.warning(f"No 'data' field in API response for {triplet}")
+                        final_reports[resort_name] = self._create_empty_report(station_name, error_reason='no_data', triplet=triplet)
+                        continue
+    
+                    for element_data in station_data.get('data', []):
+                        element_code = element_data['stationElement']['elementCode'].lower()
+                        values = element_data.get('values', [])
+                        
+                        if len(values) == 2:
+                            yest_data, today_data = values[0], values[1]
+                            results['today']['date'] = today_data['date']
+                            results['yesterday']['date'] = yest_data['date']
+                            if element_code == 'wteq':
+                                results['today']['wteq'] = today_data.get('value')
+                                results['today']['wteq_median'] = today_data.get('median')
+                                results['yesterday']['wteq'] = yest_data.get('value')
+                            elif element_code == 'snwd':
+                                results['today']['snwd'] = today_data.get('value')
+                                results['yesterday']['snwd'] = yest_data.get('value')
+                        elif len(values) == 1:
+                            today_data = values[0]
+                            results['today']['date'] = today_data['date']
+                            if element_code == 'wteq':
+                                results['today']['wteq'] = today_data.get('value')
+                                results['today']['wteq_median'] = today_data.get('median')
+                            elif element_code == 'snwd':
+                                results['today']['snwd'] = today_data.get('value')
+                    # --- End logic from _fetch_from_rest_api ---
+    
+                    # --- This is the same calculation logic from get_snowfall_report ---
+                    today = results.get('today', {})
+                    yesterday = results.get('yesterday', {})
+    
+                    snow_change = None
+                    swe_change = None
+                    if today.get('snwd') is not None and yesterday.get('snwd') is not None:
+                        snow_change = round(today['snwd'] - yesterday['snwd'], 1)
+                    
+                    if today.get('wteq') is not None and yesterday.get('wteq') is not None:
+                        swe_change = round(today['wteq'] - yesterday['wteq'], 3)
+    
+                    density = None
+                    if snow_change is not None and swe_change is not None and snow_change > 0 and swe_change > 0.001:
+                        density = round((swe_change / snow_change) * 100, 1)
+                    
+                    percent_of_median = None
+                    if today.get('wteq') is not None and today.get('wteq_median') is not None:
+                        if today['wteq_median'] > 0:
+                            percent_of_median = round((today['wteq'] / today['wteq_median']) * 100)
+                        elif today['wteq'] > 0:
+                            percent_of_median = 999
+                        else:
+                            percent_of_median = 100
+                    
+                    SNOW_THRESHOLD = 0.5
+                    SWE_THRESHOLD  = 0.01
+                    is_new_snow = (snow_change is not None and swe_change is not None and
+                                   snow_change >= SNOW_THRESHOLD and swe_change >= SWE_THRESHOLD)
+    
+                    if not is_new_snow:
+                        final_reports[resort_name] = {
+                            'station_name': station_name, 'triplet': triplet,
+                            'snow_depth': snow_change if snow_change is not None else 'N/A',
+                            'swe': swe_change if swe_change is not None else 'N/A',
+                            'density': 'N/A', 'percent_of_median': percent_of_median,
+                            'snow_category': 'N/A', 'latest_observation': today.get('date'),
+                            'unavailable': False, 'error_reason': "No new snow"
+                        }
+                    else:
+                        final_reports[resort_name] = {
+                            'station_name': station_name, 'triplet': triplet,
+                            'snow_depth': snow_change, 'swe': swe_change,
+                            'density': density, 'percent_of_median': percent_of_median,
+                            'snow_category': self._snow_category(density),
+                            'latest_observation': today.get('date'),
+                            'unavailable': False, 'error_reason': None
+                        }
+                    # --- End calculation logic ---
+    
+            except Exception as e:
+                self._log.error(f"SNOTEL batch API fetch error: {e}", exc_info=True)
+                # If the whole call fails, create empty reports for all
+                for resort_name in triplet_to_resort.values():
+                    if resort_name not in final_reports:
+                         final_reports[resort_name] = self._create_empty_report(
+                             station_name=self.STATION_INFO[resort_name]['name'], 
+                             error_reason='batch_api_fail', 
+                             triplet=self.STATION_INFO[resort_name]['triplet']
+                         )
+            
+            # 5. Fill in any missing resorts (in case they weren't in the API response)
+            for resort_name in self.STATION_INFO.keys():
+                if resort_name not in final_reports:
+                    self._log.warning(f"No SNOTEL data returned for {resort_name} in batch.")
+                    final_reports[resort_name] = self._create_empty_report(
+                        station_name=self.STATION_INFO[resort_name]['name'], 
+                        error_reason='missing_from_batch', 
+                        triplet=self.STATION_INFO[resort_name]['triplet']
+                    )
+                    
+            self._log.info(f"Batch SNOTEL processing complete. Found data for {len(final_reports)} stations.")
+            return final_reports
+
 
 class EmailSnowReportMessenger:
     """
@@ -2015,103 +2195,113 @@ class EmailSnowReportMessenger:
         """
 
     def _generate_snotel_box(self, snotel_data: Dict, station_info: Optional[Dict], resort_name: str) -> str:
-                """Generate SNOTEL backcountry data box with graceful fallback text."""
-                if not snotel_data:
-                    return ""
-        
-                station_name = snotel_data.get('station_name') or (station_info.get('name') if station_info else 'SNOTEL')
-        
-                # Distance + elevation
-                distance_str = "nearby"
-                elevation_str = "—"
-                if station_info and {'lat','lon'} <= station_info.keys():
-                    try:
-                        rc = RESORT_COORDS.get(resort_name)
-                        if rc:
-                            distance_str = f"{self.haversine_miles(rc['lat'], rc['lon'], station_info['lat'], station_info['lon']):.1f} mi"
-                    except Exception:
-                        pass
-                elev = station_info.get('elevation') if station_info else None
-                elevation_str = f"{int(elev)} ft" if isinstance(elev,(int,float)) else "—"
-        
-                # Check for unavailable status
-                unavailable = snotel_data.get('unavailable', False)
-                if unavailable:
-                    error_reason = snotel_data.get('error_reason')
-                    msg = "SNOTEL data unavailable"
-                    if error_reason:
-                        msg += f" ({error_reason})"
-                    status_info = f'<div style="font-family:Arial, Helvetica, sans-serif; font-size:12px; color:{EmailTheme.TEXT_SECONDARY}; margin-top:4px;">{msg}.</div>'
-                    
-                    # --- Return a simplified box for errors ---
-                    return f"""
-                      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%; background:{EmailTheme.BG_CARD}; border:1px solid {EmailTheme.BORDER_MEDIUM}; border-radius:12px;">
-                        <tr>
-                          <td style="padding:12px 12px 6px 12px;">
-                            <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.ACCENT_BLUE}; font-weight:700; font-size:12px;">SNOTEL</div>
-                            <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; margin-top:2px;">{station_name}</div>
-                            <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px; margin-top:2px;">{distance_str} • {elevation_str}</div>
-                          </td>
-                        </tr>
-                        <tr>
-                          <td style="padding:6px 12px 12px 12px;">
-                            {status_info}
-                          </td>
-                        </tr>
-                      </table>
-                    """
-        
-                # If we reach here, data is available.
-                def inches(value, fallback='0"'):
-                    if value in (None, '', 'N/A'): return fallback
-                    try:
-                        # --- THIS IS THE FIX ---
-                        # Removed the redundant `+ '"'` at the end of this line
-                        if isinstance(value, (int, float)): return f'{value:.2f}"'.rstrip('0').rstrip('.')
-                        # --- END OF FIX ---
-                        
-                        if isinstance(value, str) and value.endswith('"'): return value
-                        digits = ''.join(c for c in str(value) if c.isdigit() or c in ".-")
-                        return f'{digits}"' if digits else fallback
-                    except Exception: return fallback
-        
-                snow_depth = snotel_data.get('snow_depth', 0)
-                snow_depth_display = inches(snow_depth, fallback='0"') if snow_depth != 'melting/settling' else '0"'
-                swe_display = inches(snotel_data.get('swe', 0), fallback='0"')
-                density = snotel_data.get('density', 'N/A')
-                density_display = f"{density}%" if density not in ('N/A', None) else "—"
-                snow_quality = snotel_data.get('snow_category', 'N/A')
-                
-                # SNOTEL Badge Logic
-                if 'Powder' in str(snow_quality):
-                    badge_html = f'<div style="margin-top:8px; display:inline-block; background:{EmailTheme.SNOTEL_POWDER_BG}; color:{EmailTheme.SNOTEL_POWDER_TEXT}; padding:4px 8px; border-radius:999px; font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:700;">{snow_quality}</div>'
-                elif snow_depth != 'melting/settling' and snow_depth > 0:
-                     badge_html = f'<div style="margin-top:8px; display:inline-block; background:#eab308; color:#0b1220; padding:4px 8px; border-radius:999px; font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:700;">{snow_quality}</div>'
-                else:
-                    badge_html = f'<div style="margin-top:8px; display:inline-block; background:{EmailTheme.SNOTEL_HISTORIC_BG}; color:{EmailTheme.SNOTEL_HISTORIC_TEXT}; padding:4px 8px; border-radius:999px; font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:700;">—</div>'
+            """Generate SNOTEL backcountry data box with graceful fallback text."""
+            if not snotel_data:
+                return ""
     
+            station_name = snotel_data.get('station_name') or (station_info.get('name') if station_info else 'SNOTEL')
+    
+            # Distance + elevation
+            distance_str = "nearby"
+            elevation_str = "—"
+            if station_info and {'lat','lon'} <= station_info.keys():
+                try:
+                    rc = RESORT_COORDS.get(resort_name)
+                    if rc:
+                        distance_str = f"{self.haversine_miles(rc['lat'], rc['lon'], station_info['lat'], station_info['lon']):.1f} mi"
+                except Exception:
+                    pass
+            elev = station_info.get('elevation') if station_info else None
+            elevation_str = f"{int(elev)} ft" if isinstance(elev,(int,float)) else "—"
+    
+            # Check for unavailable status
+            unavailable = snotel_data.get('unavailable', False)
+            if unavailable:
+                error_reason = snotel_data.get('error_reason')
+                msg = "SNOTEL data unavailable"
+                if error_reason:
+                    msg += f" ({error_reason})"
+                status_info = f'<div style="font-family:Arial, Helvetica, sans-serif; font-size:12px; color:{EmailTheme.TEXT_SECONDARY}; margin-top:4px;">{msg}.</div>'
+                
+                # --- Return a simplified box for errors ---
                 return f"""
-                      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%; background:{EmailTheme.BG_CARD}; border:1px solid {EmailTheme.BORDER_MEDIUM}; border-radius:12px;">
+                    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%; background:{EmailTheme.BG_CARD}; border:1px solid {EmailTheme.BORDER_MEDIUM}; border-radius:12px;">
                         <tr>
-                          <td style="padding:12px 12px 6px 12px;">
+                            <td style="padding:12px 12px 6px 12px;">
+                                <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.ACCENT_BLUE}; font-weight:700; font-size:12px;">SNOTEL</div>
+                                <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; margin-top:2px;">{station_name}</div>
+                                <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px; margin-top:2px;">{distance_str} • {elevation_str}</div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="padding:6px 12px 12px 12px;">
+                                {status_info}
+                            </td>
+                        </tr>
+                    </table>
+                """
+    
+            # If we reach here, data is available.
+            def inches(value, fallback='0"'):
+                if value in (None, '', 'N/A'): return fallback
+                try:
+                    if isinstance(value, (int, float)): return f'{value:.2f}"'.rstrip('0').rstrip('.')
+                    if isinstance(value, str) and value.endswith('"'): return value
+                    digits = ''.join(c for c in str(value) if c.isdigit() or c in ".-")
+                    return f'{digits}"' if digits else fallback
+                except Exception: return fallback
+    
+            snow_depth = snotel_data.get('snow_depth', 0)
+            snow_depth_display = inches(snow_depth, fallback='0"') if snow_depth != 'melting/settling' else '0"'
+            swe_display = inches(snotel_data.get('swe', 0), fallback='0"')
+            density = snotel_data.get('density', 'N/A')
+            density_display = f"{density}%" if density not in ('N/A', None) else "—"
+            snow_quality = snotel_data.get('snow_category', 'N/A')
+            
+            # --- NEWLY ADDED ---
+            percent_of_median = snotel_data.get('percent_of_median')
+            median_display = f"{int(percent_of_median)}%" if isinstance(percent_of_median, (int, float)) else "—"
+            # --- END NEW ---
+    
+            # --- Safely check if snow_depth is a positive number ---
+            snow_depth_numeric = 0.0
+            if isinstance(snow_depth, (int, float)):
+                snow_depth_numeric = snow_depth
+            
+            # SNOTEL Badge Logic
+            if 'Powder' in str(snow_quality):
+                badge_html = f'<div style="margin-top:8px; display:inline-block; background:{EmailTheme.SNOTEL_POWDER_BG}; color:{EmailTheme.SNOTEL_POWDER_TEXT}; padding:4px 8px; border-radius:999px; font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:700;">{snow_quality}</div>'
+            elif snow_depth != 'melting/settling' and snow_depth_numeric > 0:
+                    badge_html = f'<div style="margin-top:8px; display:inline-block; background:#eab308; color:#0b1220; padding:4px 8px; border-radius:999px; font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:700;">{snow_quality}</div>'
+            else:
+                badge_html = f'<div style="margin-top:8px; display:inline-block; background:{EmailTheme.SNOTEL_HISTORIC_BG}; color:{EmailTheme.SNOTEL_HISTORIC_TEXT}; padding:4px 8px; border-radius:999px; font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:700;">—</div>'
+    
+            return f"""
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%; background:{EmailTheme.BG_CARD}; border:1px solid {EmailTheme.BORDER_MEDIUM}; border-radius:12px;">
+                    <tr>
+                        <td style="padding:12px 12px 6px 12px;">
                             <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.ACCENT_BLUE}; font-weight:700; font-size:12px;">SNOTEL</div>
                             <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; margin-top:2px;">{station_name}</div>
                             <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px; margin-top:2px;">{distance_str} • {elevation_str}</div>
                             {badge_html}
-                          </td>
-                        </tr>
-                        <tr>
-                          <td style="padding:6px 12px 12px 12px;">
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:6px 12px 12px 12px;">
                             <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
-                              <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">24-hr Snow Δ</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; text-align:right;">{snow_depth_display}</td></tr>
-                              <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">24-hr SWE Δ</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{swe_display}</td></tr>
-                              <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Density</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{density_display}</td></tr>
-                              <tr><td style="padding:8px 10px; border-bottom:0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Latest Obs</td><td style="padding:8px 1An 10px; border-bottom:0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{snotel_data.get('latest_observation', 'N/A')}</td></tr>
+                                <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">24-hr Snow Δ</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; text-align:right;">{snow_depth_display}</td></tr>
+                                <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">24-hr SWE Δ</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{swe_display}</td></tr>
+                                <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Density</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{density_display}</td></tr>
+                                
+                                <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">% of Median</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; text-align:right;">{median_display}</td></tr>
+                                
+                                <tr><td style="padding:8px 10px; border-bottom:0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Latest Obs</td><td style="padding:8px 10px; border-bottom:0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{snotel_data.get('latest_observation', 'N/A')}</td></tr>
                             </table>
-                          </td>
-                        </tr>
-                      </table>
-        """
+                        </td>
+                    </tr>
+                </table>
+            """
+
 
     # -------------------------------------------------------------------------
     # HTML GENERATION - FOOTER
@@ -2372,6 +2562,10 @@ class EmailTheme:
 # MAIN EXECUTION
 # =============================================================================
 
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
 def main():
     
     # Suppress Pandas warnings in output...
@@ -2387,8 +2581,8 @@ def main():
     # We import sys at the top of the script for this
     logging.basicConfig(
         handlers=[
-            logging.FileHandler(log_file),      # Saves to file
-            logging.StreamHandler(sys.stdout)   # Prints to console
+            logging.FileHandler(log_file),     # Saves to file
+            logging.StreamHandler(sys.stdout)  # Prints to console
         ],
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
@@ -2425,6 +2619,18 @@ def main():
         snotel_fetcher = SNOTELDataFetcher()
         nws_fetcher = NWSStormOutlook()
 
+        # === EFFICIENCY CHANGE ===
+        # Call SNOTEL *once* before the loop
+        logging.info("Fetching all SNOTEL data in one batch...")
+        try:
+            all_snotel_data = snotel_fetcher.get_all_snowfall_reports()
+            logging.info(f"Batch SNOTEL fetch complete. Got data for {len(all_snotel_data)} stations.")
+        except Exception as e:
+            logging.error(f"FATAL: SNOTEL batch fetch failed: {e}", exc_info=True)
+            # Create an empty dict so the script can continue
+            all_snotel_data = {}
+        # === END EFFICIENCY CHANGE ===
+
         # Initialize scrapers
         scrapers = [
             SnowbowlScraper(),
@@ -2446,15 +2652,26 @@ def main():
             if snow_data:
                 resort_name = snow_data["resort"]
                 
-                # 1. Get SNOTEL data and add it to the main object
-                logging.info(f"Fetching SNOTEL for: {resort_name}")
-                try:
-                    snow_data['snotel_data'] = snotel_fetcher.get_snowfall_report(resort_name)
-                except Exception as e:
-                    logging.warning(f"SNOTEL fetch failed for {resort_name}: {e}")
-                    snow_data['snotel_data'] = None
+                # === EFFICIENCY CHANGE ===
+                # 1. Get SNOTEL data from the pre-fetched dictionary
+                logging.info(f"Looking up pre-fetched SNOTEL for: {resort_name}")
+                snow_data['snotel_data'] = all_snotel_data.get(resort_name)
+                
+                if snow_data['snotel_data'] is None:
+                    # This is a fallback in case the batch call failed
+                    logging.warning(f"No pre-fetched SNOTEL data for {resort_name}, attempting single fallback fetch...")
+                    try:
+                        snow_data['snotel_data'] = snotel_fetcher.get_snowfall_report(resort_name)
+                    except Exception as e:
+                        logging.error(f"SNOTEL fallback fetch failed for {resort_name}: {e}")
+                        snow_data['snotel_data'] = snotel_fetcher._create_empty_report(
+                            station_name=snotel_fetcher.STATION_INFO.get(resort_name, {}).get('name', 'SNOTEL'),
+                            error_reason='fallback_fail',
+                            triplet=snotel_fetcher.STATION_INFO.get(resort_name, {}).get('triplet')
+                        )
+                # === END EFFICIENCY CHANGE ===
 
-                # 2. Get NWS data and add it to the main object
+                # 2. Get NWS data (still must be one by one)
                 logging.info(f"Fetching NWS for: {resort_name}")
                 coords = RESORT_COORDS.get(resort_name)
                 if coords:
@@ -2470,7 +2687,7 @@ def main():
                 resort_data_list.append(snow_data)
                 
                 # Now save the *complete* data to the CSV
-                scraper.save_to_csv(snow_data) 
+                scraper.save_to_csv(snow_data)  
                 logging.info(f"Complete data saved to CSV for {scraper.resort_name}")
             else:
                 logging.warning(f"No data retrieved for {scraper.resort_name}")
@@ -2489,6 +2706,7 @@ def main():
     except Exception as e:
         logging.error(f"Error in main function: {str(e)}", exc_info=True)
         raise
+
 
 if __name__ == "__main__":
     main()
