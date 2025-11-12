@@ -1,0 +1,2289 @@
+"""
+Montana/Idaho Snow Report Scraper - Cleaned & Standardized VersionThis script scrapes snow reports from multiple ski resorts, stores data in CSV files,
+and sends consolidated email reports to subscribers.Features:
+- Standardized data schema across all resorts
+- CSV backup storage
+- Firebase Firestore integration (for future migration)
+- Email notifications with HTML formatting
+- SNOTEL backcountry data integration
+- Powder alert notifications (configurable threshold)Environment Variables Required:
+- GMAIL_ADDRESS: Your Gmail address for sending reports
+- GMAIL_APP_PASSWORD: Gmail app-specific password
+- FIREBASE_SERVICE_ACCOUNT: Path to Firebase service account JSON (for future)Author: Original code by user, cleaned and standardized by Claude
+"""
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+from abc import ABC, abstractmethod
+from bs4 import BeautifulSoup
+import re
+import os
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import Dict, List, Optional
+import time
+import logging
+import json
+from math import ceil
+import base64
+# Gmail API imports
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from nws_storm_outlook_v3 import NWSStormOutlook
+from googleapiclient.errors import HttpError
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Powder Alert Threshold (inches of snow in 24 hours)
+POWDER_ALERT_THRESHOLD = 6
+# Resort coordinates for NWS forecasts
+RESORT_COORDS = {
+    "Snowbowl": {"lat": 46.9137, "lon": -113.9525},
+    "Discovery": {"lat": 46.3861, "lon": -113.2144},
+    "LookoutPass": {"lat": 47.4536, "lon": -115.7414},
+    "BigMountain": {"lat": 48.4853, "lon": -114.3572},
+    "LostTrail": {"lat": 45.7019, "lon": -113.9219},
+    "TetonPass": {"lat": 47.9299, "lon": -112.8109},
+    "Showdown": {"lat": 46.9939, "lon": -110.6647},
+    "Blacktail": {"lat": 48.0067, "lon": -114.3589}
+}
+
+# Data directory
+DATA_DIR = os.path.expanduser("~/snow_reports/data")
+LOG_DIR = os.path.expanduser("~/snow_reports/logs")
+# Ensure directories exist
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+def normalize_text(s: str) -> str:
+    """Replace curly quotes, dashes, and non-breaking spaces with ASCII equivalents."""
+    if not s:
+        return s
+
+    replacements = {
+        '\u2018': "'", '\u2019': "'",
+        '\u201c': '"', '\u201d': '"',
+        '\u2013': '-', '\u2014': '-',
+        '\xa0': ' ',  # non-breaking space -> normal space
+    }
+    for orig, repl in replacements.items():
+        s = s.replace(orig, repl)
+    
+    return s
+    
+# =============================================================================
+# BASE SCRAPER CLASS
+# =============================================================================
+class BaseSnowReportScraper(ABC):
+    """
+    Abstract base class for ski resort snow report scrapers.
+    All resort-specific scrapers inherit from this class.
+    """
+    
+    # Standardized schema - all scrapers must return these fields
+    STANDARD_COLUMNS = [
+        # Core metadata
+        'resort',                 # Resort name
+        'date',                   # Date data were accessed (YYYY-MM-DD)
+        'timestamp',              # Time data were accessed (YYYY-MM-DD HH:MM:SS)
+        'last_updated',           # Resort's reported last update time
+        
+        # Snowfall measurements (NEW SNOW)
+        'snow_overnight',         # Overnight snowfall (since lifts closed)
+        'snow_24h_base',          # 24-hour snowfall at base
+        'snow_24h_summit',        # 24-hour snowfall at summit
+        'snow_48h_base',          # 48-hour snowfall at base
+        'snow_48h_summit',        # 48-hour snowfall at summit
+        'snow_7day',              # 7-day snowfall total (for future)
+        
+        # Snow depth measurements (TOTAL BASE DEPTH)
+        'base_depth',             # Base depth (settled base)
+        'summit_depth',           # Summit depth (settled base)
+        
+        # Temperature
+        'temp_base',              # Base temperature
+        'temp_summit',            # Summit temperature
+        
+        # Wind conditions
+        'wind_speed',             # Wind speed measurement
+        
+        # Conditions
+        'conditions_surface',     # Surface conditions (powder, packed, etc.)
+        'weather_current',        # Current weather description
+        
+        # Operations
+        'lifts_open',             # Number/fraction of lifts operating
+        'runs_open',              # Number/fraction of runs open
+        
+        # Additional info
+        'comments',               # Additional notes/forecast/comments
+        
+        # Future NWS forecast fields (populated later)
+        'forecast_base_temp_high',    # Forecasted high temp at base
+        'forecast_base_temp_low',     # Forecasted low temp at base
+        'forecast_summit_temp_high',  # Forecasted high temp at summit
+        'forecast_summit_temp_low',   # Forecasted low temp at summit
+        'forecast_precipitation',     # Forecasted precipitation
+        'forecast_snow',              # Forecasted snow amount
+    ]
+    def __init__(self, resort_name: str):
+        self.resort_name = resort_name
+        self.csv_filename = os.path.join(DATA_DIR, f"{resort_name}_snow_report.csv")
+        
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+        }
+
+    @staticmethod
+    def clean_numeric(value) -> float:
+        """
+        Clean numeric values consistently across all scrapers.
+        Removes quotes, units, whitespace. Returns 0 for invalid values.
+        """
+        if value is None or value == '' or value == 'N/A':
+            return 0.0
+        
+        value_str = str(value).strip()
+        
+        # Handle slash notation (take first number)
+        if '/' in value_str:
+            value_str = value_str.split('/')[0]
+        
+        # Remove common units and quotes
+        for char in ['"', '°', 'F', 'C', 'mph', 'in', '%']:
+            value_str = value_str.replace(char, '')
+        
+        # Extract just digits, decimal, and minus
+        cleaned = ''.join(c for c in value_str if c.isdigit() or c in ['.', '-'])
+        
+        try:
+            return float(cleaned) if cleaned else 0.0
+        except ValueError:
+            return 0.0
+
+    @abstractmethod
+    def get_url(self) -> str:
+        """Return the URL to scrape for this resort."""
+        pass
+
+    @abstractmethod
+    def process_data(self, response) -> Dict:
+        """
+        Process the HTTP response and return standardized data.
+        
+        Must return a dictionary with ALL keys from STANDARD_COLUMNS.
+        Fields not available from the resort should be set to None.
+        """
+        pass    
+    
+    def get_snow_report(self) -> Optional[Dict]:
+        """Fetch and process snow report data from the resort website."""
+        try:
+            # First try with standard SSL verification
+            response = requests.get(self.get_url(), headers=self.headers, timeout=10)
+            response.raise_for_status()
+            
+            snow_data = self.process_data(response)
+            if snow_data:
+                snow_data.update({
+                    'resort': self.resort_name,
+                    'date': datetime.now().strftime('%Y-%m-%d'),
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+            return snow_data    
+        except requests.exceptions.SSLError:
+            # If SSL fails, try again without verification
+            try:
+                print(f"SSL verification failed for {self.resort_name}, retrying without verification...")
+                response = requests.get(self.get_url(), headers=self.headers, timeout=10, verify=False)
+                response.raise_for_status()
+                
+                snow_data = self.process_data(response)
+                if snow_data:
+                    snow_data.update({
+                        'resort': self.resort_name,
+                        'date': datetime.now().strftime('%Y-%m-%d'),
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                return snow_data
+                
+            except Exception as e:
+                print(f"Error fetching snow report for {self.resort_name} (without SSL verification): {e}")
+                return None
+        except requests.RequestException as e:
+            print(f"Error fetching snow report for {self.resort_name}: {e}")
+            return None
+            
+            
+    def save_to_csv(self, data: Dict):
+        """Save snow report data to CSV file with deduplication."""
+        try:
+            # Standardize last_updated parsing
+            last_updated_dt = None
+            if data.get('last_updated'):
+                try:
+                    for fmt in [
+                        '%Y-%m-%d %I:%M %p',
+                        '%Y-%m-%d %H:%M %p',
+                        '%Y-%m-%d %I:%M%p',
+                        '%Y-%m-%d %H:%M',
+                        '%Y-%m-%d %I:%M  %p',
+                        '%B %d, %Y %I:%M %p'
+                    ]:
+                        try:
+                            last_updated_dt = datetime.strptime(data['last_updated'], fmt)
+                            break
+                        except ValueError:
+                            continue
+                    if last_updated_dt:
+                        data['last_updated'] = last_updated_dt.strftime('%Y-%m-%d %I:%M %p')
+                except Exception as e:
+                    print(f"Could not parse last_updated: {data.get('last_updated')} - Error: {e}")
+    
+            # Standardize data with all required columns
+            standardized_data = {col: None for col in self.STANDARD_COLUMNS}
+            standardized_data.update({
+                k: normalize_text(v) if isinstance(v, str) else v
+                for k, v in data.items() if v is not None
+            })
+    
+            # Create DataFrame
+            df = pd.DataFrame([standardized_data], columns=self.STANDARD_COLUMNS)
+    
+            if os.path.exists(self.csv_filename):
+                # Read existing CSV
+                dtype_dict = {col: str for col in self.STANDARD_COLUMNS}
+                existing_df = pd.read_csv(self.csv_filename, dtype=dtype_dict)
+    
+                # Convert date columns
+                existing_df['date'] = pd.to_datetime(existing_df['date'], errors='coerce')
+    
+                def parse_last_updated(x):
+                    formats = [
+                        '%Y-%m-%d %I:%M %p',
+                        '%Y-%m-%d %H:%M %p',
+                        '%Y-%m-%d %I:%M%p',
+                        '%Y-%m-%d %H:%M',
+                        '%Y-%m-%d %I:%M  %p',
+                        '%B %d, %Y %I:%M %p'
+                    ]
+                    for f in formats:
+                        try:
+                            return pd.to_datetime(x, format=f)
+                        except Exception:
+                            continue
+                    return pd.NaT
+    
+                existing_df['last_updated'] = existing_df['last_updated'].apply(parse_last_updated)
+    
+                # Remove entries for the same date as this update (if we parsed it)
+                if last_updated_dt:
+                    existing_df = existing_df[
+                        (existing_df['date'].dt.date != last_updated_dt.date()) &
+                        (existing_df['last_updated'].dt.date != last_updated_dt.date())
+                    ]
+    
+                # Prepare new row’s date fields
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')
+                df['last_updated'] = df['last_updated'].apply(parse_last_updated)
+    
+                # Append
+                df = pd.concat([existing_df, df], ignore_index=True, sort=False)
+    
+            # Sort and deduplicate (keep latest per date)
+            df = df.sort_values(['date', 'last_updated'], ascending=True).dropna(subset=['date'])
+            df = df.drop_duplicates(subset='date', keep='last')
+    
+            # Convert datetime back to string for saving
+
+            if pd.api.types.is_datetime64_any_dtype(df['date']):
+                df['date'] = df['date'].dt.strftime('%Y-%m-%d')
+            
+            if pd.api.types.is_datetime64_any_dtype(df['last_updated']):
+                df['last_updated'] = df['last_updated'].dt.strftime('%Y-%m-%d %I:%M %p')
+    
+            # Save to CSV
+            df.to_csv(self.csv_filename, index=False, encoding='utf-8-sig')
+            print(f"Data saved to {self.csv_filename}")
+    
+        except Exception as e:
+            print(f"Error saving to CSV: {e}")
+            import traceback
+            traceback.print_exc()
+    
+
+
+            
+# =============================================================================
+# RESORT-SPECIFIC SCRAPERS
+# =============================================================================
+class SnowbowlScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("Snowbowl")
+    
+    def get_url(self):
+        return "https://www.montanasnowbowl.com/report.php"
+    
+    
+    def process_data(self, response):
+            data_dict = {}
+            
+            # --- FIX: Wrap comment-parsing in a try...except block ---
+            # This part is fragile and depends on a hidden HTML comment.
+            # If it fails, we want to continue and try parsing the HTML table.
+            try:
+                # Parse polling data from HTML comments
+                comment_pattern = r''
+                polling_data = re.search(comment_pattern, response.text, re.DOTALL)
+                
+
+                if polling_data:
+                    data_string = polling_data.group(1)
+                    pairs = data_string.split('|~')
+                    
+                    for pair in pairs:
+                        if '|' in pair:
+                            key, value = pair.split('|')
+                            data_dict[key.strip()] = value.strip()
+            except Exception as e:
+                print(f"Warning: Could not parse polling data for Snowbowl: {e}")
+                # data_dict remains empty, and that's okay.
+            # --- END FIX ---
+                
+            # Initialize with all standard columns
+            data = {col: None for col in self.STANDARD_COLUMNS}
+            
+            # Map resort data to standard columns (will use data_dict if it was populated)
+            data['summit_depth'] = data_dict.get('surface_depth_summit', '')
+            data['base_depth'] = data_dict.get('surface_depth_base', '')
+            data['temp_base'] = data_dict.get('current_temp_base', '')
+            data['lifts_open'] = data_dict.get('operations_lifts', '')
+            data['runs_open'] = data_dict.get('operations_trails', '')
+            data['comments'] = data_dict.get('comments', '')
+            
+            # Format last_updated
+            if data_dict.get('lastupdated'):
+                try:
+                    date_str = data_dict['lastupdated']
+                    parsed_date = datetime.strptime(date_str, '%A %b %d, %Y %I:%M %p')
+                    data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+                except ValueError:
+                    data['last_updated'] = data_dict.get('lastupdated', '')
+            
+                
+            # This part will now *always* run, even if comment parsing failed
+            try:
+                # Parse HTML for table data
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                rows = soup.find_all('tr')
+                for row in rows:
+                    base_cell = row.find('td', {'bgcolor': '#ffffff'})
+                    summit_cell = row.find('td', {'bgcolor': '#e6242b'})
+                    
+                    if base_cell and 'Base' in base_cell.text:
+                        cells = row.find_all('td')
+                        if len(cells) >= 5:
+                            data['snow_24h_base'] = self.clean_numeric(cells[2].text.strip())
+                            # Only update temp if not already set by polling data
+                            if not data['temp_base']:
+                                data['temp_base'] = cells[3].text.strip()
+                    
+                    if summit_cell and 'Summit' in summit_cell.text:
+                        cells = row.find_all('td')
+                        if len(cells) >= 5:
+                            data['snow_24h_summit'] = self.clean_numeric(cells[2].text.strip())
+                            data['temp_summit'] = cells[3].text.strip()
+                            data['wind_speed'] = self.clean_numeric(cells[4].text.strip())
+                
+                # Get surface conditions
+                conditions = []
+                condition_rows = soup.find_all('tr')
+                for row in condition_rows:
+                    condition_cell = row.find('td', {'bgcolor': '#e6242b'}) or row.find('td', {'bgcolor': '#ffffff'})
+                    if condition_cell and any(cond in condition_cell.text for cond in ['Powder:', 'Packed Powder:', 'Packed:', 'Machine Groomed:', 'Firm Packed:', 'Spring Snow:']):
+                        check_cell = row.find('img', {'src': re.compile(r'check\.gif$')})
+                        if check_cell:
+                            condition_text = condition_cell.text.strip().rstrip(':')
+                            conditions.append(condition_text)
+                
+                if conditions:
+                    data['conditions_surface'] = ', '.join(conditions)
+            except Exception as e:
+                print(f"Error parsing Snowbowl HTML table data: {e}")
+            
+            return data
+
+class DiscoveryScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("Discovery")
+
+    def _clean_numeric(self, value):
+        """Clean numeric values by removing non-numeric characters."""
+        if not value:
+            return None
+        try:
+            cleaned = re.sub(r'[^\d.-]', '', str(value))
+            return cleaned if cleaned else None
+        except:
+            return None
+
+    def get_url(self):
+        return "https://www.skidiscovery.com/snow-report/"
+
+    def process_data(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Initialize with all standard columns
+        data = {col: None for col in self.STANDARD_COLUMNS}
+        
+        # Get last updated time
+        updated = soup.find('span', class_='tablinks')
+        if updated:
+            try:
+                date_str = updated.text.replace('Updated:', '').strip()
+                date_str = date_str.replace(' at ', ' ')
+                parsed_date = datetime.strptime(date_str, '%B %d, %Y %I:%M %p')
+                data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+            except ValueError:
+                data['last_updated'] = updated.text.replace('Updated:', '').strip()
+        
+        # Find all report rows
+        primary_condition = None
+        secondary_condition = None
+        
+        rows = soup.find_all('div', class_='row')
+        for row in rows:
+            label = row.find('p')
+            if not label:
+                continue
+                
+            label_text = label.text.strip()
+            value_elem = row.find('p', class_='little-text')
+            if value_elem:
+                value = value_elem.text.strip()
+                
+                if label_text == 'New Snow (24 hours)':
+                    data['snow_24h_base'] = self.clean_numeric(value)
+                elif label_text == 'New Snow (48 hours)':
+                    data['snow_48h_base'] = self._clean_numeric(value)
+                elif label_text == 'New Snow (since lifts closed)':
+                    data['snow_overnight'] = self._clean_numeric(value)
+                elif label_text == 'Snow Depth - Bottom':
+                    data['base_depth'] = self._clean_numeric(value)
+                elif label_text == 'Snow Depth - Top':
+                    data['summit_depth'] = self._clean_numeric(value)
+                elif label_text == 'Current Temperature':
+                    data['temp_base'] = self._clean_numeric(value)
+                elif label_text == 'Current Wind':
+                    if value.lower() != 'no':
+                        data['wind_speed'] = self.clean_numeric(value)
+                elif label_text == 'Surface Conditions (Primary)':
+                    primary_condition = value
+                elif label_text == 'Surface Conditions (Secondary)':
+                    secondary_condition = value
+                elif label_text == 'Lifts Open':
+                    data['lifts_open'] = value
+                elif label_text == 'Trails Open':
+                    data['runs_open'] = value
+                elif label_text == 'Current Weather':
+                    data['weather_current'] = value
+        
+        # Combine surface conditions
+        if primary_condition and secondary_condition:
+            data['conditions_surface'] = f"{primary_condition}, {secondary_condition}".strip(', ')
+        elif primary_condition:
+            data['conditions_surface'] = primary_condition
+        
+        return data
+
+class LookoutPassScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("LookoutPass")
+
+    def get_url(self):
+        return "https://skilookout.com/snow-report"
+
+    def _parse_snow_value(self, value_text):
+        """Parse 'X" Summit | Y" Base' format into (summit, base) tuple."""
+        if not value_text or '|' not in value_text:
+            return None, None
+        try:
+            summit_part, base_part = value_text.split('|')
+            summit = re.search(r'(\d+\.?\d*)', summit_part)
+            base = re.search(r'(\d+\.?\d*)', base_part)
+            return (summit.group(1) if summit else None,
+                    base.group(1) if base else None)
+        except:
+            return None, None
+
+    def process_data(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Initialize with all standard columns
+        data = {col: None for col in self.STANDARD_COLUMNS}
+        
+        # Get last updated time
+        last_updated_elem = soup.find('span', class_='sr_inner_txt_sml')
+        if last_updated_elem:
+            try:
+                date_str = last_updated_elem.text.strip()
+                date_str = re.sub(r'\s+(?:PST|PDT)$', '', date_str)
+                parsed_date = datetime.strptime(date_str, '%b %d %Y, %I:%M %p')
+                data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+            except ValueError as e:
+                print(f"Error parsing last_updated date: {e}")
+        
+        # Parse HTML data for snow measurements
+        snowfall_rows = soup.find_all('div', class_=['light_row', 'dark_row'])
+        for row in snowfall_rows:
+            left = row.find('div', class_='left')
+            right = row.find('div', class_='right')
+            
+            if left and right:
+                label = left.find('p')
+                value = right.find('p')
+                
+                if label and value:
+                    label_text = label.text.strip()
+                    value_text = value.text.strip()
+                    
+                    if '24-HR:' in label_text:
+                        summit, base = self._parse_snow_value(value_text)
+                        data['snow_24h_summit'] = self.clean_numeric(summit)
+                        data['snow_24h_base'] = self.clean_numeric(base)
+                    elif '48-HR:' in label_text:
+                        summit, base = self._parse_snow_value(value_text)
+                        data['snow_48h_summit'] = summit
+                        data['snow_48h_base'] = base
+                    elif 'Base:' in label_text:
+                        data['base_depth'] = value_text.replace('"', '')
+                    elif 'Summit:' in label_text:
+                        data['summit_depth'] = value_text.replace('"', '')
+                    elif 'Base Temp:' in label_text:
+                        data['temp_base'] = value_text.replace('°', '')
+                    elif 'Summit Temp:' in label_text:
+                        data['temp_summit'] = value_text.replace('°', '')
+                    elif 'Open:' in label_text:
+                        data['runs_open'] = value_text
+                    elif 'Conditions:' in label_text:
+                        data['conditions_surface'] = value_text
+        
+        return data
+
+class BigMountainScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("BigMountain")
+
+    def get_url(self):
+        return "https://skiwhitefish.com/snowreport/"
+
+    def _get_weather_data(self):
+        """Get weather data from the weather page."""
+        try:
+            weather_url = "https://skiwhitefish.com/weather/"
+            response = requests.get(weather_url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            weather_data = {
+                'temp_summit': None,
+                'wind_speed': None
+            }
+            
+            temp_cols = soup.find_all('div', class_='wp-block-column')
+            for col in temp_cols:
+                em = col.find('em')
+                if em and 'Temperature' in em.text:
+                    if br := col.find('br'):
+                        temp_text = br.next_sibling.strip() if br.next_sibling else None
+                        if temp_text:
+                            temp_match = re.search(r'(-?\d+)', temp_text)
+                            if temp_match:
+                                weather_data['temp_summit'] = temp_match.group(1)
+                
+                elif em and 'Winds' in em.text:
+                    if br := col.find('br'):
+                        wind_text = br.next_sibling.strip() if br.next_sibling else None
+                        if wind_text:
+                            speed_match = re.search(r'@\s*(\d+(?:\.\d+)?)', wind_text)
+                            if speed_match:
+                                weather_data['wind_speed'] = self.clean_numeric(speed_match.group(1))
+            
+            return weather_data
+        except Exception as e:
+            print(f"Error getting weather data: {e}")
+            return None
+
+    def process_data(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Initialize with all standard columns
+        data = {col: None for col in self.STANDARD_COLUMNS}
+        
+        # Find date and time
+        date = None
+        time = None
+        for p_tag in soup.find_all('p'):
+            strong_tag = p_tag.find('strong')
+            if strong_tag:
+                text = strong_tag.text
+                if re.search(r'\w+,\s+\w+\.?\s+\d{1,2},\s+\d{4}', text):
+                    date = text.rstrip(':')
+                elif re.search(r'\d+(?::\d+)?\s*[ap]\.m\.', text, re.IGNORECASE):
+                    time = re.search(r'(\d+(?::\d+)?\s*[ap]\.m\.)', text, re.IGNORECASE).group(1)
+                    
+        # Format last_updated
+        if date and time:
+            try:
+                date_str = f"{date} {time}"
+                date_str = date_str.replace('.', '').replace('  ', ' ').strip()
+                if ':' not in time:
+                    date_str = date_str.replace(' am', ':00 am').replace(' pm', ':00 pm')
+                parsed_date = datetime.strptime(date_str, '%A, %b %d, %Y %I:%M %p')
+                data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+            except ValueError:
+                if date:
+                    data['last_updated'] = f"{date} {time}"
+        
+        # Get weather data
+        weather_data = self._get_weather_data()
+        if weather_data:
+            data.update(weather_data)
+        
+        # Process Summit data
+        summit_cols = soup.find_all('div', class_='wp-block-column')
+        for col in summit_cols:
+            h5 = col.find('h5')
+            p = col.find('p')
+            if h5 and p:
+                value = h5.text.strip().replace('"', '')
+                label = p.text.strip()
+                
+                if 'Overnight Fresh' in label:
+                    data['snow_overnight'] = value
+                elif 'Past 24 Hours' in label and not data['snow_24h_summit']:
+                    data['snow_24h_summit'] = self.clean_numeric(value)
+                elif 'Settled Base' in label and not data['summit_depth']:
+                    data['summit_depth'] = value
+        
+        # Process Base Area data
+        base_area = False
+        for col in summit_cols:
+            h4 = col.find('h4')
+            if h4 and 'Base Area' in h4.text:
+                base_area = True
+                continue
+            
+            if base_area:
+                h5 = col.find('h5')
+                p = col.find('p')
+                if h5 and p:
+                    value = h5.text.strip().replace('"', '')
+                    label = p.text.strip()
+                    
+                    if 'Past 24 Hours' in label:
+                        data['snow_24h_base'] = self.clean_numeric(value)
+                    elif 'Settled Base' in label:
+                        data['base_depth'] = value
+        
+        return data
+
+class LostTrailScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("LostTrail")
+
+    def get_url(self):
+        return "https://losttrail.com/snow-report/"
+
+    def process_data(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Initialize with all standard columns
+        data = {col: None for col in self.STANDARD_COLUMNS}
+        
+        # Extract "Last Updated" Section
+        last_updated_element = soup.find('div', class_='elementor-heading-title elementor-size-default',
+                                         string=re.compile(r'Snow Report for', re.I))
+        
+        if last_updated_element:
+            last_updated_text = last_updated_element.get_text(strip=True)
+            match = re.search(r'Snow Report for (.+)', last_updated_text)
+            if match:
+                try:
+                    date_str = match.group(1).strip()
+                    parsed_date = datetime.strptime(date_str, "%B %d, %Y %I:%M %p")
+                    data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+                except ValueError as e:
+                    print(f"Error parsing last updated date for Lost Trail: {e}")
+        
+        # Extract Snowfall Data
+        labels = {
+            "New Snow (since lifts closed)": "snow_overnight",
+            "New Snow, 24 hours": "snow_24h_base",
+            "New Snow, 48 hours": "snow_48h_base",
+            "Snow Depth - Bottom": "base_depth",
+            "Snow Depth - Top": "summit_depth"
+        }
+        
+        for label, key in labels.items():
+            element = soup.find(string=re.compile(label, re.I))
+            if element:
+                next_sibling = element.find_next("span", class_="elementor-heading-title")
+                if next_sibling:
+                    data[key] = next_sibling.text.strip().replace('"', '')
+        
+        # Extract Surface Conditions
+        primary_condition = soup.find(string=re.compile("Surface Conditions \(Primary\)", re.I))
+        secondary_condition = soup.find(string=re.compile("Surface Conditions \(Secondary\)", re.I))
+        if primary_condition:
+            primary_text = primary_condition.find_next("span").text.strip()
+            if secondary_condition:
+                secondary_text = secondary_condition.find_next("span").text.strip()
+                data['conditions_surface'] = f"{primary_text}, {secondary_text}"
+            else:
+                data['conditions_surface'] = primary_text
+        
+        # Extract Lifts and Runs Open
+        lifts_section = soup.find(string=re.compile("Number of Lifts Open", re.I))
+        if lifts_section:
+            lifts_value = lifts_section.find_next("span", class_="elementor-heading-title")
+            if lifts_value:
+                data['lifts_open'] = lifts_value.text.strip()
+        
+        trails_section = soup.find(string=re.compile("Trails Open", re.I))
+        if trails_section:
+            trails_value = trails_section.find_next("span", class_="elementor-heading-title")
+            if trails_value:
+                data['runs_open'] = trails_value.text.strip()
+        
+        # Extract Comments
+        comments_section = soup.find('div', class_='elementor-widget-container')
+        if comments_section:
+            data['comments'] = comments_section.get_text(strip=True)
+        
+        return data
+
+class TetonPassScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("TetonPass")
+
+    def get_url(self):
+        return "https://www.skitetonmt.com/mountain-info/current-conditions"
+
+    def process_data(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Initialize with all standard columns
+        data = {col: None for col in self.STANDARD_COLUMNS}
+        
+        # Extract last updated time
+        updated_elem = soup.find('p', class_='CDt4Ke', string=lambda text: 'Updated' in str(text) if text else False)
+        if updated_elem:
+            try:
+                date_str = updated_elem.text.replace('Updated', '').strip()
+                parsed_date = datetime.strptime(date_str, '%m/%d/%Y %I:%M%p')
+                data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+            except ValueError:
+                data['last_updated'] = updated_elem.text.replace('Updated', '').strip()
+        
+        # Find text paragraphs with snow and condition information
+        paragraphs = soup.find_all('p', class_='CDt4Ke')
+        for p in paragraphs:
+            text = p.get_text().strip()
+            
+            if "New Snow:" in text:
+                snow_match = re.search(r'(\d+)\"', text)
+                if snow_match:
+                    data['snow_24h_base'] = self.clean_numeric(snow_match.group(1))
+            
+            elif "Settled Base" in text:
+                depth_match = re.search(r'(\d+)\"', text)
+                if depth_match:
+                    if "mid-mountain" in text:
+                        data['base_depth'] = depth_match.group(1)
+                    elif "top of lift" in text:
+                        data['summit_depth'] = depth_match.group(1)
+            
+            elif "Temperature:" in text:
+                temp_match = re.search(r'(-?\d+)\s*degrees', text)
+                if temp_match:
+                    data['temp_base'] = temp_match.group(1)
+            
+            elif "Conditions:" in text:
+                data['conditions_surface'] = text.replace('Conditions:', '').strip()
+            
+            elif "Wind:" in text:
+                data['wind_speed'] = self.clean_numeric(text.replace('Wind:', '').strip())
+        
+        return data
+
+class ShowdownScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("Showdown")
+
+    def get_url(self):
+        return "https://www.showdownmontana.com/snow-report"
+
+    def process_data(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Initialize with all standard columns
+        data = {col: None for col in self.STANDARD_COLUMNS}
+        
+        # Find time string
+        time_str = None
+        large_paragraphs = soup.find_all('p', class_='sqsrte-large')
+        for p in large_paragraphs:
+            if 'Last Update' in p.text:
+                time_str = p.text.strip()
+                break
+        
+        # Find date string
+        all_h3s = soup.find_all('h3')
+        for h3 in all_h3s:
+            if re.match(r'\d{1,2}/\d{1,2}/\d{4}', h3.text.strip()):
+                date_str = h3.text.strip()
+                try:
+                    parsed_date = datetime.strptime(date_str, '%m/%d/%Y')
+                    formatted_date = parsed_date.strftime('%Y-%m-%d')
+                    if time_str:
+                        clean_time = time_str.replace('Last Update:', '').strip()
+                        data['last_updated'] = f"{formatted_date} {clean_time}"
+                except Exception as e:
+                    print(f"Error parsing date: {e}")
+        
+        # Process snow blocks
+        snow_blocks = soup.find_all('h2', style=lambda value: value and 'white-space:pre-wrap;' in value)
+        for block in snow_blocks:
+            value = block.get_text(strip=True)
+            if not value:
+                continue
+            
+            sibling = block.find_next_sibling('p', class_='sqsrte-large')
+            if sibling:
+                label = sibling.get_text(strip=True)
+                if 'Base' in label and 'elv. 6,800' in label:
+                    data['base_depth'] = value.replace('"', '')
+                elif 'Summit' in label and 'elv. 8,200' in label:
+                    data['summit_depth'] = value.replace('"', '')
+                elif 'Last 24 Hour' in label:
+                    data['snow_24h_base'] = self.clean_numeric(value)
+                elif 'Overnight' in label:
+                    data['snow_overnight'] = value.replace('"', '')
+        
+        # Process text blocks
+        text_blocks = soup.find_all('p', class_='sqsrte-large')
+        for p in text_blocks:
+            text = p.get_text(strip=True)
+            
+            if 'Current Temperature:' in text:
+                temp_match = re.search(r'(-?\d+)', text)
+                if temp_match:
+                    data['temp_base'] = temp_match.group(1)
+            
+            elif 'Trails Open:' in text:
+                data['runs_open'] = text.replace('Trails Open:', '').strip()
+            
+            elif 'Lifts Open:' in text:
+                data['lifts_open'] = text.replace('Lifts Open:', '').strip()
+            
+            elif 'Primary Surface:' in text:
+                primary_surface = text.replace('Primary Surface:', '').strip()
+                secondary_block = p.find_next('p', class_='sqsrte-large')
+                if secondary_block and 'Secondary Surface:' in secondary_block.get_text():
+                    secondary_surface = secondary_block.get_text().replace('Secondary Surface:', '').strip()
+                    data['conditions_surface'] = f"{primary_surface}, {secondary_surface}"
+                else:
+                    data['conditions_surface'] = primary_surface
+            
+            elif "Today's forecast:" in text:
+                data['comments'] = text.replace("Today's forecast:", '').strip()
+        
+        return data
+
+class BlacktailScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("Blacktail")
+
+    def get_url(self):
+        return "https://blacktailmountain.com/snow-report/"
+
+    def process_data(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Initialize with all standard columns
+        data = {col: None for col in self.STANDARD_COLUMNS}
+        
+        # Get the date from the article header
+        article_date = None
+        article_header = soup.find('div', class_='byline')
+        if article_header:
+            reported_h3 = article_header.find('h3')
+            if reported_h3 and 'Reported:' in reported_h3.text:
+                date_match = re.search(r'\d{2}/\d{2}/\d{2}', reported_h3.text)
+                if date_match:
+                    try:
+                        article_date = datetime.strptime(date_match.group(), '%m/%d/%y').strftime('%Y-%m-%d')
+                    except ValueError:
+                        pass
+        
+        # Look for snow report details in the sidebar
+        snow_sidebar = soup.find('ul', class_='reports')
+        if snow_sidebar:
+            list_items = snow_sidebar.find_all('li')
+            update_time = None
+            for item in list_items:
+                strong_text = item.find('strong')
+                if strong_text:
+                    label = strong_text.get_text(strip=True).rstrip(':')
+                    value = item.get_text(strip=True).replace(strong_text.get_text(strip=True), '').strip()
+                    
+                    if label == 'Updated':
+                        update_time = value
+                        if article_date and update_time:
+                            time_str = update_time.lower().replace('am', ' AM').replace('pm', ' PM').strip()
+                            data['last_updated'] = f"{article_date} {time_str}"
+                    elif label == 'Current Temp':
+                        temp_match = re.search(r'(-?\d+\.?\d*)', value)
+                        if temp_match:
+                            data['temp_base'] = temp_match.group(1)
+                    elif label == 'New Snow Overnight':
+                        data['snow_overnight'] = value.replace('"', '').strip()
+                    elif label == 'New Snow 24 Hours':
+                        data['snow_24h_base'] = self.clean_numeric(value)
+                    elif label == 'Summit Depth':
+                        data['summit_depth'] = value.replace('"', '').strip()
+                    elif label == 'Wind':
+                        data['wind_speed'] = self.clean_numeric(value)
+        
+        # Look for grooming report details
+        grooming_sidebar = soup.find('div', id='groomingSidebar')
+        if grooming_sidebar:
+            list_items = grooming_sidebar.find_all('li')
+            for item in list_items:
+                strong_text = item.find('strong')
+                if strong_text:
+                    label = strong_text.get_text(strip=True).rstrip(':')
+                    value = item.get_text(strip=True).replace(strong_text.get_text(strip=True), '').strip()
+                    
+                    if label == 'Number of lifts in operation':
+                        data['lifts_open'] = value.strip()
+                    elif label == 'Number of trails groomed':
+                        data['runs_open'] = value.strip()
+        
+        # Look for comments in the page content
+        entry_content = soup.find('div', class_='entry-content')
+        if entry_content:
+            data['comments'] = entry_content.get_text(strip=True)
+        
+        return data
+# =============================================================================
+# SNOTEL DATA INTEGRATION
+# =============================================================================
+# =============================================================================
+# SNOTEL DATA INTEGRATION (DROP-IN REPLACEMENT)
+# =============================================================================
+class SNOTELDataFetcher:
+    """
+    Fetches backcountry snow data from SNOTEL stations via the reportGenerator CSV endpoint.
+    Computes 24h (or 48h) depth and SWE changes, density, and a qualitative snow category.
+    Hardened with retries, backoff, per-run cache, and friendly fallbacks.
+    """
+    STATION_INFO = {
+        "Showdown":    {"triplet": "437:MT:SNTL",  "name": "Deadman Creek",  "lat": 46.79, "lon": -110.68, "elevation": 6440},
+        "TetonPass":   {"triplet": "649:MT:SNTL",  "name": "Mount Lockhart", "lat": 47.92, "lon": -112.82, "elevation": 6430},
+        "Discovery":   {"triplet": "850:MT:SNTL",  "name": "Warm Springs",   "lat": 46.27, "lon": -113.16, "elevation": 7840},
+        "LostTrail":   {"triplet": "727:MT:SNTL",  "name": "Saddle Mountain","lat": 45.69, "lon": -113.97, "elevation": 7890},
+        "Snowbowl":    {"triplet": "901:MT:SNTL",  "name": "Stuart Peak",    "lat": 47.00, "lon": -113.93, "elevation": 7270},
+        "LookoutPass": {"triplet": "594:ID:SNTL",  "name": "Lookout",        "lat": 47.46, "lon": -115.70, "elevation": 5180},
+        "Blacktail":   {"triplet": "1144:MT:SNTL", "name": "Blacktail Mtn",  "lat": 47.98, "lon": -114.35, "elevation": 5660},
+        "BigMountain": {"triplet": "469:MT:SNTL",  "name": "Emery Creek",    "lat": 48.43, "lon": -113.94, "elevation": 4340},
+    }
+    def __init__(self):
+        import os
+        import logging
+        from requests import Session
+        from requests.adapters import HTTPAdapter
+        try:
+            # urllib3 location depends on version; handle both
+            from urllib3.util.retry import Retry
+        except Exception:
+            from requests.packages.urllib3.util.retry import Retry  # fallback
+        self._log = logging.getLogger(__name__)
+        # Tunables via env (sane defaults provided)
+        connect_timeout = float(os.getenv("SNOTEL_TIMEOUT_CONNECT", "10"))
+        read_timeout    = float(os.getenv("SNOTEL_TIMEOUT_READ",    "25"))
+        total_retries   = int(os.getenv("SNOTEL_RETRIES",           "4"))
+        backoff_factor  = float(os.getenv("SNOTEL_BACKOFF",         "1.2"))
+        self._timeout = (connect_timeout, read_timeout)
+        retry = Retry(
+            total=total_retries,
+            connect=total_retries,
+            read=total_retries,
+            status=total_retries,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "HEAD"]),
+            backoff_factor=backoff_factor,
+            raise_on_status=False,
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
+        sess = Session()
+        sess.headers.update({
+            "User-Agent": "Mozilla/5.0 (SnowReportBot/1.0; +https://example.com) requests",
+            "Accept": "text/csv, text/plain, */*",
+            "Connection": "keep-alive",
+        })
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        self.session = sess
+        self._cache = {}  # per-run cache by triplet
+    
+    def get_station_info(self, resort_name: str) -> Optional[Dict]:
+        return self.STATION_INFO.get(resort_name)
+    
+    @staticmethod
+    def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Great-circle distance between two points, in miles."""
+        from math import radians, sin, cos, asin, sqrt
+        R = 3958.7613  # miles
+        phi1, lam1, phi2, lam2 = map(radians, [lat1, lon1, lat2, lon2])
+        dphi, dlam = (phi2 - phi1), (lam2 - lam1)
+        a = sin(dphi/2)**2 + cos(phi1) * cos(phi2) * sin(dlam/2)**2
+        c = 2 * asin(sqrt(a))
+        return R * c
+    
+    @staticmethod
+    def _snow_category(density_pct: float) -> str:
+        """Classify snow quality by density."""
+        if density_pct < 6:
+            return "Blower Powder"
+        elif density_pct < 10:
+            return "Light Powder"
+        elif density_pct < 15:
+            return "Medium Powder"
+        elif density_pct < 25:
+            return "Heavy Powder"
+        elif density_pct < 40:
+            return "Wet Snow"
+        else:
+            return "Slush"
+    
+    @staticmethod
+    def _parse_report_csv(text: str):
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if any('# Stations do not exist' in ln for ln in lines):
+            return []
+        try:
+            start_idx = next(i for i, ln in enumerate(lines) if ln.startswith('Date,'))
+        except StopIteration:
+            return []
+        data = []
+        for ln in lines[start_idx + 1:]:
+            if ln.startswith('#') or not ln:
+                continue
+            parts = ln.split(',')
+            if len(parts) < 3:
+                continue
+            date_str = parts[0]
+            try:
+                wteq = float(parts[1]) if parts[1] not in ('', 'NA', 'null') else None
+            except ValueError:
+                wteq = None
+            try:
+                snwd = float(parts[2]) if parts[2] not in ('', 'NA', 'null') else None
+            except ValueError:
+                snwd = None
+            data.append({'date': date_str, 'WTEQ': wteq, 'SNWD': snwd})
+        return data
+    
+    def _create_empty_report(self, station_name=None, latest_observation=None, error_reason=None):
+        """Return an empty-but-informative report structure."""
+        return {
+            'station_name': station_name or 'SNOTEL',
+            'snow_depth': 'melting/settling',
+            'swe': 0,
+            'density': 'N/A',
+            'snow_category': 'N/A',
+            'temp_min': None,
+            'temp_max': None,
+            'latest_observation': latest_observation,
+            'latest_temp': None,
+            'unavailable': bool(error_reason),
+            'error_reason': error_reason  # 'timeout', 'http', 'empty', 'insufficient', 'no_station'
+        }
+    
+    def _fetch_daily_series(self, triplet: str):
+        """
+        Robust fetch with session retries, small jitter, and per-run cache.
+        Raises on final failure; caller handles graceful fallback.
+        """
+        if triplet in self._cache:
+            return self._cache[triplet]
+        
+        import time
+        import random
+        
+        url = (
+            "https://wcc.sc.egov.usda.gov/reportGenerator/view_csv/"
+            f"customSingleStationReport/daily/{triplet}%7Cid=%22%22%7Cname/"
+            "POR_BEGIN,POR_END/WTEQ::value,SNWD::value"
+        )
+        
+        # Jitter to avoid bursty simultaneous hits across many resorts
+        time.sleep(0.2 + random.random() * 0.6)
+        
+        resp = self.session.get(url, timeout=(6,8))
+        resp.raise_for_status()
+        parsed = self._parse_report_csv(resp.text)
+        self._cache[triplet] = parsed
+        return parsed
+    
+    def get_snowfall_report(self, resort_name: str, days: int = 1):
+        """
+        Safe wrapper that resolves station, fetches with retries,
+        and returns a payload suitable for display even on failure.
+        """
+        from datetime import datetime
+        info = self.get_station_info(resort_name)
+        if not info:
+            return self._create_empty_report(station_name='SNOTEL', error_reason='no_station')
+        
+        station_name = info['name']
+        
+        try:
+            series = self._fetch_daily_series(info['triplet'])
+        except Exception as e:
+            # Log once per failure path; keep email output clean
+            self._log.warning("SNOTEL fetch error for %s (%s): %s", resort_name, info['triplet'], str(e))
+            return self._create_empty_report(station_name=station_name, error_reason='timeout')
+        
+        if not series:
+            return self._create_empty_report(station_name=station_name, error_reason='empty')
+        
+        # Require both WTEQ and SNWD
+        rows = [r for r in series if r['WTEQ'] is not None and r['SNWD'] is not None]
+        if len(rows) < 2:
+            latest_dt = rows[-1]['date'] if rows else None
+            return self._create_empty_report(station_name=station_name, latest_observation=latest_dt, error_reason='insufficient')
+        
+        # Chronological sort best-effort
+        try:
+            rows.sort(key=lambda r: datetime.strptime(r['date'], '%Y-%m-%d'))
+        except Exception:
+            pass
+        
+        # Clamp days to 1–2 due to daily granularity
+        step = max(1, min(int(days), 2))
+        end = rows[-1]
+        start = rows[-(step + 1)] if len(rows) > step else rows[0]
+        
+        snow_change = round(end['SNWD'] - start['SNWD'], 1)
+        swe_change  = round(end['WTEQ'] - start['WTEQ'], 3)
+        
+        # Thresholds to treat it as actual new snow
+        SNOW_THRESHOLD = 0.5
+        SWE_THRESHOLD  = 0.01
+        is_new_snow = (snow_change > SNOW_THRESHOLD and swe_change > SWE_THRESHOLD)
+        
+        if not is_new_snow:
+            # Not an error: explicitly indicate no net new snow
+            report = self._create_empty_report(
+                station_name=station_name,
+                latest_observation=end['date'],
+                error_reason=None
+            )
+            return report
+        
+        density  = round((swe_change / snow_change) * 100, 1) if snow_change else 0.0
+        category = self._snow_category(density)
+        
+        return {
+            'station_name': station_name,
+            'snow_depth': snow_change,
+            'swe': swe_change,
+            'density': density,
+            'snow_category': category,
+            'temp_min': None,
+            'temp_max': None,
+            'latest_observation': end['date'],
+            'latest_temp': None,
+            'unavailable': False,
+            'error_reason': None
+        }
+
+class EmailSnowReportMessenger:
+    """
+    Manages email distribution of snow reports with dark theme HTML formatting.
+    Complete rewrite with modern responsive design.
+    """
+    def __init__(self, gmail_address: str, credentials_path: str = "credentials.json",
+                 token_path: str = "token.json"):
+        self.gmail_address = gmail_address
+        self.credentials_path = credentials_path
+        self.token_path = token_path
+        self.subscribers_file = os.path.join(DATA_DIR, "snow_report_subscribers.csv")
+        self.nws_outlook = NWSStormOutlook()
+    
+    # -------------------------------------------------------------------------
+    # UTILITY METHODS
+    # -------------------------------------------------------------------------
+    def _fmt_inches(self, value) -> str:
+        """Format inches with single quote mark."""
+        if value is None:
+            return ""
+        s = str(value).strip()
+        if not s or s.lower() in ('', 'none', 'n/a'):
+            return ""
+        
+        import re
+        s = s.replace('"', '"').replace('"', '"').replace('″', '"')
+        s = re.sub(r'"{2,}', '"', s).strip()
+        
+        if s.endswith('"') and re.match(r'^\s*-?\d+(\.\d+)?"\s*$', s):
+            return s.strip()
+        
+        digits = ''.join(c for c in s if c.isdigit() or c in ".-")
+        return f'{digits}"' if digits else ""
+    
+    def _sanitize_text(self, value: str) -> str:
+        """Normalize text for HTML output."""
+        if value is None:
+            return ""
+        s = normalize_text(str(value))
+        s = re.sub(r'"+', '"', s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+    
+    def get_24hr_snow(self, resort_data: Dict) -> float:
+        """Extract 24-hour snow amount (prefer summit, fallback base)."""
+        try:
+            snow = resort_data.get('snow_24h_summit') or resort_data.get('snow_24h_base', '0')
+            snow = ''.join(c for c in str(snow) if c.isdigit() or c == '.')
+            return float(snow or 0)
+        except (ValueError, TypeError):
+            return 0.0
+    
+    def get_master_sort_key(self, resort_data: Dict) -> tuple:
+        """Sort key: fresh first, then by snow amount (desc), then recency, then name."""
+        from datetime import datetime
+        resort_name = resort_data.get('resort', '')
+        today = datetime.now().date()
+        
+        last_updated_str = resort_data.get('last_updated', '')
+        last_updated_date = None
+        if last_updated_str and last_updated_str != 'N/A':
+            for fmt in ('%Y-%m-%d %I:%M %p', '%Y-%m-%d %H:%M %p'):
+                try:
+                    last_updated_date = datetime.strptime(last_updated_str, fmt).date()
+                    break
+                except ValueError:
+                    continue
+        
+        snow_amount = self.get_24hr_snow(resort_data)
+        is_fresh = 0 if (last_updated_date == today) else 1
+        snow_sort = -float(snow_amount)
+        date_sort = -(last_updated_date.toordinal() if last_updated_date else 0)
+        return (is_fresh, snow_sort, date_sort, resort_name)
+
+    def _get_display_name(self, resort_name: str) -> str:
+        """Get display-friendly resort name."""
+        name_map = {
+            "LookoutPass": "Lookout Pass",
+            "BigMountain": "Big Mountain",
+            "LostTrail": "Lost Trail",
+            "TetonPass": "Teton Pass",
+            "Blacktail": "Blacktail Mountain",
+            "Snowbowl": "Snowbowl",
+            "Discovery": "Discovery",
+            "Showdown": "Showdown"
+        }
+        return name_map.get(resort_name, resort_name)
+
+    def _check_powder_alert(self, resort_data_list: List[Dict]) -> bool:
+        """Check if any resort has powder alert worthy snow."""
+        today = datetime.now().date()
+        for resort_data in resort_data_list:
+            last_updated_str = resort_data.get('last_updated', '')
+            if not last_updated_str:
+                continue
+            last_updated_date = None
+            if last_updated_str:
+                for fmt in ('%Y-%m-%d %I:%M %p', '%Y-%m-%d %H:%M %p'):
+                    try:
+                        last_updated_date = datetime.strptime(last_updated_str, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+            if last_updated_date and (today - last_updated_date).days <= 1:
+                if self.get_24hr_snow(resort_data) >= POWDER_ALERT_THRESHOLD:
+                    return True
+        return False
+        
+    
+    # -------------------------------------------------------------------------
+    # CHART PREPARATION
+    # -------------------------------------------------------------------------
+
+    def _prepare_chart_data(self, resort_data_list: List[Dict]) -> List[Dict]:
+            """Prepare 5-day snow accumulation chart data from CSV files."""
+            chart_data = []
+            today = datetime.now().date()
+    
+            for resort_data in resort_data_list:
+                resort_name = resort_data['resort']
+                csv_file = os.path.join(DATA_DIR, f"{resort_name}_snow_report.csv")
+    
+                try:
+                    if os.path.exists(csv_file):
+                        df = pd.read_csv(csv_file)
+                        
+                        # --- START FIX ---
+                        # The chart must be based on the 'date' (when the script ran),
+                        # not 'last_updated' (when the resort posted).
+                        
+                        # 1. Parse the correct date column
+                        df['report_date'] = pd.to_datetime(df['date'], format='%Y-%m-%d', errors='coerce')
+                        
+                        if df['report_date'].isna().all():
+                            # If parsing fails, fall back to default
+                            raise ValueError("All report_dates are NaT")
+                            
+                        df = df.dropna(subset=['report_date']).sort_values('report_date', ascending=False)
+                        most_recent_update = df['report_date'].iloc[0].date()
+                        # --- END FIX ---
+                        
+                        days_since_update = (today - most_recent_update).days
+    
+                        values = [0] * 5
+                        date_labels = [(today - timedelta(days=i)) for i in range(5)]
+    
+                        for i, date in enumerate(date_labels):
+                            # --- START FIX ---
+                            # 2. Filter using the correct date column
+                            day_data = df[df['report_date'].dt.date == date]
+                            # --- END FIX ---
+                            
+                            if not day_data.empty:
+                                # Use the first report from that day (should be only one)
+                                snow = day_data.iloc[0]['snow_24h_summit']
+                                if pd.isna(snow):
+                                    snow = day_data.iloc[0]['snow_24h_base']
+                                if isinstance(snow, str):
+                                    snow = snow.replace('"', '').strip()
+                                try:
+                                    values[i] = float(snow) if snow else 0
+                                except Exception:
+                                    values[i] = 0
+    
+                        total = sum(values)
+                        chart_data.append({
+                            'resort': resort_name,
+                            'values': values,
+                            'date_labels': date_labels,
+                            'total': total,
+                            'has_current_data': days_since_update < 2,
+                            'most_recent_update': most_recent_update
+                        })
+                    else:
+                        # No CSV file found
+                        raise FileNotFoundError("No CSV file")
+                except Exception:
+                    # Catch any error (no CSV, parsing error, etc.) and append empty data
+                    chart_data.append({
+                        'resort': resort_name,
+                        'values': [0, 0, 0, 0, 0],
+                        'date_labels': [today - timedelta(days=i) for i in range(5)],
+                        'total': 0,
+                        'has_current_data': False,
+                        'most_recent_update': None
+                    })
+    
+            return chart_data
+        
+        
+    # -------------------------------------------------------------------------
+    # HTML GENERATION - HEADER
+    # -------------------------------------------------------------------------
+
+    def _generate_email_header(self, is_powder_alert: bool = False) -> str:
+            """Generate email header with title and date."""
+            today = datetime.now()
+            title = "POWDER ALERT - Daily Snow Report" if is_powder_alert else "Daily Snow Report"
+            
+            return f"""<!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Snow Report</title>
+      <style>
+        /* --- START MOBILE FIX --- */
+        @media only screen and (max-width: 620px) {{
+          .container {{ width: 100% !important; }}
+          .stack {{ 
+            display: block !important; 
+            width: 100% !important; 
+            padding: 0 !important;
+            text-align: left !important; /* Force left-align when stacked */
+          }}
+          .p-sm {{ padding: 14px !important; }}
+          .center-sm {{ text-align: center !important; }}
+          .hide-sm {{ display: none !important; }}
+          .stack-item {{ padding-left: 0 !important; padding-top: 12px; }}
+    
+          /* New rules for the summary table */
+          .stack-row {{
+            display: block !important;
+            width: 100% !important;
+          }}
+          .stack-row-col {{
+            display: block !important;
+            width: 100% !important;
+            box-sizing: border-box !important; /* Ensures padding doesn't break width */
+            border-radius: 0 !important;
+            border: 0 !important; /* Remove individual borders */
+          }}
+          /* Re-add borders for stacking */
+          .stack-row-col-first {{
+            border-radius: 10px 10px 0 0 !important;
+            border-top: 1px solid {EmailTheme.BORDER_SUBTLE} !important;
+            border-left: 1px solid {EmailTheme.BORDER_SUBTLE} !important;
+            border-right: 1px solid {EmailTheme.BORDER_SUBTLE} !important;
+          }}
+          .stack-row-col-last {{
+            border-radius: 0 0 10px 10px !important;
+            border-bottom: 1px solid {EmailTheme.BORDER_SUBTLE} !important;
+            border-left: 1px solid {EmailTheme.BORDER_SUBTLE} !important;
+            border-right: 1px solid {EmailTheme.BORDER_SUBTLE} !important;
+          }}
+          .stack-row-col-mid {{
+            border-left: 1px solid {EmailTheme.BORDER_SUBTLE} !important;
+            border-right: 1px solid {EmailTheme.BORDER_SUBTLE} !important;
+          }}
+        }}
+        /* --- END MOBILE FIX --- */
+      </style>
+    </head>
+    <body style="margin:0; padding:0; background:{EmailTheme.BG_OUTER}; color:{EmailTheme.BG_OUTER};">
+      <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent; mso-hide:all;">
+        Northern Rockies daily snow report – sortable summary, powder alerts, and per‑resort details.
+      </div>
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:{EmailTheme.BG_OUTER};">
+        <tr>
+          <td align="center" style="padding:24px;">
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="700" class="container" style="width:700px; max-width:100%; background:{EmailTheme.BG_CONTAINER}; border-radius:16px; overflow:hidden; box-shadow:0 8px 24px rgba(0,0,0,0.35);">
+              <tr>
+                <td style="padding:24px 24px 16px 24px; background:linear-gradient(135deg,{EmailTheme.GRADIENT_START},{EmailTheme.GRADIENT_END});">
+                  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                    <tr>
+                      <td class="stack" style="vertical-align:middle; color:{EmailTheme.TEXT_SECONDARY}; font-family:Arial, Helvetica, sans-serif; font-size:13px;">
+                        <div style="letter-spacing:.08em; text-transform:uppercase; opacity:.9;">{title}</div>
+                        <div style="font-size:22px; font-weight:700; color:{EmailTheme.TEXT_WHITE}; margin-top:4px;">Northern Rockies</div>
+                      </td>
+                      <td class="stack center-sm" style="vertical-align:middle; text-align:right;">
+                        <span style="display:inline-block; background:{EmailTheme.BG_OUTER}; color:{EmailTheme.ACCENT_BLUE}; font-family:Arial, Helvetica, sans-serif; font-size:12px; padding:8px 12px; border-radius:999px; border:1px solid rgba(255,255,255,0.12);">
+                          {today.strftime('%A, %B %d, %Y')}
+                        </span>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+    """
+
+    
+    # -------------------------------------------------------------------------
+    # HTML GENERATION - SUMMARY TABLE WITH CHARTS
+    # -------------------------------------------------------------------------
+
+    def _generate_summary_table(self, sorted_resorts: List[Dict], chart_data: List[Dict]) -> str:
+        """Generate summary table with 5-day charts."""
+        html = [f"""
+          <tr>
+            <td style="padding:20px 24px 6px 24px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:separate; border-spacing:0 8px;">
+                
+                <tr class="hide-sm">
+                  <td style="width:38%; font-family:Arial, Helvetica, sans-serif; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:{EmailTheme.TEXT_SECONDARY};">Resort</td>
+                  <td style="width:22%; font-family:Arial, Helvetica, sans-serif; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:{EmailTheme.TEXT_SECONDARY};">24-hr</td>
+                  <td style="width:40%; font-family:Arial, Helvetica, sans-serif; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:{EmailTheme.TEXT_SECONDARY};">5-Day Trend</td>
+                </tr>
+                """]
+        
+        today = datetime.now().date()
+        
+        for resort_data in sorted_resorts:
+            resort_name = resort_data['resort']
+            display_name = self._get_display_name(resort_name)
+            snow_24hr = int(round(self.get_24hr_snow(resort_data)))
+            
+            # Get chart data for this resort
+            resort_chart = next((c for c in chart_data if c['resort'] == resort_name), None)
+            
+            # Determine badge
+            last_updated_str = resort_data.get('last_updated', '')
+            last_updated_date = None
+            if last_updated_str:
+                for fmt in ('%Y-%m-%d %I:%M %p', '%Y-%m-%d %H:%M %p'):
+                    try:
+                        last_updated_date = datetime.strptime(last_updated_str, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+            
+            is_current = last_updated_date == today if last_updated_date else False
+            is_powder = is_current and snow_24hr >= POWDER_ALERT_THRESHOLD
+            
+            badge_html = ""
+            if is_powder:
+                badge_html = f'<span style="display:inline-block; background:{EmailTheme.POWDER_BADGE_BG}; color:{EmailTheme.POWDER_BADGE_TEXT}; font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; margin-left:8px;">Powder</span>'
+            elif not is_current:
+                badge_html = f'<span style="display:inline-block; background:{EmailTheme.HISTORIC_BADGE_BG}; color:{EmailTheme.HISTORIC_BADGE_TEXT}; font-size:11px; padding:2px 8px; border-radius:999px; margin-left:8px;">Historic</span>'
+            
+            # Format last updated
+            last_updated_display = last_updated_str.replace(' ', ' ') if last_updated_str else "N/A"
+            
+            # Generate mini chart
+            chart_html = self._generate_mini_chart(resort_chart['values'] if resort_chart else [0,0,0,0,0])
+            
+            # --- START MOBILE FIX: Add stacking classes to rows and columns ---
+            html.append(f"""
+              <tr class="stack-row">
+                <td class="stack-row-col stack-row-col-first" style="padding:10px 12px; background:{EmailTheme.BG_CARD}; border-radius:10px 0 0 10px; border:1px solid {EmailTheme.BORDER_SUBTLE};">
+                  <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:14px; font-weight:700;">
+                    {display_name}{badge_html}
+                  </div>
+                  <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:11px; margin-top:2px;">Last updated: {last_updated_display}</div>
+                </td>
+                <td class="stack-row-col stack-row-col-mid" style="padding:10px 12px; background:{EmailTheme.BG_CARD}; border-top:1px solid {EmailTheme.BORDER_SUBTLE}; border-bottom:1px solid {EmailTheme.BORDER_SUBTLE}; border-right:1px solid {EmailTheme.BORDER_SUBTLE};">
+                  <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:14px; font-weight:700; text-align:right;">{snow_24hr}"</div>
+                  <div class="hide-lg" style="display:none; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px; text-align:left;">24-hr Snow</div>
+                </td>
+                <td class="stack-row-col stack-row-col-last" style="padding:10px 12px; background:{EmailTheme.BG_CARD}; border-radius:0 10px 10px 0; border:1px solid {EmailTheme.BORDER_SUBTLE};">
+                  {chart_html}
+                  <div class="hide-lg" style="display:none; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px; text-align:left; margin-top:4px;">5-Day Trend</div>
+                </td>
+              </tr>
+            """)
+            # --- END MOBILE FIX ---
+        
+        # Add legend
+        html.append(f"""
+                  </table>
+                  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 12px;">
+                    <tr>
+                      <td style="padding: 10px 0; font-family: Arial, Helvetica, sans-serif; font-size: 11px; color: {EmailTheme.TEXT_SECONDARY}; text-align: center;">
+                        <b>Legend:</b> &nbsp;
+                        <span style="display: inline-block; width: 10px; height: 10px; background: {EmailTheme.CHART_COLORS[0]}; border-radius: 2px; vertical-align: -1px; margin-left: 5px;"></span> Mon
+                        <span style="display: inline-block; width: 10px; height: 10px; background: {EmailTheme.CHART_COLORS[1]}; border-radius: 2px; vertical-align: -1px; margin-left: 10px;"></span> Tue
+                        <span style="display: inline-block; width: 10px; height: 10px; background: {EmailTheme.CHART_COLORS[2]}; border-radius: 2px; vertical-align: -1px; margin-left: 10px;"></span> Wed
+                        <span style="display: inline-block; width: 10px; height: 10px; background: {EmailTheme.CHART_COLORS[3]}; border-radius: 2px; vertical-align: -1px; margin-left: 10px;"></span> Thu
+                        <span style="display: inline-block; width: 10px; height: 10px; background: {EmailTheme.CHART_COLORS[4]}; border-radius: 2px; vertical-align: -1px; margin-left: 10px;"></span> Today
+                      </td>
+                    </tr>
+                  </table>
+            </td>
+          </tr>
+        """)
+        
+        return ''.join(html)
+
+
+
+
+    def _generate_mini_chart(self, values: List[float]) -> str:
+        """Generate mini bar chart HTML."""
+        # Reverse values (oldest to newest: Mon -> Today)
+        values_reversed = list(reversed(values))
+        max_val = max(max(values_reversed), 10)  # At least 10 for scaling
+        
+        if all(v == 0 for v in values_reversed):
+            return f"""
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-radius:6px; overflow:hidden;">
+        <tr><td style="height:14px; background:{EmailTheme.BG_OUTER};"></td></tr>
+      </table>
+"""
+        
+        html = ['<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-radius:6px; overflow:hidden;"><tr>']
+        
+        for i, (val, color) in enumerate(zip(values_reversed, EmailTheme.CHART_COLORS)):
+            if val > 0:
+                width_pct = (val / max_val) * 100
+                text_color = EmailTheme.TEXT_WHITE if color != EmailTheme.CHART_COLORS[0] else EmailTheme.BG_CONTAINER
+                html.append(f'<td style="width:{width_pct:.1f}%; height:14px; background:{color}; color:{text_color}; font-size:11px; text-align:center;">{int(round(val))}"</td>')
+            else:
+                # Empty space
+                if i == 0 or values_reversed[i-1] == 0:
+                    html.append(f'<td style="height:14px; background:{EmailTheme.BG_OUTER};"></td>')
+        
+        html.append('</tr></table>')
+        return ''.join(html)
+        
+        
+    # -------------------------------------------------------------------------
+    # HTML GENERATION - NWS STORM BANNER (if applicable)
+    # -------------------------------------------------------------------------
+ 
+    def _generate_nws_storm_banner(self, nws_outlooks: List[Dict]) -> str:
+            """Generate NWS storm watch banner if significant weather forecast."""
+            if not nws_outlooks:
+                return ""
+            
+            # --- START FIX: Define new, legit thresholds ---
+            STORM_SNOW_THRESHOLD = 4.0  # Use 6 inches (up from 1.0)
+            STORM_RAIN_THRESHOLD = 0.5  # 1.5 inches is good
+            # --- END FIX ---
+            
+            heavy_snow = []
+            heavy_rain = []
+            
+            for outlook in nws_outlooks:
+                if not outlook.get('outlook'):
+                    continue
+                
+                ol = outlook['outlook']
+                resort_name = self._get_display_name(outlook['resort_name'])
+                
+                # --- START FIX: Use correct keys from NWS script ---
+                snow_amount = ol.get('total_snow_inches', 0)
+                precip_amount = ol.get('total_precip_inches', 0)
+                
+                # Check for snow
+                if snow_amount >= STORM_SNOW_THRESHOLD:
+                    heavy_snow.append(f"{resort_name}: {snow_amount:.1f}\" snow")
+                
+                # Check for heavy rain
+                if precip_amount >= STORM_RAIN_THRESHOLD:
+                    # Only count as rain if it's not mostly snow
+                    if snow_amount < 1.0: 
+                        prob = ol.get('precip_probability_max', 0)
+                        heavy_rain.append(f"{resort_name}: {precip_amount:.2f}\" ({prob}% chance)")
+                # --- END FIX ---
+            
+            if not heavy_snow and not heavy_rain:
+                return "" # Correctly hiding
+            
+            snow_text = ""
+            if heavy_snow:
+                snow_text = f"""
+                                    <b style="color: {EmailTheme.ACCENT_LIGHT_BLUE};">❄️ Snow Forecast (48hr):</b>
+                                    <br>
+                                    {' · '.join(heavy_snow[:4])}
+    """
+            
+            rain_text = ""
+            if heavy_rain:
+                rain_text = f"""
+                                    <b style="color: {EmailTheme.ACCENT_LIGHT_BLUE};">🌧️ Heavy Rain Forecast (48hr):</b>
+                                    <br>
+                                    {' · '.join(heavy_rain[:2])}
+    """
+            
+            return f"""
+              <tr>
+                <td style="padding: 20px 24px 10px 24px;">
+                  <div style="border-top: 1px solid rgba(148,163,184,.2); padding-top: 20px; border-bottom: 1px solid rgba(148,163,184,.2); padding-bottom: 20px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+                        <td style="width: 40px; vertical-align: top; padding-top: 4px;">
+                          <span style="font-size: 28px; line-height: 1;">⚠️</span>
+                        </td>
+                        <td style="font-family: Arial, Helvetica, sans-serif; color: {EmailTheme.TEXT_PRIMARY}; padding-left: 12px;">
+                          <div style="font-size: 16px; font-weight: 700; color: {EmailTheme.ALERT_ORANGE};">STORM WATCH</div>
+                          <div style="font-size: 13px; color: {EmailTheme.TEXT_MUTED}; line-height: 1.5; margin-top: 8px;">
+                            Heavy precipitation forecast - see detailed reports below.
+                            <div style="margin-top: 8px;">
+                              {snow_text}
+                            </div>
+                            <div style="margin-top: 8px;">
+                              {rain_text}
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    </table>
+                  </div>
+                </td>
+              </tr>
+    """
+ 
+ 
+    
+    
+    # -------------------------------------------------------------------------
+    # HTML GENERATION - DETAILED RESORT SECTIONS
+    # -------------------------------------------------------------------------
+    def _generate_detailed_section(self, resort_data: Dict, snotel_data: Optional[Dict], nws_outlook: Optional[Dict], station_info: Optional[Dict]) -> str:
+        """Generate detailed resort section with hero stats, data table, NWS, and SNOTEL."""
+        resort_name = resort_data['resort']
+        display_name = self._get_display_name(resort_name)
+        last_updated = resort_data.get('last_updated', 'N/A')
+        
+        snow_24hr = int(round(self.get_24hr_snow(resort_data)))
+        summit_depth = self._fmt_inches(resort_data.get('summit_depth', ''))
+        
+        # Determine if powder (for hero stat color)
+        today = datetime.now().date()
+        last_updated_date = None
+        if last_updated:
+            for fmt in ('%Y-%m-%d %I:%M %p', '%Y-%m-%d %H:%M %p'):
+                try:
+                    last_updated_date = datetime.strptime(last_updated, fmt).date()
+                    break
+                except ValueError:
+                    continue
+        
+        is_current = last_updated_date == today if last_updated_date else False
+        is_powder = is_current and snow_24hr >= POWDER_ALERT_THRESHOLD
+        hero_color = EmailTheme.ALERT_RED if is_powder else EmailTheme.TEXT_PRIMARY
+        
+        # Generate data rows
+        data_rows = self._generate_resort_data_rows(resort_data)
+        
+        # Generate NWS outlook box
+        nws_box = self._generate_nws_outlook_box(nws_outlook) if nws_outlook else ""
+        
+        # Generate SNOTEL box
+        snotel_box = self._generate_snotel_box(snotel_data, station_info, resort_name) if snotel_data else ""
+        
+        return f"""
+      <tr>
+        <td style="padding:18px 24px 6px 24px;">
+          <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:18px; font-weight:800;">{display_name}</div>
+          <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px; margin-top:4px;">Last updated {last_updated}</div>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:8px 24px 20px 24px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom: 12px; border-bottom: 1px solid {EmailTheme.BORDER_SUBTLE}; padding-bottom: 12px;">
+            <tr>
+              <td style="font-family: Arial, Helvetica, sans-serif; width: 50%; padding-right: 8px;">
+                <div style="font-size: 13px; color: {EmailTheme.TEXT_SECONDARY}; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .05em;">24-HR SNOW</div>
+                <div style="font-size: 32px; font-weight: 700; color: {hero_color}; line-height: 1;">{snow_24hr}"</div>
+              </td>
+              <td style="font-family: Arial, Helvetica, sans-serif; width: 50%; padding-left: 8px;">
+                <div style="font-size: 13px; color: {EmailTheme.TEXT_SECONDARY}; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .05em;">SUMMIT DEPTH</div>
+                <div style="font-size: 32px; font-weight: 700; color: {EmailTheme.TEXT_PRIMARY}; line-height: 1;">{summit_depth if summit_depth else 'N/A'}</div>
+              </td>
+            </tr>
+          </table>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+              <td class="stack" style="width:56%; vertical-align:top; padding-right:12px;">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:{EmailTheme.BG_CARD}; border-radius:12px;">
+                  {data_rows}
+                </table>
+              </td>
+              <td class="stack stack-item" style="width:44%; vertical-align:top; padding-left:12px;">
+                {nws_box}
+                {snotel_box}
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:0 24px 8px 24px;">
+          <div style="height:1px; background:linear-gradient(90deg, rgba(148,163,184,.18), rgba(148,163,184,.06));"></div>
+        </td>
+      </tr>
+"""
+
+    def _generate_resort_data_rows(self, resort_data: Dict) -> str:
+        """Generate data rows for resort table."""
+        rows = []
+        
+        field_map = [
+            ('snow_24h_base', '24‑hr Snow – Base', True),
+            ('snow_overnight', 'Overnight Snow', False),
+            ('base_depth', 'Base Depth', False),
+            ('temp_base', 'Base Temp', False),
+            ('temp_summit', 'Summit Temp', False),
+            ('wind_speed', 'Wind Speed', False),
+            ('lifts_open', 'Lifts Open', False),
+            ('runs_open', 'Runs Open', False),
+            ('conditions_surface', 'Surface', False),
+            ('weather_current', 'Weather', False),
+        ]
+        
+        for field_key, label, is_highlight in field_map:
+            value = resort_data.get(field_key)
+            if not value or str(value).strip().lower() in ('', 'none', 'n/a', '0'):
+                continue
+            
+            # Format value
+            if field_key in ['snow_24h_base', 'snow_overnight', 'base_depth']:
+                formatted_value = self._fmt_inches(value)
+            elif field_key in ['temp_base', 'temp_summit']:
+                formatted_value = f"{self._sanitize_text(value)}°F" if value else ""
+            elif field_key == 'wind_speed':
+                formatted_value = f"{self._sanitize_text(value)} mph" if value else ""
+            else:
+                formatted_value = self._sanitize_text(value)
+            
+            if not formatted_value:
+                continue
+            
+            font_weight = '700' if is_highlight else '400'
+            
+            rows.append(f"""
+      <tr>
+        <td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">{label}</td>
+        <td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:{font_weight}; text-align:right;">{formatted_value}</td>
+      </tr>""")
+        
+        return ''.join(rows)
+
+    def _generate_nws_outlook_box(self, nws_outlook: Optional[Dict]) -> str:
+            """Generate NWS 48-hour outlook box."""
+            if not nws_outlook or not nws_outlook.get('outlook'):
+                return ""
+            
+            ol = nws_outlook['outlook']
+            
+            # --- START FIX ---
+            # Use the correct keys from nws_storm_outlook_v3.py
+            
+            prob = ol.get('precip_probability_max', 0)
+            precip = f"{ol.get('total_precip_inches', 0):.2f}\" ({prob}% chance)"
+            
+            snow_val = ol.get('total_snow_inches', 0)
+            snow = f"{snow_val:.1f}\" expected"
+            if snow_val == 0 and ol.get('total_precip_inches', 0) > 0:
+                snow = "0\" (Rain)"
+                
+            temp_high = ol.get('temp_high_f', 'N/A')
+            temp_low = ol.get('temp_low_f', 'N/A')
+            temps = f"High {temp_high}°F, Low {temp_low}°F"
+            
+            snow_level = ol.get('snow_level_feet', 'N/A')
+            snow_level_str = f"{snow_level} ft" if snow_level != 'N/A' and snow_level is not None else "N/A"
+            
+            # The 'conditions' key in the NWS script returns a list, so join it.
+            conditions_list = ol.get('conditions')
+            if isinstance(conditions_list, list):
+                conditions = ", ".join(conditions_list)
+            else:
+                conditions = ol.get('conditions', 'N/A') # Fallback if it's a string
+            
+            # --- END FIX ---
+            
+            return f"""
+                    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%; background:{EmailTheme.BG_CARD}; border:1px dashed {EmailTheme.BORDER_DASHED}; border-radius:12px;">
+                      <tr>
+                        <td style="padding:10px 12px;">
+                          <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.ACCENT_BLUE}; font-weight:700; font-size:12px;">48-HR OUTLOOK</div>
+                          <div style="height:10px;"></div>
+                          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+                            <tr><td style="padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px;">Precipitation</td><td style="text-align:right; padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700;">{precip}</td></tr>
+                            <tr><td style="padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px;">Snow</td><td style="text-align:right; padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700;">{snow}</td></tr>
+                            <tr><td style="padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px;">Temps</td><td style="text-align:right; padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700;">{temps}</td></tr>
+                            <tr><td style="padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px;">Snow Level</td><td style="text-align:right; padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700;">{snow_level_str}</td></tr>
+                            <tr><td style="padding:6px 0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; vertical-align: top;">Conditions</td><td style="text-align:right; padding:6px 0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400;">{conditions}</td></tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+    """
+
+
+    def _generate_snotel_box(self, snotel_data: Dict, station_info: Optional[Dict], resort_name: str) -> str:
+            """Generate SNOTEL backcountry data box with graceful fallback text."""
+            if not snotel_data:
+                return ""
+    
+            station_name = snotel_data.get('station_name') or (station_info.get('name') if station_info else 'SNOTEL')
+    
+            # Distance + elevation
+            distance_str = "nearby"
+            elevation_str = "—"
+            if station_info and {'lat','lon'} <= station_info.keys():
+                try:
+                    rc = RESORT_COORDS.get(resort_name)
+                    if rc:
+                        distance_str = f"{self.haversine_miles(rc['lat'], rc['lon'], station_info['lat'], station_info['lon']):.1f} mi"
+                except Exception:
+                    pass
+            elev = station_info.get('elevation') if station_info else None
+            elevation_str = f"{int(elev)} ft" if isinstance(elev,(int,float)) else "—"
+    
+            # Check for unavailable status
+            unavailable = snotel_data.get('unavailable', False)
+            if unavailable:
+                error_reason = snotel_data.get('error_reason')
+                msg = "SNOTEL data unavailable"
+                if error_reason:
+                    msg += f" ({error_reason})"
+                status_info = f'<div style="font-family:Arial, Helvetica, sans-serif; font-size:12px; color:{EmailTheme.TEXT_SECONDARY}; margin-top:4px;">{msg}.</div>'
+                
+                # --- START FIX: Return a simplified box for errors ---
+                return f"""
+                    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%; background:{EmailTheme.BG_CARD}; border:1px dashed {EmailTheme.BORDER_DASHED}; border-radius:12px; margin-top: 12px;">
+                      <tr>
+                        <td style="padding:10px 12px;">
+                          <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; margin-top:2px;">{station_name} SNOTEL</div>
+                          <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px; margin-top:2px;">{distance_str} • {elevation_str}</div>
+                          <div style="height:10px;"></div>
+                          {status_info}
+                        </td>
+                      </tr>
+                    </table>
+                """
+                # --- END FIX ---
+    
+            # If we reach here, data is available. Proceed with the full table.
+            status_info = ""
+            if snotel_data.get('snow_depth') == 'melting/settling':
+                status_info = f'<div style="font-size:12px; color:{EmailTheme.TEXT_SECONDARY}; margin-top:4px;">No recent net new snow at the station (settling/melt).</div>'
+    
+            def inches(value, fallback='0"'):
+                if value in (None, '', 'N/A'): return fallback
+                try:
+                    if isinstance(value, (int, float)): return f'{value:.2f}"'.rstrip('0').rstrip('.') + '"'
+                    if isinstance(value, str) and value.endswith('"'): return value
+                    digits = ''.join(c for c in str(value) if c.isdigit() or c in ".-")
+                    return f'{digits}"' if digits else fallback
+                except Exception: return fallback
+    
+            snow_depth = snotel_data.get('snow_depth', 0)
+            snow_depth_display = inches(snow_depth, fallback='0"') if snow_depth != 'melting/settling' else 'melting/settling'
+            swe_display = inches(snotel_data.get('swe', 0), fallback='0"')
+            density = snotel_data.get('density', 'N/A')
+            density_display = f"{density}%" if density not in ('N/A', None) else "—"
+            snow_quality = snotel_data.get('snow_category', 'N/A')
+            quality_weight = '700' if 'Powder' in str(snow_quality) else '400'
+    
+            return f"""
+                    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%; background:{EmailTheme.BG_CARD}; border:1px dashed {EmailTheme.BORDER_DASHED}; border-radius:12px; margin-top: 12px;">
+                      <tr>
+                        <td style="padding:10px 12px;">
+                          <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; margin-top:2px;">{station_name} SNOTEL</div>
+                          <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px; margin-top:2px;">{distance_str} • {elevation_str}</div>
+                          {status_info}
+                          <div style="height:10px;"></div>
+                          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+                            <tr><td style="padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px;">24-hr Snow Depth Δ</td><td style="text-align:right; padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700;">{snow_depth_display}</td></tr>
+                            <tr><td style="padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px;">24-hr SWE Δ</td><td style="text-align:right; padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400;">{swe_display}</td></tr>
+                            <tr><td style="padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px;">Density</td><td style="text-align:right; padding:6px 0; border-bottom:1px solid {EmailTheme.BORDER_MEDIUM}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400;">{density_display}</td></tr>
+                            <tr><td style="padding:6px 0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px;">Snow Quality</td><td style="text-align:right; padding:6px 0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:{quality_weight};">{snow_quality}</td></tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+        """
+
+
+    # -------------------------------------------------------------------------
+    # HTML GENERATION - FOOTER
+    # -------------------------------------------------------------------------
+    def _generate_footer(self) -> str:
+        """Generate email footer."""
+        return f"""
+          <tr>
+            <td style="padding:22px 24px 28px 24px; background:{EmailTheme.BG_CONTAINER}; border-top:1px solid {EmailTheme.BORDER_SUBTLE};">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td class="stack center-sm" style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px;">
+                    Data sources: resort public snow reports, NWS API, &amp; nearby SNOTEL stations. Values are best‑effort scrapes and may lag resort updates.
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+    
+    
+    # -------------------------------------------------------------------------
+    # MAIN EMAIL ASSEMBLY
+    # -------------------------------------------------------------------------
+    def _build_email_html(self, sorted_resorts: List[Dict], snotel: SNOTELDataFetcher, is_powder_alert: bool = False, nws_outlooks: List[Dict] = None) -> str:
+        """Build complete HTML email with dark theme."""
+        html_parts = []
+        
+        # Header
+        html_parts.append(self._generate_email_header(is_powder_alert))
+        
+        # Powder alert banner
+        if is_powder_alert:
+            html_parts.append(self._generate_powder_alert_banner(sorted_resorts))
+        
+        # Summary table with charts
+        chart_data = self._prepare_chart_data(sorted_resorts)
+        html_parts.append(self._generate_summary_table(sorted_resorts, chart_data))
+        
+        # NWS storm banner (if applicable)
+        if nws_outlooks:
+            html_parts.append(self._generate_nws_storm_banner(nws_outlooks))
+        
+        # Detailed resort sections
+        snotel_available = (os.getenv("DISABLE_SNOTEL") not in ("1","true","TRUE"))
+        
+        for resort_data in sorted_resorts:
+            resort_name = resort_data['resort']
+            
+            print(f"Fetching SNOTEL for: {resort_name}")
+            # Get SNOTEL data
+            if snotel_available:
+                try:
+                    snotel_data = snotel.get_snowfall_report(resort_name)
+                except Exception:
+                    snotel_data = {"unavailable": True, "error_reason": "timeout"}
+            else:
+                snotel_data = {"unavailable": True, "error_reason": "service_down"}
+
+            station_info = snotel.get_station_info(resort_name)
+            # Get NWS outlook for this resort
+            nws_outlook = next((item for item in nws_outlooks if item['resort_name'] == resort_name), None) if nws_outlooks else None
+            
+            html_parts.append(self._generate_detailed_section(resort_data, snotel_data, nws_outlook, station_info))
+        
+        # Footer
+        html_parts.append(self._generate_footer())
+        
+        return ''.join(html_parts)
+    
+    # -------------------------------------------------------------------------
+    # EMAIL SENDING
+    # -------------------------------------------------------------------------
+    def send_consolidated_report(self, resort_data_list: List[Dict]):
+        """Send consolidated snow report email via Gmail API OAuth2."""
+        if not os.path.exists(self.subscribers_file):
+            print(f"No subscribers file found at {self.subscribers_file}")
+            return
+        try:
+            subscribers_df = pd.read_csv(self.subscribers_file)
+            recipients = subscribers_df['email'].tolist()
+        except Exception as e:
+            print(f"Error reading subscribers: {e}")
+            return
+        if not recipients:
+            print("No subscribers found")
+            return
+        
+        # Sort resorts
+        sorted_resorts = sorted(resort_data_list, key=self.get_master_sort_key)
+        
+        # Check powder alert
+        is_powder_alert = self._check_powder_alert(sorted_resorts)
+        
+        # Build NWS outlooks
+        snotel = SNOTELDataFetcher()
+        nws_outlooks = []
+        for resort_data in sorted_resorts:
+            resort_name = resort_data["resort"]
+            coords = RESORT_COORDS.get(resort_name)
+            if coords:
+                try:
+                    outlook = self.nws_outlook.get_outlook(coords["lat"], coords["lon"])
+                    nws_outlooks.append({"resort_name": resort_name, "outlook": outlook})
+                except Exception:
+                    nws_outlooks.append({"resort_name": resort_name, "outlook": None})
+                time.sleep(0.3)
+            else:
+                nws_outlooks.append({"resort_name": resort_name, "outlook": None})
+        
+        # Build email HTML
+        email_html = self._build_email_html(sorted_resorts, snotel, is_powder_alert, nws_outlooks)
+        
+        # === DEBUG: write out the EXACT html we are about to send ===
+        debug_path = os.path.expanduser("~/email_last_sent.html")
+        with open(debug_path, "w", encoding="utf-8") as f:
+            f.write(email_html)
+        print("EMAIL DEBUG | Theme CHART_COLORS:", EmailTheme.CHART_COLORS)
+        print("EMAIL DEBUG | Wrote exact outgoing HTML to:", debug_path)
+        
+        # Subject
+        if is_powder_alert:
+            max_snow = max(self.get_24hr_snow(r) for r in sorted_resorts)
+            best_resort = max(sorted_resorts, key=lambda x: self.get_24hr_snow(x))['resort']
+            subject = f"POWDER ALERT: {int(max_snow)}\" at {self._get_display_name(best_resort)} - Daily Snow Report (ColorTest {datetime.now().strftime('%H%M%S')})"
+        else:
+            subject = f"Daily Snow Report (ColorTest {datetime.now().strftime('%H%M%S')})"
+        
+        # Gmail API send
+        try:
+            creds = None
+            if os.path.exists(self.token_path):
+                creds = Credentials.from_authorized_user_file(self.token_path)
+            
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                    with open(self.token_path, 'w') as token:
+                        token.write(creds.to_json())
+                else:
+                    raise ValueError("OAuth credentials invalid. Please re-authenticate.")
+            
+            service = build('gmail', 'v1', credentials=creds)
+            
+            message = MIMEMultipart('alternative')
+            message['Subject'] = subject
+            message['From'] = self.gmail_address
+            message['To'] = ', '.join(recipients)
+            
+            html_part = MIMEText(email_html, 'html')
+            message.attach(html_part)
+            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+            
+            service.users().messages().send(userId='me', body={'raw': raw_message}).execute()
+            
+            print(f"Report sent successfully to {len(recipients)} recipients")
+        except HttpError as error:
+            print(f"Gmail API error: {error}")
+        except Exception as e:
+            print(f"Error sending email: {e}")
+# -----------------------------------------------------------------------------
+# Email color and theme constants for snow/weather HTML reports
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Email color and theme constants for snow/weather HTML reports
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Email color and theme constants for snow/weather HTML reports
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Email color and theme constants for snow/weather HTML reports (v7 palette)
+# -----------------------------------------------------------------------------
+class EmailTheme:
+    # === Backgrounds === (unchanged)
+    BG_OUTER = "#0b1220"
+    BG_CONTAINER = "#111827"
+    BG_CARD = "#0f172a"
+
+    # === Text Colors === (unchanged)
+    TEXT_PRIMARY = "#e5e7eb"
+    TEXT_SECONDARY = "#94a3b8"
+    TEXT_MUTED = "#9ca3af"
+    TEXT_WHITE = "#ffffff"
+
+    # === Accent / Brand Colors ===  (UPDATED to purple ramp)
+    ACCENT_BLUE = "#7C3AED"        # primary accent (purple 600)
+    ACCENT_LIGHT_BLUE = "#A78BFA"  # lighter accent (purple 300)
+    ACCENT_DARK_BLUE = "#5B21B6"   # deeper accent (purple 800)
+
+    # === Borders === (unchanged)
+    BORDER_SUBTLE = "rgba(148,163,184,.15)"
+    BORDER_MEDIUM = "rgba(148,163,184,.25)"
+    BORDER_DASHED = "rgba(148,163,184,.35)"
+
+    # === Alerts / Badges === (optional tweak to harmonize)
+    ALERT_BLUE = "#7C3AED"
+    ALERT_ORANGE = "#f59e0b"
+    ALERT_RED = "#ef4444"
+    POWDER_BADGE_BG = "#7C3AED"     # was teal; switch to purple to match
+    POWDER_BADGE_TEXT = "#ffffff"
+    HISTORIC_BADGE_BG = "#1f2937"
+    HISTORIC_BADGE_TEXT = "#9ca3af"
+
+    # === Header Gradient === (UPDATED to purple gradient)
+    GRADIENT_START = "#1f1b3a"  # deep indigo-purple
+    GRADIENT_END   = "#3b2a7a"  # richer purple
+
+    # === Mini-Chart / Sparkline Colors (already purple) ===
+    CHART_COLORS = [
+        "#483D8B",
+        "#6A5ACD",
+        "#87CEEB",
+        "#B0E0E6",
+        "#F0F8FF",
+    ]
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+def main():
+    """Main execution function."""
+    log_file = os.path.join(LOG_DIR, "snow_report.log")
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    try:
+        logging.info("Starting snow report script")
+        
+        # Get Gmail address from environment variable
+        gmail_address = os.environ.get('GMAIL_ADDRESS')
+        
+        # Get OAuth credential paths from environment (or use defaults)
+        credentials_path = os.environ.get('GMAIL_CREDENTIALS_PATH', 'credentials.json')
+        token_path = os.environ.get('GMAIL_TOKEN_PATH', 'token.json')
+        
+        if not gmail_address:
+            raise ValueError("GMAIL_ADDRESS environment variable must be set")
+        
+        # Initialize messenger with OAuth
+        messenger = EmailSnowReportMessenger(
+            gmail_address=gmail_address,
+            credentials_path=credentials_path,
+            token_path=token_path
+        )
+        logging.info(f"Checking subscribers file at: {messenger.subscribers_file}")
+        
+        if os.path.exists(messenger.subscribers_file):
+            logging.info("Subscribers file found")
+        else:
+            logging.warning("Subscribers file not found - will create new one")
+        
+        # Initialize scrapers
+        scrapers = [
+            SnowbowlScraper(),
+            DiscoveryScraper(),
+            LookoutPassScraper(),
+            BigMountainScraper(),
+            LostTrailScraper(),
+            TetonPassScraper(),
+            ShowdownScraper(),
+            BlacktailScraper(),
+        ]
+        
+        # Run scrapers and collect data
+        resort_data_list = []
+        for scraper in scrapers:
+            logging.info(f"Fetching data for {scraper.resort_name}...")
+            snow_data = scraper.get_snow_report()
+            
+            if snow_data:
+                resort_data_list.append(snow_data)
+                scraper.save_to_csv(snow_data)
+                logging.info(f"Data saved for {scraper.resort_name}")
+            else:
+                logging.warning(f"No data retrieved for {scraper.resort_name}")
+        
+        # Send consolidated report
+        if resort_data_list:
+            logging.info("Sending consolidated report...")
+            try:
+                messenger.send_consolidated_report(resort_data_list)
+                logging.info("Consolidated report sent successfully")
+            except Exception as e:
+                logging.error(f"Error sending report: {str(e)}", exc_info=True)
+        else:
+            logging.warning("No resort data to send")
+    except Exception as e:
+        logging.error(f"Error in main function: {str(e)}", exc_info=True)
+        raise
+
+if __name__ == "__main__":
+    main()

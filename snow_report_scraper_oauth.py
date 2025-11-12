@@ -337,13 +337,16 @@ class BaseSnowReportScraper(ABC):
 # =============================================================================
 # RESORT-SPECIFIC SCRAPERS
 # =============================================================================
+# =============================================================================
+# UPDATED CLASS #1: SnowbowlScraper (with fixed last_updated parsing)
+# =============================================================================
+
 class SnowbowlScraper(BaseSnowReportScraper):
     def __init__(self):
         super().__init__("Snowbowl")
     
     def get_url(self):
         return "https://www.montanasnowbowl.com/report.php"
-    
     
     def process_data(self, response):
             data_dict = {}
@@ -353,7 +356,7 @@ class SnowbowlScraper(BaseSnowReportScraper):
             # If it fails, we want to continue and try parsing the HTML table.
             try:
                 # Parse polling data from HTML comments
-                comment_pattern = r''
+                comment_pattern = r'<!--polling-->(.*?)<!--/polling-->'
                 polling_data = re.search(comment_pattern, response.text, re.DOTALL)
                 
 
@@ -390,6 +393,26 @@ class SnowbowlScraper(BaseSnowReportScraper):
                 except ValueError:
                     data['last_updated'] = data_dict.get('lastupdated', '')
             
+            # --- NEW FIX: Better table parsing for last_updated ---
+            # If we didn't get last_updated from polling data, try the table
+            if not data['last_updated']:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Look for "Updated:" in the table
+                for row in soup.find_all('tr'):
+                    row_text = row.get_text(strip=True)
+                    if 'Updated:' in row_text:
+                        # Extract date like "Monday Jul 14, 2025 10:19 AM"
+                        match = re.search(r'Updated:(\w+\s+\w+\s+\d+,\s+\d{4}\s+\d+:\d+\s+[AP]M)', row_text)
+                        if match:
+                            try:
+                                date_str = match.group(1).strip()
+                                parsed_date = datetime.strptime(date_str, '%A %b %d, %Y %I:%M %p')
+                                data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+                                break
+                            except ValueError as e:
+                                print(f"Error parsing Snowbowl table date: {e}")
+            # --- END NEW FIX ---
                 
             # This part will now *always* run, even if comment parsing failed
             try:
@@ -591,6 +614,11 @@ class LookoutPassScraper(BaseSnowReportScraper):
         
         return data
 
+
+# =============================================================================
+# UPDATED CLASS #2: BigMountainScraper (with fixed last_updated parsing)
+# =============================================================================
+
 class BigMountainScraper(BaseSnowReportScraper):
     def __init__(self):
         super().__init__("BigMountain")
@@ -654,17 +682,31 @@ class BigMountainScraper(BaseSnowReportScraper):
                     time = re.search(r'(\d+(?::\d+)?\s*[ap]\.m\.)', text, re.IGNORECASE).group(1)
                     
         # Format last_updated
-        if date and time:
+        # --- FIX: Handle case where we have date but no time ---
+        if date:
             try:
-                date_str = f"{date} {time}"
-                date_str = date_str.replace('.', '').replace('  ', ' ').strip()
-                if ':' not in time:
-                    date_str = date_str.replace(' am', ':00 am').replace(' pm', ':00 pm')
-                parsed_date = datetime.strptime(date_str, '%A, %b %d, %Y %I:%M %p')
-                data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
-            except ValueError:
-                if date:
+                if time:
+                    # We have both date and time
+                    date_str = f"{date} {time}"
+                    date_str = date_str.replace('.', '').replace('  ', ' ').strip()
+                    if ':' not in time:
+                        date_str = date_str.replace(' am', ':00 am').replace(' pm', ':00 pm')
+                    parsed_date = datetime.strptime(date_str, '%A, %b %d, %Y %I:%M %p')
+                    data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+                else:
+                    # We only have date, assume 6:00 AM (when they typically measure)
+                    date_str = f"{date} 6:00 AM"
+                    date_str = date_str.replace('.', '').replace('  ', ' ').strip()
+                    parsed_date = datetime.strptime(date_str, '%A, %b %d, %Y %I:%M %p')
+                    data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+            except ValueError as e:
+                # If parsing fails, store whatever we have
+                print(f"Error parsing BigMountain date: {e}")
+                if time:
                     data['last_updated'] = f"{date} {time}"
+                else:
+                    data['last_updated'] = date
+        # --- END FIX ---
         
         # Get weather data
         weather_data = self._get_weather_data()
@@ -708,6 +750,8 @@ class BigMountainScraper(BaseSnowReportScraper):
                         data['base_depth'] = value
         
         return data
+
+
 
 class LostTrailScraper(BaseSnowReportScraper):
     def __init__(self):
@@ -838,6 +882,11 @@ class TetonPassScraper(BaseSnowReportScraper):
         
         return data
 
+
+# =============================================================================
+# UPDATED CLASS #3: ShowdownScraper (with fixed last_updated parsing)
+# =============================================================================
+
 class ShowdownScraper(BaseSnowReportScraper):
     def __init__(self):
         super().__init__("Showdown")
@@ -859,19 +908,21 @@ class ShowdownScraper(BaseSnowReportScraper):
                 time_str = p.text.strip()
                 break
         
-        # Find date string
-        all_h3s = soup.find_all('h3')
-        for h3 in all_h3s:
-            if re.match(r'\d{1,2}/\d{1,2}/\d{4}', h3.text.strip()):
-                date_str = h3.text.strip()
-                try:
+        # --- FIX: Parse the date-only format ---
+        if time_str:
+            try:
+                # Extract date from "Last Update:10/12/2025"
+                date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', time_str)
+                if date_match:
+                    date_str = date_match.group(1)
+                    # Parse and assume 6:00 AM
                     parsed_date = datetime.strptime(date_str, '%m/%d/%Y')
-                    formatted_date = parsed_date.strftime('%Y-%m-%d')
-                    if time_str:
-                        clean_time = time_str.replace('Last Update:', '').strip()
-                        data['last_updated'] = f"{formatted_date} {clean_time}"
-                except Exception as e:
-                    print(f"Error parsing date: {e}")
+                    # Add 6 AM time
+                    data['last_updated'] = parsed_date.strftime('%Y-%m-%d') + ' 06:00 AM'
+            except Exception as e:
+                print(f"Error parsing Showdown date: {e}")
+                data['last_updated'] = time_str
+        # --- END FIX ---
         
         # Process snow blocks
         snow_blocks = soup.find_all('h2', style=lambda value: value and 'white-space:pre-wrap;' in value)
