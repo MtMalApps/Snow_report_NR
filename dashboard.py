@@ -69,29 +69,32 @@ def get_snotel_iframe_html(triplet: str, station_name: str, show_years: str | No
 @st.cache_resource
 def initialize_firebase():
     try:
-        # Check if running in Streamlit Cloud (using st.secrets)
+        # Prefer Streamlit Cloud secrets
         if "firebase_service_account" in st.secrets:
-            creds_dict = st.secrets["firebase_service_account"]
+            # Convert SecretDict → plain dict (REQUIRED!)
+            creds_dict = dict(st.secrets["firebase_service_account"])
             cred = credentials.Certificate(creds_dict)
+
         else:
-            # Fallback to local file path (for running locally)
+            # Local fallback (not used on Streamlit Cloud)
             cred_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
             if not cred_path or not os.path.exists(cred_path):
                 st.error("Firebase credentials (FIREBASE_SERVICE_ACCOUNT) missing or invalid.")
                 return None
             cred = credentials.Certificate(cred_path)
-        
-        # Initialize app
+
+        # Initialize Firebase app safely
         try:
             firebase_admin.get_app()
         except ValueError:
             firebase_admin.initialize_app(cred)
-        
+
         return firestore.client()
-    
+
     except Exception as e:
         st.error(f"Firebase init error: {e}")
         return None
+
 
 
 # ──────────────────────────────────────────────────────────────
