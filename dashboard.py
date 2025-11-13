@@ -70,33 +70,36 @@ def get_snotel_iframe_html(triplet: str, station_name: str, show_years: str | No
 @st.cache_resource
 def initialize_firebase():
     try:
-        # --- FIX: Replaced error-prone 'in st.secrets' check ---
-        # This is the official way to check if running on Streamlit Cloud
-        if os.environ.get("STREAMLIT_SERVER_RUNNING_IN_CLOUD") == "true":
-            # We are on Streamlit Cloud
-            creds = st.secrets["firebase_service_account"]
-            if isinstance(creds, str):
-                creds_dict = ast.literal_eval(creds)
-            else:
-                creds_dict = creds
-            cred = credentials.Certificate(creds_dict)
-        else:
-            # We are running locally. Use the environment variable.
-            cred_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
-            if not cred_path or not os.path.exists(cred_path):
-                st.error("LOCAL RUN: Firebase credentials (FIREBASE_SERVICE_ACCOUNT) missing or invalid.")
-                st.info("To run locally, set your environment variable first in your terminal:\n\n`export FIREBASE_SERVICE_ACCOUNT=\"your-creds-file.json\"`\n\nThen run the app:\n\n`streamlit run dashboard.py`")
+        # --- NEW, SAFER FIX ---
+        # Check if the LOCAL environment variable is set first.
+        cred_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+        
+        if cred_path:
+            # We are running LOCALLY.
+            if not os.path.exists(cred_path):
+                st.error(f"LOCAL RUN: Firebase credentials file not found at: {cred_path}")
+                st.info("Please check the file name and path in your `export` command.")
                 return None
             cred = credentials.Certificate(cred_path)
-
-        # Initialize Firebase app safely
+        else:
+            # We are running in STREAMLIT CLOUD.
+            # Now it is safe to access st.secrets.
+            creds = st.secrets["firebase_service_account"]
+            if isinstance(creds, str):
+                # This handles the string-parsing error we saw before
+                creds_dict = ast.literal_eval(creds)
+            else:
+                creds_dict = dict(creds)
+            cred = credentials.Certificate(creds_dict)
+        
+        # Initialize app
         try:
             firebase_admin.get_app()
         except ValueError:
             firebase_admin.initialize_app(cred)
-
+        
         return firestore.client()
-
+    
     except Exception as e:
         st.error(f"Firebase init error: {e}")
         return None
@@ -847,7 +850,7 @@ else:
 st.caption("💡 Chart shows 5-day snowfall (only fresh daily reports counted).")
 
 # --- KEPT Forecast map (with new header) ---
-st.markdown("<div class='section-header'>🌨️ 48-Hour Snowfall Forecast</div>", unsafe_allow_html=True)
+st.markdown("<div class='section-header'>🌨️ Snowfall Forecast</div>", unsafe_allow_html=True)
 st.caption("💡 Click anywhere on the map for detailed point forecasts. Use the menu (⋮) to switch layers.")
 components.html(
     """
