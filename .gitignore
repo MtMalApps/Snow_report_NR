@@ -3,3 +3,5 @@ __pycache__/
 *.py.bak
 *.patch
 *_backup_*.py
+dashboard_*.bak
+dashboard_recover.py
