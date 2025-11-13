@@ -12,6 +12,7 @@ import altair as alt
 
 import firebase_admin
 from firebase_admin import credentials, firestore
+import ast # <-- ADD THIS IMPORT
 
 # ──────────────────────────────────────────────────────────────
 # CONFIG
@@ -28,7 +29,7 @@ DEBUG_TABLE = False
 DEBUG_CHART = False
 
 LOCAL_TZ = ZoneInfo("America/Denver")
-FRESHNESS_TOLERANCE_HOURS = 30
+FRESHNESS_TOLERANCE_HOURS = 30 # For "fresh" snow
 
 # SNOTEL iframe settings
 SNOTEL_CROP_TOP = 410
@@ -69,17 +70,22 @@ def get_snotel_iframe_html(triplet: str, station_name: str, show_years: str | No
 @st.cache_resource
 def initialize_firebase():
     try:
-        # Prefer Streamlit Cloud secrets
-        if "firebase_service_account" in st.secrets:
-            # Convert SecretDict → plain dict (REQUIRED!)
-            creds_dict = dict(st.secrets["firebase_service_account"])
+        # --- FIX: Replaced error-prone 'in st.secrets' check ---
+        # This is the official way to check if running on Streamlit Cloud
+        if os.environ.get("STREAMLIT_SERVER_RUNNING_IN_CLOUD") == "true":
+            # We are on Streamlit Cloud
+            creds = st.secrets["firebase_service_account"]
+            if isinstance(creds, str):
+                creds_dict = ast.literal_eval(creds)
+            else:
+                creds_dict = creds
             cred = credentials.Certificate(creds_dict)
-
         else:
-            # Local fallback (not used on Streamlit Cloud)
+            # We are running locally. Use the environment variable.
             cred_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
             if not cred_path or not os.path.exists(cred_path):
-                st.error("Firebase credentials (FIREBASE_SERVICE_ACCOUNT) missing or invalid.")
+                st.error("LOCAL RUN: Firebase credentials (FIREBASE_SERVICE_ACCOUNT) missing or invalid.")
+                st.info("To run locally, set your environment variable first in your terminal:\n\n`export FIREBASE_SERVICE_ACCOUNT=\"your-creds-file.json\"`\n\nThen run the app:\n\n`streamlit run dashboard.py`")
                 return None
             cred = credentials.Certificate(cred_path)
 
@@ -95,10 +101,48 @@ def initialize_firebase():
         st.error(f"Firebase init error: {e}")
         return None
 
+# ──────────────────────────────────────────────────────────────
+# --- SECTION MOVED UP: HELPERS ---
+# ──────────────────────────────────────────────────────────────
+def get_display_name(resort_name: str) -> str:
+    name_map = {
+        "LookoutPass": "Lookout Pass",
+        "BigMountain": "Big Mountain",
+        "LostTrail": "Lost Trail",
+        "TetonPass": "Teton Pass",
+        "Blacktail": "Blacktail Mountain",
+        "Snowbowl": "Snowbowl",
+        "Discovery": "Discovery",
+        "Showdown": "Showdown"
+    }
+    return name_map.get(resort_name, resort_name)
+
+def parse_open_status(status_string: str) -> (float, str):
+    if not isinstance(status_string, str):
+        return (0.0, "N/A")
+    parts = re.findall(r'\d+', status_string)
+    if len(parts) == 2:
+        try:
+            open_count = float(parts[0])
+            total_count = float(parts[1])
+            if total_count == 0:
+                return (0.0, status_string)
+            percentage = open_count / total_count
+            return (percentage, status_string)
+        except Exception:
+            pass
+    return (0.0, status_string)
+
+
+def is_fresh_for_day(qd, lu):
+    if pd.isna(lu) or pd.isna(qd):
+        return False
+    mid = datetime(qd.year, qd.month, qd.day, 12, tzinfo=LOCAL_TZ)
+    return abs((lu - mid).total_seconds()) / 3600 <= FRESHNESS_TOLERANCE_HOURS
 
 
 # ──────────────────────────────────────────────────────────────
-# DATA LOADING (underscore args so Streamlit won't try to hash)
+# DATA LOADING
 # ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=600)
 def load_latest_data(_db):
@@ -175,9 +219,42 @@ def load_latest_data(_db):
 
         if "state" not in df.columns:
             df["state"] = ""
+            
+        # --- NEW STALE DATA LOGIC ---
         
+        # 1. DEFINE THE CURRENT SEASON
+        # We'll set the season start to October 1st.
+        today = datetime.now(LOCAL_TZ).date()
+        season_start_year = today.year if today.month >= 10 else today.year - 1
+        SEASON_START_DATE = pd.Timestamp(season_start_year, 10, 1, tz=LOCAL_TZ)
+        
+        # 2. SEASONAL STALE CHECK (for data from last season)
+        # If a report is from before this season, zero out EVERYTHING.
+        all_snow_cols = ['snow_24h_summit', 'snow_24h_base', 'base_depth', 'summit_depth', 'snow_overnight']
+        is_from_this_season = df['last_updated_dt'] >= SEASON_START_DATE
+        
+        for col in all_snow_cols:
+            if col in df.columns:
+                df.loc[~is_from_this_season, col] = 0
+                
+        # 3. FRESH SNOW STALE CHECK (for data > 30h old)
+        # For reports that ARE from this season, check if they are "fresh".
+        # If not fresh, zero out 24h/overnight snow, but LEAVE base/summit depth.
+        now_dt = datetime.now(LOCAL_TZ)
+        is_fresh_snow = (now_dt - df['last_updated_dt']).dt.total_seconds() / 3600 < FRESHNESS_TOLERANCE_HOURS
+        
+        fresh_snow_cols = ['snow_24h_summit', 'snow_overnight']
+        
+        for col in fresh_snow_cols:
+            if col in df.columns:
+                # Apply this check ONLY to reports that are from this season
+                # but are no longer "fresh" (i.e., > 30h old)
+                df.loc[is_from_this_season & ~is_fresh_snow, col] = 0
+                
+        # --- END STALE DATA LOGIC ---
+        
+        df["display_name"] = df["resort"].apply(get_display_name) # <-- This line was failing
         df = df.sort_values("snow_24h_summit", ascending=False).reset_index(drop=True)
-        df["display_name"] = df["resort"].apply(get_display_name)
 
         return df
     except Exception as e:
@@ -219,46 +296,6 @@ def load_historical_data(_db, days=5):
     except Exception as e:
         st.error(f"Error loading history: {e}")
         return pd.DataFrame()
-
-
-# ──────────────────────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────────────────────
-def get_display_name(resort_name: str) -> str:
-    name_map = {
-        "LookoutPass": "Lookout Pass",
-        "BigMountain": "Big Mountain",
-        "LostTrail": "Lost Trail",
-        "TetonPass": "Teton Pass",
-        "Blacktail": "Blacktail Mountain",
-        "Snowbowl": "Snowbowl",
-        "Discovery": "Discovery",
-        "Showdown": "Showdown"
-    }
-    return name_map.get(resort_name, resort_name)
-
-def parse_open_status(status_string: str) -> (float, str):
-    if not isinstance(status_string, str):
-        return (0.0, "N/A")
-    parts = re.findall(r'\d+', status_string)
-    if len(parts) == 2:
-        try:
-            open_count = float(parts[0])
-            total_count = float(parts[1])
-            if total_count == 0:
-                return (0.0, status_string)
-            percentage = open_count / total_count
-            return (percentage, status_string)
-        except Exception:
-            pass
-    return (0.0, status_string)
-
-
-def is_fresh_for_day(qd, lu):
-    if pd.isna(lu) or pd.isna(qd):
-        return False
-    mid = datetime(qd.year, qd.month, qd.day, 12, tzinfo=LOCAL_TZ)
-    return abs((lu - mid).total_seconds()) / 3600 <= FRESHNESS_TOLERANCE_HOURS
 
 
 def prepare_chart_data(df_hist, df_current):
@@ -934,7 +971,7 @@ if selected_display_name:
         st.markdown("<br>", unsafe_allow_html=True)
         st.info(r['comments'])
     
-    # --- LAYOUT FIX: SNOTEL Chart section removed from here ---
+    # --- LAYEAYOUT FIX: SNOTEL Chart section removed from here ---
 
 # --- END REPLACED SECTION ---
 
