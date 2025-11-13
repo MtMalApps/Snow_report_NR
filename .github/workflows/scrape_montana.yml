@@ -1,9 +1,11 @@
 name: Scrape Montana Resorts
 
 on:
+  workflow_dispatch: # This lets you run it manually from GitHub's website
   schedule:
-    - cron: '0 14 * * *'  # 7 AM MT (14:00 UTC) - Running daily starting Nov 3, 2025.
-  workflow_dispatch:  # also allow manual trigger
+    # This runs every 10 minutes between 12:00 and 17:50 UTC
+    # (5:00 AM - 10:50 AM MST)
+    - cron: '*/10 12-17 * * *'
 
 jobs:
   scrape:
