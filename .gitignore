@@ -1,7 +1,6 @@
+*.pyc
 __pycache__/
+dashboard_*.py
 *.json
-*.py.bak
-*.patch
-*_backup_*.py
-dashboard_*.bak
-dashboard_recover.py
+token.json
+credentials.json
