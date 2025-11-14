@@ -1,12 +1,10 @@
 name: Scrape Montana Resorts
-
 on:
   workflow_dispatch: # This lets you run it manually from GitHub's website
   schedule:
     # This runs every 10 minutes between 12:00 and 17:50 UTC
     # (5:00 AM - 10:50 AM MST)
     - cron: '*/10 12-17 * * *'
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -27,21 +25,6 @@ jobs:
         
     - name: Create data directory
       run: mkdir -p ~/snow_reports/data ~/snow_reports/logs
-      
-    - name: Set up OAuth credentials
-      env:
-        GMAIL_CREDENTIALS: ${{ secrets.GMAIL_CREDENTIALS_JSON }}
-        GMAIL_TOKEN: ${{ secrets.GMAIL_TOKEN_JSON }}
-      run: |
-        echo "$GMAIL_CREDENTIALS" > credentials.json
-        echo "$GMAIL_TOKEN" > token.json
-        
-    - name: Set up subscribers list
-      env:
-        SUBSCRIBER_EMAILS: ${{ secrets.SUBSCRIBER_EMAILS }}
-      run: |
-        echo "email,resorts" > ~/snow_reports/data/snow_report_subscribers.csv
-        echo "$SUBSCRIBER_EMAILS" >> ~/snow_reports/data/snow_report_subscribers.csv
         
     - name: Set up Firebase credentials
       env:
@@ -49,15 +32,12 @@ jobs:
       run: |
         echo "$FIREBASE_CREDS" > firebase-service-account.json
         
-    - name: Run scraper with Firebase
+    - name: Run scraper with Firebase upload
       env:
-        GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
-        GMAIL_CREDENTIALS_PATH: credentials.json
-        GMAIL_TOKEN_PATH: token.json
         FIREBASE_SERVICE_ACCOUNT: firebase-service-account.json
       run: python run_scraper_with_firebase.py
       
     - name: Clean up credentials
       if: always()
       run: |
-        rm -f credentials.json token.json firebase-service-account.json
+        rm -f firebase-service-account.json
