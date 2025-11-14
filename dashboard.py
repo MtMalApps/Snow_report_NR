@@ -681,17 +681,19 @@ if df.empty:
 
 df_hist = load_historical_data(db, days=5)
 
-# --- NEW Hero Section ---
-now = datetime.now()
+# --- NEW, CORRECTED HERO SECTION (Localizes Time) ---
+now_utc = datetime.now(ZoneInfo("UTC")) # Get time as UTC
+now_local = now_utc.astimezone(LOCAL_TZ) # Convert to MST/MDT
 st.markdown(f"""
     <div class='hero'>
         <h1 class='hero-title'>❄️ Northern Rockies Snow Report</h1>
         <p class='hero-subtitle'>Real-time conditions • Live forecasts • Backcountry data</p>
         <p class='hero-subtitle' style='font-size: 0.9rem; margin-top: 0.5rem; opacity: 0.9;'>
-            {now.strftime('%A, %B %d, %Y at %I:%M %p')}
+            {now_local.strftime('%A, %B %d, %Y at %I:%M %p %Z')} 
         </p>
     </div>
 """, unsafe_allow_html=True)
+# --- END NEW ---
 
 # --- NEW Powder Alert ---
 powder_resorts = df[df['is_powder'] == True]
