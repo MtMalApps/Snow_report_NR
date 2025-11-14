@@ -4,3 +4,7 @@ dashboard_*.py
 *.json
 token.json
 credentials.json
+*.bak
+*_backup_*.py
+*_20*.py
+*.patch
