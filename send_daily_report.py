@@ -21,15 +21,12 @@ import sys
 import json
 import pandas as pd
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
 import re
 import base64
-
 from email.mime.text import MIMEText
-
 from email.mime.multipart import MIMEMultipart
-from zoneinfo import ZoneInfo
-
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google.oauth2.credentials import Credentials
@@ -45,14 +42,11 @@ from nws_storm_outlook_v3 import NWSStormOutlook
 # =============================================================================
 
 # Dashboard URL
+DASHBOARD_URL = "https://northern-rockries-snow.streamlit.app/"
 DASHBOARD_URL = "https://northern-rockies-snow.streamlit.app/"
 
 # Powder Alert Threshold (inches of snow in 24 hours)
 POWDER_ALERT_THRESHOLD = 6
-
-# Local timezone and freshness tolerance (match dashboard behavior)
-LOCAL_TZ = ZoneInfo("America/Denver")
-FRESHNESS_TOLERANCE_HOURS = 30  # For "fresh" 24h/overnight snow
 
 # Resort coordinates for distance calculations
 RESORT_COORDS = {
@@ -80,6 +74,10 @@ SNOTEL_STATION_INFO = {
 
 # Data directory (for CSV chart data)
 DATA_DIR = os.path.expanduser("~/snow_reports/data")
+
+# Timezone and freshness config (to mirror dashboard logic)
+LOCAL_TZ = ZoneInfo("America/Denver")
+FRESHNESS_TOLERANCE_HOURS = 30  # used for "fresh" snow definitions
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -110,78 +108,6 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     a = sin(dphi/2)**2 + cos(phi1) * cos(phi2) * sin(dlam/2)**2
     c = 2 * asin(sqrt(a))
     return R * c
-
-def apply_stale_snow_logic_to_resorts(resort_data_list: List[Dict]) -> List[Dict]:
-    """
-    Mirror the dashboard's stale-data behavior for resort snow/depth fields:
-
-      1. Define current season starting Oct 1 (local time).
-      2. Zero out ALL snow/depth values from previous seasons
-         (snow_24h_summit, snow_24h_base, base_depth, summit_depth, snow_overnight).
-      3. For this season, if last_updated is older than FRESHNESS_TOLERANCE_HOURS,
-         zero out 24h/overnight snow but keep base/summit depth.
-
-    Operates in-place and also returns the list for convenience.
-    """
-    if not resort_data_list:
-        return resort_data_list
-
-    now_local = datetime.now(LOCAL_TZ)
-    today_local = now_local.date()
-
-    # Season start: Oct 1 of current year, or previous year if before October
-    season_start_year = today_local.year if today_local.month >= 10 else today_local.year - 1
-    season_start_dt = datetime(season_start_year, 10, 1, tzinfo=LOCAL_TZ)
-
-    all_snow_keys = [
-        "snow_24h_summit",
-        "snow_24h_base",
-        "base_depth",
-        "summit_depth",
-        "snow_overnight",
-    ]
-    fresh_snow_keys = [
-        "snow_24h_summit",
-        "snow_overnight",
-    ]
-
-    for resort in resort_data_list:
-        lu_str = resort.get("last_updated")
-        last_updated_dt = None
-
-        if lu_str:
-            # Try several formats; fall back gracefully if none match
-            for fmt in (
-                "%Y-%m-%d %I:%M %p",
-                "%Y-%m-%d %H:%M %p",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%dT%H:%M:%S",
-            ):
-                try:
-                    parsed = datetime.strptime(lu_str, fmt)
-                    last_updated_dt = parsed.replace(tzinfo=LOCAL_TZ)
-                    break
-                except ValueError:
-                    continue
-
-        resort["_last_updated_dt"] = last_updated_dt
-
-        # If we couldn't parse, or it's from before this season, treat as previous-season stale:
-        # zero ALL snow/depth fields so old Teton Pass base depth etc. don't show up.
-        if last_updated_dt is None or last_updated_dt < season_start_dt:
-            for key in all_snow_keys:
-                if key in resort:
-                    resort[key] = 0
-            continue
-
-        # Within this season: keep base/summit but zero 24h/overnight if older than freshness window
-        hours_since_update = (now_local - last_updated_dt).total_seconds() / 3600.0
-        if hours_since_update > FRESHNESS_TOLERANCE_HOURS:
-            for key in fresh_snow_keys:
-                if key in resort:
-                    resort[key] = 0
-
-    return resort_data_list
 
 # =============================================================================
 # FIREBASE CONNECTION
@@ -265,6 +191,71 @@ def get_latest_resort_data_from_firebase(db: firestore.Client) -> List[Dict]:
         import traceback
         traceback.print_exc()
         return []
+
+# =============================================================================
+# STALE DATA LOGIC (mirrors dashboard behavior)
+# =============================================================================
+
+def apply_stale_logic_to_resorts(resort_data_list: List[Dict]) -> List[Dict]:
+    """
+    Apply seasonal and freshness logic to resort data so that:
+    - Data from a previous season (before Oct 1 of current season) has ALL snow and depth set to 0.
+    - Data from this season but older than FRESHNESS_TOLERANCE_HOURS has 24h/overnight snow cleared but keeps depths.
+    """
+    if not resort_data_list:
+        return resort_data_list
+
+    df = pd.DataFrame(resort_data_list)
+
+    if "last_updated" not in df.columns:
+        return resort_data_list
+
+    # Parse last_updated to timezone-aware datetimes in LOCAL_TZ
+    dt = pd.to_datetime(df["last_updated"], format="mixed", errors="coerce")
+    try:
+        if dt.dt.tz is None:
+            dt = dt.dt.tz_localize(LOCAL_TZ)
+        else:
+            dt = dt.dt.tz_convert(LOCAL_TZ)
+    except Exception:
+        # If timezone operations fail, keep as-is
+        df["last_updated_dt"] = dt
+    else:
+        df["last_updated_dt"] = dt
+
+    # Season start is October 1 of current or previous year
+    today_local = datetime.now(LOCAL_TZ).date()
+    season_start_year = today_local.year if today_local.month >= 10 else today_local.year - 1
+    season_start_dt = datetime(season_start_year, 10, 1, tzinfo=LOCAL_TZ)
+
+    is_from_this_season = df["last_updated_dt"] >= season_start_dt
+
+    # Zero out *all* snow-related fields for prior seasons
+    all_snow_cols = [
+        "snow_24h_summit",
+        "snow_24h_base",
+        "base_depth",
+        "summit_depth",
+        "snow_overnight",
+    ]
+    for col in all_snow_cols:
+        if col in df.columns:
+            df.loc[~is_from_this_season, col] = 0
+
+    # For this season, clear 24h/overnight snow that's too old, but keep depths
+    now_dt = datetime.now(LOCAL_TZ)
+    age_hours = (now_dt - df["last_updated_dt"]).dt.total_seconds() / 3600
+    is_fresh_snow = age_hours < FRESHNESS_TOLERANCE_HOURS
+
+    fresh_snow_cols = ["snow_24h_summit", "snow_overnight"]
+    for col in fresh_snow_cols:
+        if col in df.columns:
+            df.loc[is_from_this_season & ~is_fresh_snow, col] = 0
+
+    # Optionally store a date-only version for other logic
+    df["last_updated_date"] = df["last_updated_dt"].dt.date
+
+    return df.to_dict(orient="records")
 
 # =============================================================================
 # EMAIL THEME
@@ -471,13 +462,9 @@ class EmailSnowReportMessenger:
                     
                     df['report_date'] = pd.to_datetime(df['date'], format='%Y-%m-%d', errors='coerce')
                     df['last_updated_dt'] = (
-                        pd.to_datetime(
-                            df['last_updated'],
-                            format='mixed',        # <-- NEW: pandas 2.2+ allows this
-                            errors='coerce'
-                        ).dt.date
+                        pd.to_datetime(df['last_updated'], format='mixed', errors='coerce')
+                        .dt.date
                     )
-
                     
                     if df['report_date'].isna().all():
                         raise ValueError("All report_dates are NaT")
@@ -989,7 +976,6 @@ class EmailSnowReportMessenger:
             ('weather_current', 'Weather', False),
         ]
         
-        # When data is not from "today", we still allow base/summit depth
         historic_safe_fields = ['base_depth', 'summit_depth']
 
         for field_key, label, is_highlight in field_map:
@@ -999,9 +985,9 @@ class EmailSnowReportMessenger:
             value = resort_data.get(field_key)
             if value is None or str(value).strip().lower() in ('', 'none', 'n/a', '0', '0.0'):
                 if is_current and field_key in ['snow_24h_base', 'snow_24h_summit', 'snow_overnight'] and str(value) == '0':
-                    pass
+                     pass
                 else:
-                    continue
+                     continue
             
             if field_key in ['snow_24h_base', 'snow_24h_summit', 'snow_overnight', 'base_depth', 'summit_depth']:
                 formatted_value = self._fmt_inches(value)
@@ -1183,6 +1169,14 @@ class EmailSnowReportMessenger:
                 <tr>
                   <td class="stack center-sm" style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px;">
                     Data sources: resort public snow reports, NWS API, &amp; nearby SNOTEL stations. Values are best-effort scrapes and may lag resort updates.
+                    <div style="font-family:Arial, Helvetica, sans-serif; color:#64748b; font-size:11px; margin-top:12px; text-align:center;">
+                      If you no longer want to receive these reports,
+                      <a href="mailto:mtmalamuteapps+unsubscribe@gmail.com?subject=Unsubscribe" style="color:#93c5fd; text-decoration:none;">
+                        click here to unsubscribe
+                      </a>.
+                      <br>
+                      Tip: Add <span style="color:#e2e8f0;">mtmalamuteapps@gmail.com</span> to your Contacts to ensure delivery.
+                    </div>
                   </td>
                 </tr>
               </table>
@@ -1257,9 +1251,9 @@ class EmailSnowReportMessenger:
         if not recipients:
             print("No subscribers found")
             return
-
-        # Apply stale snow/base-depth logic to match dashboard behavior
-        resort_data_list = apply_stale_snow_logic_to_resorts(resort_data_list)
+        
+        # Apply stale logic so email matches dashboard behavior
+        resort_data_list = apply_stale_logic_to_resorts(resort_data_list)
         
         # Sort resorts
         sorted_resorts = sorted(resort_data_list, key=self.get_master_sort_key)
@@ -1319,9 +1313,27 @@ class EmailSnowReportMessenger:
             message['Subject'] = subject
             message['From'] = self.gmail_address
             message['To'] = ', '.join(recipients)
+
+            # List-Unsubscribe headers (improves deliverability)
+            local, _, domain = self.gmail_address.partition("@")
+            unsubscribe_email = f"{local}+unsubscribe@{domain}" if domain else self.gmail_address
+            message['List-Unsubscribe'] = f"<mailto:{unsubscribe_email}?subject=Unsubscribe>"
+            message['List-Unsubscribe-Post'] = "List-Unsubscribe=One-Click"
             
+            # Plain-text fallback part
+            text_part = MIMEText(
+                "Northern Rockies Daily Snow Report\n\n"
+                "Full snow report available at:\n"
+                "https://northern-rockies-snow.streamlit.app/\n\n"
+                "Tip: Add mtmalamuteapps@gmail.com to your Contacts to ensure delivery.",
+                "plain"
+            )
+            message.attach(text_part)
+            
+            # HTML part
             html_part = MIMEText(email_html, 'html')
             message.attach(html_part)
+
             raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
             
             service.users().messages().send(userId='me', body={'raw': raw_message}).execute()
