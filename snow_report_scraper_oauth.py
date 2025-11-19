@@ -37,7 +37,9 @@ from nws_storm_outlook_v3 import NWSStormOutlook
 # Powder Alert Threshold (inches of snow in 24 hours)
 POWDER_ALERT_THRESHOLD = 6
 # Resort coordinates for NWS forecasts
+# Resort coordinates for NWS forecasts
 RESORT_COORDS = {
+    # Existing
     "Snowbowl": {"lat": 46.9137, "lon": -113.9525},
     "Discovery": {"lat": 46.3861, "lon": -113.2144},
     "LookoutPass": {"lat": 47.4536, "lon": -115.7414},
@@ -45,7 +47,17 @@ RESORT_COORDS = {
     "LostTrail": {"lat": 45.7019, "lon": -113.9219},
     "TetonPass": {"lat": 47.9299, "lon": -112.8109},
     "Showdown": {"lat": 46.9939, "lon": -110.6647},
-    "Blacktail": {"lat": 48.0067, "lon": -114.3589}
+    "Blacktail": {"lat": 48.0067, "lon": -114.3589},
+    # New Additions
+    "SilverMountain": {"lat": 47.4991, "lon": -116.1192},
+    "TurnerMountain": {"lat": 48.6098, "lon": -115.6488},
+    "BearPaw": {"lat": 48.1621, "lon": -109.6799},
+    "GreatDivide": {"lat": 46.7489, "lon": -112.3285},
+    "Schweitzer": {"lat": 48.3778, "lon": -116.6334},
+    "Maverick": {"lat": 45.4383, "lon": -113.1422},
+    "BigSky": {"lat": 45.2809, "lon": -111.4406},
+    "BridgerBowl": {"lat": 45.8139, "lon": -110.9219},
+    "RedLodge": {"lat": 45.1811, "lon": -109.3543},
 }
 
 # Data directory
@@ -975,15 +987,27 @@ class SNOTELDataFetcher:
     Uses HOURLY data to calculate real-time 24-hour snow totals (catching early morning storms).
     """
     STATION_INFO = {
-        "Showdown":     {"triplet": "437:MT:SNTL",  "name": "Deadman Creek",   "lat": 46.79, "lon": -110.68, "elevation": 6440},
-        "TetonPass":    {"triplet": "649:MT:SNTL",  "name": "Mount Lockhart",  "lat": 47.92, "lon": -112.82, "elevation": 6430},
-        "Discovery":    {"triplet": "850:MT:SNTL",  "name": "Warm Springs",    "lat": 46.27, "lon": -113.16, "elevation": 7840},
-        "LostTrail":    {"triplet": "727:MT:SNTL",  "name": "Saddle Mountain", "lat": 45.69, "lon": -113.97, "elevation": 7890},
-        "Snowbowl":     {"triplet": "901:MT:SNTL",  "name": "Stuart Mountain", "lat": 47.00, "lon": -113.93, "elevation": 7270},
-        "LookoutPass": {"triplet": "594:ID:SNTL",  "name": "Lookout",          "lat": 47.46, "lon": -115.70, "elevation": 5180},
-        "Blacktail":    {"triplet": "1144:MT:SNTL", "name": "Blacktail Mtn",   "lat": 47.98, "lon": -114.35, "elevation": 5660},
-        "BigMountain": {"triplet": "469:MT:SNTL",  "name": "Emery Creek",      "lat": 48.43, "lon": -113.94, "elevation": 4340},
-    }
+            # Existing
+            "Showdown":     {"triplet": "437:MT:SNTL",  "name": "Deadman Creek",   "lat": 46.79, "lon": -110.68, "elevation": 6440},
+            "TetonPass":    {"triplet": "649:MT:SNTL",  "name": "Mount Lockhart",  "lat": 47.92, "lon": -112.82, "elevation": 6430},
+            "Discovery":    {"triplet": "850:MT:SNTL",  "name": "Warm Springs",    "lat": 46.27, "lon": -113.16, "elevation": 7840},
+            "LostTrail":    {"triplet": "727:MT:SNTL",  "name": "Saddle Mountain", "lat": 45.69, "lon": -113.97, "elevation": 7890},
+            "Snowbowl":     {"triplet": "901:MT:SNTL",  "name": "Stuart Mountain", "lat": 47.00, "lon": -113.93, "elevation": 7270},
+            "LookoutPass":  {"triplet": "594:ID:SNTL",  "name": "Lookout",         "lat": 47.46, "lon": -115.70, "elevation": 5180},
+            "Blacktail":    {"triplet": "1144:MT:SNTL", "name": "Blacktail Mtn",   "lat": 47.98, "lon": -114.35, "elevation": 5660},
+            "BigMountain":  {"triplet": "469:MT:SNTL",  "name": "Emery Creek",     "lat": 48.43, "lon": -113.94, "elevation": 4340},
+            
+            # New Additions
+            "SilverMountain": {"triplet": "803:ID:SNTL", "name": "Sunset",            "lat": 47.56, "lon": -115.82, "elevation": 5580},
+            "TurnerMountain": {"triplet": "311:MT:SNTL", "name": "Banfield Mountain", "lat": 48.57, "lon": -115.45, "elevation": 5580},
+            "BearPaw":        {"triplet": "917:MT:SNTL", "name": "Rocky Boy",         "lat": 48.17, "lon": -109.65, "elevation": 4730},
+            "GreatDivide":    {"triplet": "903:MT:SNTL", "name": "Nevada Ridge",      "lat": 46.84, "lon": -112.51, "elevation": 7030},
+            "Schweitzer":     {"triplet": "738:ID:SNTL", "name": "Schweitzer Basin",  "lat": 48.37, "lon": -116.64, "elevation": 6090},
+            "Maverick":       {"triplet": "656:MT:SNTL", "name": "Mule Creek",        "lat": 45.41, "lon": -112.96, "elevation": 8300},
+            "BigSky":         {"triplet": "590:MT:SNTL", "name": "Lone Mountain",     "lat": 45.27, "lon": -111.43, "elevation": 8810},
+            "BridgerBowl":    {"triplet": "365:MT:SNTL", "name": "Brackett Creek",    "lat": 45.89, "lon": -110.94, "elevation": 7370},
+            "RedLodge":       {"triplet": "407:MT:SNTL", "name": "Cole Creek",        "lat": 45.19, "lon": -109.35, "elevation": 7910},
+        }
     
     def __init__(self):
         import os
