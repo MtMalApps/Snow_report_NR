@@ -1128,6 +1128,7 @@ class SNOTELDataFetcher:
             if not is_new_snow:
                 return {
                     'station_name': station_name, 'triplet': triplet,
+                    'elevation': info['elevation'],
                     'snow_depth': snow_change if snow_change is not None else 'N/A',
                     'swe': swe_change if swe_change is not None else 'N/A',
                     'density': 'N/A', 'percent_of_median': percent_of_median,
@@ -1137,6 +1138,7 @@ class SNOTELDataFetcher:
             
             return {
                 'station_name': station_name, 'triplet': triplet,
+                'elevation': info['elevation'],
                 'snow_depth': snow_change, 'swe': swe_change,
                 'density': density, 'percent_of_median': percent_of_median,
                 'snow_category': self._snow_category(density),
@@ -1183,6 +1185,8 @@ class SNOTELDataFetcher:
                         continue
                     
                     station_name = self.STATION_INFO[resort_name]['name']
+                    station_elev = self.STATION_INFO[resort_name]['elevation']
+                    
                     results = {'today': {'date': None, 'snwd': None, 'wteq': None, 'wteq_median': None}, 'yesterday': {'date': None, 'snwd': None, 'wteq': None}}
                     
                     for element_data in station_data.get('data', []):
@@ -1239,6 +1243,7 @@ class SNOTELDataFetcher:
                     if not is_new_snow:
                         final_reports[resort_name] = {
                             'station_name': station_name, 'triplet': triplet,
+                            'elevation': station_elev,
                             'snow_depth': snow_change if snow_change is not None else 'N/A',
                             'swe': swe_change if swe_change is not None else 'N/A',
                             'density': 'N/A', 'percent_of_median': percent_of_median,
@@ -1248,6 +1253,7 @@ class SNOTELDataFetcher:
                     else:
                         final_reports[resort_name] = {
                             'station_name': station_name, 'triplet': triplet,
+                            'elevation': station_elev,
                             'snow_depth': snow_change, 'swe': swe_change,
                             'density': density, 'percent_of_median': percent_of_median,
                             'snow_category': self._snow_category(density),
