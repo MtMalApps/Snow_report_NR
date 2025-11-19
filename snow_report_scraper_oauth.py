@@ -978,6 +978,279 @@ class BlacktailScraper(BaseSnowReportScraper):
         
         return data
 
+
+class SchweitzerScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("Schweitzer")
+
+    def get_url(self):
+        return "https://www.schweitzer.com/mountain-info/mountain-report"
+
+    def process_data(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        data = {col: None for col in self.STANDARD_COLUMNS}
+
+        # --- 1. Parse Last Updated ---
+        # Schweitzer usually puts this in a subtle text block
+        # Format: "Last Updated: Wednesday, Nov 19, 2025 1:00 PM"
+        timestamp_elem = soup.find(string=re.compile(r'Last Updated', re.I))
+        if timestamp_elem:
+            try:
+                # Clean up the string (e.g., remove "Last Updated: ")
+                time_text = timestamp_elem.strip().split('Updated')[-1].strip().lstrip(':').strip()
+                # Try parsing standard format
+                parsed_date = datetime.strptime(time_text, '%A, %b %d, %Y %I:%M %p')
+                data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+            except Exception:
+                # Fallback: just save the raw string
+                data['last_updated'] = timestamp_elem.strip()
+
+        # --- 2. Parse Snowfall & Depth (Grid Layout) ---
+        # They often use classes like "snow-report-item" or simple text labels
+        def find_val(label_text):
+            # Helper to find a label and get the number next to/below it
+            elem = soup.find(string=re.compile(label_text, re.I))
+            if elem:
+                # Try next sibling
+                val = elem.find_next(text=True).strip()
+                if not any(c.isdigit() for c in val): 
+                    # If next text isn't a number, try the parent's next sibling
+                    parent = elem.parent
+                    if parent:
+                        val = parent.find_next(text=True).strip()
+                return self.clean_numeric(val)
+            return None
+
+        data['snow_overnight'] = find_val(r'Overnight')
+        data['snow_24h_base'] = find_val(r'24 (Hr|Hour)')
+        data['snow_48h_base'] = find_val(r'48 (Hr|Hour)')
+        data['snow_7day'] = find_val(r'7 Day')
+        data['base_depth'] = find_val(r'Base Depth')
+        data['summit_depth'] = find_val(r'Summit Depth') # Sometimes called "Upper Mtn"
+
+        # --- 3. Parse Weather / Temps ---
+        # Look for temperature blocks
+        temp_elem = soup.find(string=re.compile(r'Temp', re.I))
+        if temp_elem:
+            val = temp_elem.find_next(text=True).strip()
+            data['temp_base'] = self.clean_numeric(val)
+
+        # --- 4. Parse Lifts & Runs ---
+        # Often found in a "Lift Status" accordion or summary block
+        # We look for the text "X of Y Open"
+        text_content = soup.get_text()
+        
+        # Lifts regex (e.g., "Lifts Open: 5/10")
+        lifts_match = re.search(r'Lifts\s*(?:Open)?\s*[:\n]\s*(\d+)\s*/\s*(\d+)', text_content, re.I)
+        if lifts_match:
+            data['lifts_open'] = f"{lifts_match.group(1)}/{lifts_match.group(2)}"
+
+        # Runs regex (e.g., "Runs Open: 50/92")
+        runs_match = re.search(r'(?:Runs|Trails)\s*(?:Open)?\s*[:\n]\s*(\d+)\s*/\s*(\d+)', text_content, re.I)
+        if runs_match:
+            data['runs_open'] = f"{runs_match.group(1)}/{runs_match.group(2)}"
+            
+        # --- 5. Surface Conditions ---
+        # Look for keywords in the text content
+        surface_keywords = ["Powder", "Packed Powder", "Machine Groomed", "Groomed", "Variable", "Corn", "Spring Conditions"]
+        found_conditions = []
+        for cond in surface_keywords:
+            if re.search(rf'\b{cond}\b', text_content, re.I):
+                found_conditions.append(cond)
+                break # Usually only the first/main one matters
+        
+        if found_conditions:
+            data['conditions_surface'] = found_conditions[0]
+
+        return data
+
+class SilverMountainScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("SilverMountain")
+
+    def get_url(self):
+        # The "expanded conditions" page usually has the cleanest text data
+        return "https://www.silvermt.com/index.php/conditions"
+
+    def process_data(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        data = {col: None for col in self.STANDARD_COLUMNS}
+        
+        # Get all text to parse with Regex (Silver Mt structure is often just text lists)
+        full_text = soup.get_text(separator=' ', strip=True)
+        
+        # --- 1. Parse Last Updated ---
+        # Look for: "Last updated: 2025-11-18T15:37:00" or "Updated: Nov 18"
+        # We try a few patterns
+        timestamp_patterns = [
+            r'Last updated[:\s]*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', # ISO format
+            r'Updated[:\s]*(\w+\s+\d{1,2},\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*[AP]M)', # Human format
+        ]
+        
+        for pat in timestamp_patterns:
+            match = re.search(pat, full_text, re.I)
+            if match:
+                try:
+                    raw_date = match.group(1)
+                    if 'T' in raw_date: # ISO Format
+                        dt = datetime.strptime(raw_date.split('.')[0], '%Y-%m-%dT%H:%M:%S')
+                        data['last_updated'] = dt.strftime('%Y-%m-%d %I:%M %p')
+                    else: # "Nov 18, 2025 at 3:37 PM"
+                        dt = datetime.strptime(raw_date, '%B %d, %Y at %I:%M %p')
+                        data['last_updated'] = dt.strftime('%Y-%m-%d %I:%M %p')
+                    break
+                except Exception:
+                    continue
+        
+        # --- 2. Split into Base (Lodge) vs Summit ---
+        # The page usually lists "Lodge" stats first, then "Summit" stats.
+        # We split the text at the word "Summit" to differentiate duplicate labels like "24 Hours"
+        
+        # Default to using full text for everything if split fails
+        base_section = full_text
+        summit_section = full_text
+        
+        # Try to split
+        if "Summit" in full_text:
+            parts = full_text.split("Summit", 1)
+            if len(parts) == 2:
+                base_section = parts[0] # Text before "Summit" header
+                summit_section = parts[1] # Text after "Summit" header
+        
+        # Helper to extract number after a label
+        def get_val(txt_block, label_pattern):
+            # Look for "Label... 12" or "Label 12"
+            # This regex finds the label, ignores non-digits, then grabs the number
+            m = re.search(rf'{label_pattern}.*?(\d+(?:\.\d+)?)', txt_block, re.I)
+            if m:
+                return self.clean_numeric(m.group(1))
+            return None
+
+        # --- 3. Snow Totals ---
+        # Base Area
+        data['snow_24h_base'] = get_val(base_section, r'24\s*Hours')
+        data['snow_48h_base'] = get_val(base_section, r'48\s*Hours')
+        data['base_depth'] = get_val(base_section, r'Snow\s*Depth')
+        
+        # Summit Area
+        data['snow_24h_summit'] = get_val(summit_section, r'24\s*Hours')
+        data['snow_48h_summit'] = get_val(summit_section, r'48\s*Hours')
+        data['summit_depth'] = get_val(summit_section, r'Snow\s*Depth')
+        
+        # Overnight usually appears once or in both; we grab the first reasonable one
+        data['snow_overnight'] = get_val(full_text, r'12\s*Hours') or get_val(full_text, r'Overnight')
+
+        # --- 4. Temps ---
+        # Look for "Temperature... 32" in respective sections
+        data['temp_base'] = get_val(base_section, r'Temperature')
+        data['temp_summit'] = get_val(summit_section, r'Temperature')
+        
+        # --- 5. Wind ---
+        data['wind_speed'] = get_val(summit_section, r'Wind') # Summit wind is what matters
+
+        # --- 6. Surface Conditions ---
+        # Look for standard keywords
+        surface_keywords = ["Powder", "Packed Powder", "Machine Groomed", "Groomed", "Variable", "Corn", "Spring Conditions", "Early Season"]
+        for cond in surface_keywords:
+            if re.search(rf'\b{cond}\b', full_text, re.I):
+                data['conditions_surface'] = cond
+                break
+                
+        # --- 7. Operations ---
+        data['lifts_open'] = get_val(full_text, r'Lifts\s*Operating')
+        data['runs_open'] = get_val(full_text, r'Trails\s*Open')
+        
+        # --- 8. Comments ---
+        # Just grab the weather summary if available
+        weather_match = re.search(r'Current\s*Weather\.?\s*([^\.]+)', full_text, re.I)
+        if weather_match:
+            data['weather_current'] = weather_match.group(1).strip()
+
+        return data
+        
+        
+class GreatDivideScraper(BaseSnowReportScraper):
+    def __init__(self):
+        super().__init__("GreatDivide")
+
+    def get_url(self):
+        return "https://skigd.com/the-mountain/conditions-weather/current-conditions/"
+
+    def process_data(self, response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        data = {col: None for col in self.STANDARD_COLUMNS}
+
+        # --- 1. Parse Last Updated ---
+        # Usually in a format like "Last Updated: 11/18/2025"
+        timestamp_elem = soup.find(string=re.compile(r'Last Updated', re.I))
+        if timestamp_elem:
+            try:
+                date_str = timestamp_elem.strip().split('Updated')[-1].strip().lstrip(':').strip()
+                # Try a few date formats
+                for fmt in ['%m/%d/%Y', '%B %d, %Y', '%b %d, %Y']:
+                    try:
+                        dt = datetime.strptime(date_str, fmt)
+                        # Since GD often just gives a date, we default to 6 AM
+                        data['last_updated'] = dt.strftime('%Y-%m-%d 06:00 AM')
+                        break
+                    except ValueError:
+                        continue
+            except Exception:
+                data['last_updated'] = timestamp_elem.strip()
+
+        # --- 2. Parse Snow Report Grid ---
+        # Great Divide usually uses blocks with numbers and labels
+        # We scan for labels and grab the number immediately preceding or following
+        text_content = soup.get_text(separator=' ', strip=True)
+        
+        def get_val_by_label(label_regex):
+            # Finds a number near the label
+            # Look for: "12" New Snow" or "New Snow: 12""
+            patterns = [
+                rf'(\d+(?:\.\d+)?)\s*["”]?\s*{label_regex}', # Number BEFORE label
+                rf'{label_regex}[:\s]*(\d+(?:\.\d+)?)'      # Number AFTER label
+            ]
+            for pat in patterns:
+                match = re.search(pat, text_content, re.I)
+                if match:
+                    return self.clean_numeric(match.group(1))
+            return None
+
+        data['snow_overnight'] = get_val_by_label(r'Overnight')
+        data['snow_24h_base'] = get_val_by_label(r'24\s*Hr')
+        data['snow_48h_base'] = get_val_by_label(r'48\s*Hr')
+        data['snow_7day'] = get_val_by_label(r'7\s*Day')
+        data['base_depth'] = get_val_by_label(r'Base')
+        data['summit_depth'] = get_val_by_label(r'Summit')
+
+        # Fallback: If 24h base/summit split isn't clear, use generic 24h for both
+        if data['snow_24h_base'] is not None and data['snow_24h_summit'] is None:
+             data['snow_24h_summit'] = data['snow_24h_base']
+
+        # --- 3. Temps ---
+        data['temp_base'] = get_val_by_label(r'Base\s*Temp')
+        data['temp_summit'] = get_val_by_label(r'Summit\s*Temp')
+
+        # --- 4. Surface Conditions ---
+        surface_keywords = ["Powder", "Packed Powder", "Machine Groomed", "Groomed", "Variable", "Corn", "Spring Conditions"]
+        for cond in surface_keywords:
+            if re.search(rf'\b{cond}\b', text_content, re.I):
+                data['conditions_surface'] = cond
+                break
+
+        # --- 5. Operations ---
+        # Look for "Lifts Open: 5"
+        lifts_val = get_val_by_label(r'Lifts\s*Open')
+        if lifts_val is not None:
+            data['lifts_open'] = str(int(lifts_val)) # "5"
+
+        runs_val = get_val_by_label(r'Runs\s*Open')
+        if runs_val is not None:
+            data['runs_open'] = str(int(runs_val))
+
+        return data  
+
+
 # =============================================================================
 # SNOTEL DATA INTEGRATION (HOURLY)
 # =============================================================================
@@ -1304,6 +1577,9 @@ def main():
             TetonPassScraper(),
             ShowdownScraper(),
             BlacktailScraper(),
+            SchweitzerScraper(),
+            SilverMountainScraper(),
+            GreatDivideScraper(),
         ]
         
         resort_data_list = []
