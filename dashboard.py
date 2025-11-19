@@ -1,18 +1,21 @@
 import os
-import re
+import ast
+import urllib.parse as urlparse
+import math
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import urllib.parse as urlparse
-import json
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 import altair as alt
 
+import folium
+from folium.plugins import Fullscreen
+from streamlit_folium import st_folium
+
 import firebase_admin
 from firebase_admin import credentials, firestore
-import ast # <-- ADD THIS IMPORT
 
 # ──────────────────────────────────────────────────────────────
 # CONFIG
@@ -24,331 +27,49 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Debug flags
-DEBUG_TABLE = False
-DEBUG_CHART = False
-
 LOCAL_TZ = ZoneInfo("America/Denver")
-FRESHNESS_TOLERANCE_HOURS = 30 # For "fresh" snow
-
-# SNOTEL iframe settings
-SNOTEL_CROP_TOP = 410
-SNOTEL_CROP_BOTTOM = 480
-SNOTEL_VIEW_HEIGHT = 440
-
-
-def get_snotel_iframe_html(triplet: str, station_name: str, show_years: str | None) -> str:
-    """Return HTML snippet cropping NRCS SNOTEL graph nicely."""
-    try:
-        state = triplet.split(":")[1].strip().upper()
-    except Exception:
-        state = ""
-    name_enc = urlparse.quote(station_name)
-    
-    # --- FIX: Updated to the correct SNOTEL URL ---
-    base = f"https://nwcc-apps.sc.egov.usda.gov/awdb/site-plots/POR/WTEQ/{state}/{name_enc}.html"
-    
-    params = ["hideAnno=true", "hideControls=true", "activeOnly=true"]
-    if show_years:
-        params.append(f"showYears={show_years.strip()}")
-    url = base + "?" + "&".join(params)
-    inner_height = SNOTEL_VIEW_HEIGHT + SNOTEL_CROP_TOP + SNOTEL_CROP_BOTTOM
-    return f"""
-    <div style="width:100%; height:{SNOTEL_VIEW_HEIGHT}px; overflow:hidden; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,.15); margin-top: 16px; background: white;">
-      <iframe
-        src="{url}"
-        style="width:100%; height:{inner_height}px; border:0; transform: translateY(-{SNOTEL_CROP_TOP}px);"
-        loading="lazy"
-        referrerpolicy="no-referrer-when-downgrade"
-      ></iframe>
-    </div>
-    """
+FRESHNESS_TOLERANCE_HOURS = 30
 
 # ──────────────────────────────────────────────────────────────
-# FIREBASE INIT
+# COORDINATES
 # ──────────────────────────────────────────────────────────────
-@st.cache_resource
-def initialize_firebase():
-    try:
-        # --- NEW, SAFER FIX ---
-        # Check if the LOCAL environment variable is set first.
-        cred_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
-        
-        if cred_path:
-            # We are running LOCALLY.
-            if not os.path.exists(cred_path):
-                st.error(f"LOCAL RUN: Firebase credentials file not found at: {cred_path}")
-                st.info("Please check the file name and path in your `export` command.")
-                return None
-            cred = credentials.Certificate(cred_path)
-        else:
-            # We are running in STREAMLIT CLOUD.
-            # Now it is safe to access st.secrets.
-            creds = st.secrets["firebase_service_account"]
-            if isinstance(creds, str):
-                # This handles the string-parsing error we saw before
-                creds_dict = ast.literal_eval(creds)
-            else:
-                creds_dict = dict(creds)
-            cred = credentials.Certificate(creds_dict)
-        
-        # Initialize app
-        try:
-            firebase_admin.get_app()
-        except ValueError:
-            firebase_admin.initialize_app(cred)
-        
-        return firestore.client()
-    
-    except Exception as e:
-        st.error(f"Firebase init error: {e}")
-        return None
+RESORTS_DATA = {
+    "Snowbowl": {"lat": 47.032417, "lon": -113.9915282},
+    "Discovery": {"lat": 46.262206, "lon": -113.246187},
+    "Lookout Pass": {"lat": 47.4531005, "lon": -115.706537},
+    "Big Mountain": {"lat": 48.502127, "lon": -114.341252},
+    "Lost Trail": {"lat": 45.695247, "lon": -113.965263},
+    "Teton Pass": {"lat": 47.929804, "lon": -112.816723},
+    "Showdown": {"lat": 46.837747, "lon": -110.715599},
+    "Blacktail": {"lat": 48.011676, "lon": -114.365251},
+    "Bridger Bowl": {"lat": 45.813919, "lon": -110.921873},
+    "Big Sky": {"lat": 45.280943, "lon": -111.440644},
+    "Red Lodge Mountain": {"lat": 45.181125, "lon": -109.354325},
+    "Maverick": {"lat": 45.438286, "lon": -113.142233},
+    "Great Divide": {"lat": 46.748900, "lon": -112.328513},
+    "Bear Paw": {"lat": 48.162084, "lon": -109.679937},
+    "Silver Mountain": {"lat": 47.499070, "lon": -116.119163},
+    "Turner Mountain": {"lat": 48.609788, "lon": -115.648756},
+    "Schweitzer": {"lat": 48.377785, "lon": -116.633436},
+}
 
 # ──────────────────────────────────────────────────────────────
-# --- SECTION MOVED UP: HELPERS ---
-# ──────────────────────────────────────────────────────────────
-def get_display_name(resort_name: str) -> str:
-    name_map = {
-        "LookoutPass": "Lookout Pass",
-        "BigMountain": "Big Mountain",
-        "LostTrail": "Lost Trail",
-        "TetonPass": "Teton Pass",
-        "Blacktail": "Blacktail Mountain",
-        "Snowbowl": "Snowbowl",
-        "Discovery": "Discovery",
-        "Showdown": "Showdown"
-    }
-    return name_map.get(resort_name, resort_name)
-
-def parse_open_status(status_string: str) -> (float, str):
-    if not isinstance(status_string, str):
-        return (0.0, "N/A")
-    parts = re.findall(r'\d+', status_string)
-    if len(parts) == 2:
-        try:
-            open_count = float(parts[0])
-            total_count = float(parts[1])
-            if total_count == 0:
-                return (0.0, status_string)
-            percentage = open_count / total_count
-            return (percentage, status_string)
-        except Exception:
-            pass
-    return (0.0, status_string)
-
-
-def is_fresh_for_day(qd, lu):
-    if pd.isna(lu) or pd.isna(qd):
-        return False
-    mid = datetime(qd.year, qd.month, qd.day, 12, tzinfo=LOCAL_TZ)
-    return abs((lu - mid).total_seconds()) / 3600 <= FRESHNESS_TOLERANCE_HOURS
-
-
-# ──────────────────────────────────────────────────────────────
-# DATA LOADING
-# ──────────────────────────────────────────────────────────────
-@st.cache_data(ttl=600)
-def load_latest_data(_db):
-    if _db is None:
-        return pd.DataFrame()
-    try:
-        latest_q = (
-            _db.collection("snow_reports")
-            .order_by("date", direction=firestore.Query.DESCENDING)
-            .limit(1)
-            .stream()
-        )
-        latest = [d.to_dict() for d in latest_q]
-        if not latest:
-            return pd.DataFrame()
-        latest_date = latest[0]["date"]
-        docs = (
-            _db.collection("snow_reports")
-            .where(filter=firestore.FieldFilter("date", "==", latest_date))
-            .stream()
-        )
-        st.session_state.latest_date_str = latest_date # Save for Hero
-        
-        rows = [d.to_dict() for d in docs]
-        if not rows:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(rows)
-
-        def ensure_series(col, default, dtype="str"):
-            if col in df.columns:
-                s = df[col]
-            else:
-                s = pd.Series([default] * len(df), index=df.index)
-                df[col] = s
-            if dtype == "num":
-                return pd.to_numeric(s, errors="coerce").fillna(0)
-            else:
-                return s.astype(str).replace(["nan", "None", "N/A"], "", regex=False)
-
-        obj_cols = [
-            "resort", "state", "last_updated", "lifts_open", "runs_open",
-            "conditions_surface", "weather_current", "comments"
-        ]
-        for c in obj_cols:
-            df[c] = ensure_series(c, default="", dtype="str")
-
-        num_cols = [
-            "snow_24h_summit", "snow_24h_base", "base_depth", "summit_depth",
-            "snow_overnight", "temp_base", "temp_summit", "wind_speed"
-        ]
-        for c in num_cols:
-            df[c] = ensure_series(c, default=0, dtype="num")
-
-        # FIX: Use lambda to handle map objects correctly
-        if "nws_forecast" not in df.columns:
-            df["nws_forecast"] = [{} for _ in range(len(df))]
-        else:
-            df["nws_forecast"] = df["nws_forecast"].apply(lambda x: x if isinstance(x, dict) else {})
-
-        if "snotel_data" not in df.columns:
-            df["snotel_data"] = [{} for _ in range(len(df))]
-        else:
-            df["snotel_data"] = df["snotel_data"].apply(lambda x: x if isinstance(x, dict) else {})
-
-        def parse_dt(s):
-            dt = pd.to_datetime(s, errors="coerce")
-            if pd.isna(dt):
-                return pd.NaT
-            return dt.replace(tzinfo=LOCAL_TZ) if dt.tzinfo is None else dt.astimezone(LOCAL_TZ)
-
-        df["last_updated_dt"] = df["last_updated"].apply(parse_dt)
-        df["is_powder"] = (df["snow_24h_summit"] >= 6)
-
-        if "state" not in df.columns:
-            df["state"] = ""
-            
-        # --- NEW STALE DATA LOGIC ---
-        
-        # 1. DEFINE THE CURRENT SEASON
-        # We'll set the season start to October 1st.
-        today = datetime.now(LOCAL_TZ).date()
-        season_start_year = today.year if today.month >= 10 else today.year - 1
-        SEASON_START_DATE = pd.Timestamp(season_start_year, 10, 1, tz=LOCAL_TZ)
-        
-        # 2. SEASONAL STALE CHECK (for data from last season)
-        # If a report is from before this season, zero out EVERYTHING.
-        all_snow_cols = ['snow_24h_summit', 'snow_24h_base', 'base_depth', 'summit_depth', 'snow_overnight']
-        is_from_this_season = df['last_updated_dt'] >= SEASON_START_DATE
-        
-        for col in all_snow_cols:
-            if col in df.columns:
-                df.loc[~is_from_this_season, col] = 0
-                
-        # 3. FRESH SNOW STALE CHECK (for data > 30h old)
-        # For reports that ARE from this season, check if they are "fresh".
-        # If not fresh, zero out 24h/overnight snow, but LEAVE base/summit depth.
-        now_dt = datetime.now(LOCAL_TZ)
-        is_fresh_snow = (now_dt - df['last_updated_dt']).dt.total_seconds() / 3600 < FRESHNESS_TOLERANCE_HOURS
-        
-        fresh_snow_cols = ['snow_24h_summit', 'snow_overnight']
-        
-        for col in fresh_snow_cols:
-            if col in df.columns:
-                # Apply this check ONLY to reports that are from this season
-                # but are no longer "fresh" (i.e., > 30h old)
-                df.loc[is_from_this_season & ~is_fresh_snow, col] = 0
-                
-        # --- END STALE DATA LOGIC ---
-        
-        df["display_name"] = df["resort"].apply(get_display_name) # <-- This line was failing
-        df = df.sort_values("snow_24h_summit", ascending=False).reset_index(drop=True)
-
-        return df
-    except Exception as e:
-        st.error(f"Error loading data from Firestore: {e}")
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=600)
-def load_historical_data(_db, days=5):
-    if _db is None:
-        return pd.DataFrame()
-    try:
-        dates = [
-            (datetime.now(LOCAL_TZ).date() - timedelta(days=i)).strftime("%Y-%m-%d")
-            for i in range(days)
-        ]
-        all_rows = []
-        for d in dates:
-            docs = (
-                _db.collection("snow_reports")
-                .where(filter=firestore.FieldFilter("date", "==", d))
-                .stream()
-            )
-            for doc in docs:
-                r = doc.to_dict()
-                r["query_date"] = d
-                all_rows.append(r)
-        df = pd.DataFrame(all_rows)
-        if df.empty:
-            return df
-        df["query_date"] = pd.to_datetime(df["query_date"], errors="coerce").dt.tz_localize(LOCAL_TZ)
-        df["last_updated_dt"] = pd.to_datetime(df["last_updated"], errors="coerce")
-        df["last_updated_dt"] = df["last_updated_dt"].apply(
-            lambda x: x.replace(tzinfo=LOCAL_TZ)
-            if x is not None and pd.notna(x) and x.tzinfo is None
-            else (x.astimezone(LOCAL_TZ) if pd.notna(x) and x.tzinfo is not None else x)
-        )
-        return df
-    except Exception as e:
-        st.error(f"Error loading history: {e}")
-        return pd.DataFrame()
-
-
-def prepare_chart_data(df_hist, df_current):
-    if df_hist.empty or df_current.empty:
-        return pd.DataFrame()
-    resorts = df_current["resort"].unique().tolist()
-    rows = []
-    today = datetime.now(LOCAL_TZ).date()
-    days = [(today - timedelta(days=i)) for i in range(4, -1, -1)]
-
-    for r in resorts:
-        disp_row = df_current.loc[df_current["resort"] == r, "display_name"]
-        if disp_row.empty:
-            continue
-        disp = disp_row.iloc[0]
-        
-        subset = df_hist[df_hist["resort"] == r]
-        for d in days:
-            qd = pd.Timestamp(d, tz=LOCAL_TZ)
-            row = subset[subset["query_date"].dt.date == d]
-            snow = 0.0
-            if not row.empty:
-                raw = float(row.iloc[0].get("snow_24h_summit", 0) or 0)
-                lu = row.iloc[0]["last_updated_dt"]
-                if raw > 0 and is_fresh_for_day(qd, lu):
-                    snow = raw
-            rows.append({"display_name": disp, "date": d, "snow": snow})
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return pd.DataFrame()
-        
-    totals = df.groupby("display_name", as_index=False)["snow"].sum().rename(columns={"snow": "total_snow"})
-    return df.merge(totals, on="display_name")
-
-# ──────────────────────────────────────────────────────────────
-# CSS
+# CSS STYLING
 # ──────────────────────────────────────────────────────────────
 def load_css():
     st.markdown("""
         <style>
             @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
             
-            * {
-                font-family: 'Inter', sans-serif !important;
+            html, body, [class*="css"] {
+                font-family: 'Inter', sans-serif;
             }
             
-            .main {
+            /* FORCE DARK BACKGROUND */
+            .stApp {
                 background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
                 background-attachment: fixed;
+                color: #e2e8f0;
             }
             
             .block-container {
@@ -356,346 +77,516 @@ def load_css():
                 max-width: 1800px;
             }
             
-            /* Hero Section */
+            h1, h2, h3, p, li, span, label, div {
+                color: #e2e8f0;
+            }
+
+            /* Hero */
             .hero {
                 background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 50%, #ec4899 100%);
-                padding: 2.5rem;
-                border-radius: 24px;
-                margin-bottom: 2rem;
-                box-shadow: 0 20px 60px rgba(59, 130, 246, 0.4);
-                text-align: center;
-                position: relative;
-                overflow: hidden;
+                padding: 2.5rem; border-radius: 24px; margin-bottom: 2rem;
+                box-shadow: 0 20px 60px rgba(59, 130, 246, 0.4); text-align: center;
             }
+            .hero-title { font-size: 3rem !important; font-weight: 900; color: white !important; margin: 0; }
             
-            .hero::before {
-                content: '';
-                position: absolute;
-                top: 0;
-                left: 0;
-                right: 0;
-                bottom: 0;
-                background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.05'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
-                opacity: 0.3;
-            }
-            
-            .hero-title {
-                font-size: 3.5rem !important;
-                font-weight: 900 !important;
-                color: white !important;
-                margin: 0 !important;
-                text-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-                position: relative;
-                z-index: 1;
-            }
-            
-            .hero-subtitle {
-                color: rgba(255, 255, 255, 0.95);
-                font-size: 1.2rem;
-                margin: 0.5rem 0 0 0;
-                position: relative;
-                z-index: 1;
-            }
-            
-            /* Metric Cards - Enhanced */
-            [data-testid="stMetric"] {
-                background: linear-gradient(135deg, rgba(30, 41, 59, 0.8) 0%, rgba(51, 65, 85, 0.6) 100%) !important;
-                padding: 1.75rem !important;
-                border-radius: 20px !important;
-                border: 1px solid rgba(59, 130, 246, 0.2) !important;
-                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3) !important;
-                transition: all 0.3s ease !important;
-                backdrop-filter: blur(20px) !important;
-            }
-            
-            /* --- CSS FIX: Removed the ::before gradient line --- */
-            
-            [data-testid="stMetric"]:hover {
-                transform: translateY(-8px);
-                border-color: rgba(59, 130, 246, 0.4) !important;
-                box-shadow: 0 16px 48px rgba(59, 130, 246, 0.3) !important;
-            }
-            
-            [data-testid="stMetricLabel"] {
-                font-size: 0.8rem !important;
-                font-weight: 700 !important;
-                text-transform: uppercase !important;
-                letter-spacing: 0.1em !important;
-                color: #94a3b8 !important;
-                margin-bottom: 0.75rem !important;
-            }
-            
-            /* --- CSS FIX: Removed gradient from metric value --- */
-            [data-testid="stMetricValue"] {
-                font-size: 2.75rem !important;
-                font-weight: 900 !important;
-                color: #ffffff !important; /* Solid white text */
-                line-height: 1.2 !important;
-            }
-            
-            [data-testid="stMetricDelta"] {
-                font-size: 0.9rem !important;
-                color: #cbd5e1 !important;
-                font-weight: 600 !important;
-                margin-top: 0.5rem !important;
-            }
-            
-            [data-testid="stMetricDelta"] svg {
-                display: none !important;
-            }
-            
-            /* Section Headers - More Visual */
-            .section-header {
-                font-size: 1.75rem;
-                font-weight: 800;
-                color: white;
-                margin: 2.5rem 0 1.5rem 0;
-                padding: 1rem 1.5rem;
-                background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(139, 92, 246, 0.1));
-                border-left: 4px solid #3b82f6;
-                border-radius: 12px;
-                box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
-            }
-            
-            /* Powder Alert Banner - More Dramatic */
+            /* Powder Alert */
             .powder-alert {
                 background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
-                padding: 2rem;
-                border-radius: 20px;
-                margin-bottom: 2rem;
-                box-shadow: 0 12px 40px rgba(220, 38, 38, 0.5);
+                padding: 1.5rem; border-radius: 20px; margin-bottom: 2rem;
                 border: 2px solid rgba(255, 255, 255, 0.2);
                 animation: pulse-glow 2s ease-in-out infinite;
             }
-            
             @keyframes pulse-glow {
-                0%, 100% { 
-                    box-shadow: 0 12px 40px rgba(220, 38, 38, 0.5);
-                    transform: scale(1);
-                }
-                50% { 
-                    box-shadow: 0 12px 60px rgba(220, 38, 38, 0.7);
-                    transform: scale(1.01);
-                }
-            }
-            
-            .powder-alert-title {
-                font-size: 2rem;
-                font-weight: 900;
-                color: white;
-                margin: 0 0 0.75rem 0;
-                text-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
-            }
-            
-            .powder-alert-text {
-                color: rgba(255, 255, 255, 0.95);
-                font-size: 1.1rem;
-                margin-bottom: 1rem;
-                font-weight: 500;
-            }
-            
-            /* Leaderboard Table - Enhanced */
-            [data-testid="stDataFrame"] {
-                background: linear-gradient(135deg, rgba(15, 23, 42, 0.8), rgba(30, 41, 59, 0.6)) !important;
-                border-radius: 20px !important;
-                border: 1px solid rgba(59, 130, 246, 0.2) !important;
-                box-shadow: 0 12px 48px rgba(0, 0, 0, 0.4) !important;
-                overflow: hidden !important;
-            }
-            
-            [data-testid="stDataFrame"] * {
-                color: white !important;
-            }
-            
-            [data-testid="stDataFrame"] th {
-                background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(139, 92, 246, 0.15)) !important;
-                font-weight: 800 !important;
-                text-transform: uppercase !important;
-                letter-spacing: 0.08em !important;
-                font-size: 0.8rem !important;
-                padding: 1.25rem !important;
-                border-bottom: 2px solid rgba(59, 130, 246, 0.3) !important;
-            }
-            
-            [data-testid="stDataFrame"] td {
-                padding: 1rem !important;
-                border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
-                font-weight: 500 !important;
-            }
-            
-            [data-testid="stDataFrame"] tbody tr:hover {
-                background: linear-gradient(90deg, rgba(59, 130, 246, 0.15), rgba(139, 92, 246, 0.1)) !important;
-                transform: translateX(4px);
-                transition: all 0.2s ease;
-            }
-            
-            /* Resort Detail Cards - More Depth */
-            [data-testid="stVerticalBlockBorderWrapper"] {
-                background: linear-gradient(135deg, rgba(30, 41, 59, 0.7), rgba(51, 65, 85, 0.5)) !important;
-                border-radius: 20px !important;
-                border: 1px solid rgba(59, 130, 246, 0.15) !important;
-                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3) !important;
-                backdrop-filter: blur(10px) !important;
-            }
-            
-            /* Readability inside detail cards */
-            [data-testid="stVerticalBlockBorderWrapper"] p,
-            [data-testid="stVerticalBlockBorderWrapper"] span,
-            [data-testid="stVerticalBlockBorderWrapper"] .st-emotion-cache-1j9prn,
-            [data-testid="stVerticalBlockBorderWrapper"] .st-emotion-cache-10trblm,
-            [data-testid="stVerticalBlockBorderWrapper"] div {
-                color: #e2e8f0 !important; /* light gray for text */
-            }
-            
-            [data-testid="stVerticalBlockBorderWrapper"] h2 {
-                color: white !important;
-            }
-            [data-testid="stVerticalBlockBorderWrapper"] h3 {
-                color: #60a5fa !important; /* blue for subheaders */
-            }
-            [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stMetricValue"] {
-                color: #ffffff !important; /* bright white for numbers */
-            }
-            [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stMetricLabel"] {
-                color: #94a3b8 !important; /* muted gray for labels */
-            }
-            [data-testid="stVerticalBlockBorderWrapper"] .stAlert * {
-                color: #e2e8f0 !important;
+                0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.7); }
+                70% { box-shadow: 0 0 0 10px rgba(220, 38, 38, 0); }
+                100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0); }
             }
 
-            /* Progress bars - Gradient */
-            [data-testid="stProgressBar"] > div {
-                background: rgba(51, 65, 85, 0.8) !important;
-                border-radius: 10px !important;
-                height: 14px !important;
-                box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.3);
+            /* Section Header */
+            .section-header {
+                font-size: 1.5rem; font-weight: 800; color: white; margin: 2rem 0 1rem 0;
+                padding: 0.75rem 1.25rem; background: rgba(59, 130, 246, 0.15);
+                border-left: 4px solid #3b82f6; border-radius: 8px;
             }
             
-            [data-testid="stProgressBar"] > div > div {
-                background: linear-gradient(90deg, #3b82f6 0%, #8b5cf6 50%, #ec4899 100%) !important;
-                border-radius: 10px !important;
-                height: 14px !important;
-                box-shadow: 0 2px 12px rgba(59, 130, 246, 0.5);
+            /* TABLE STYLING */
+            .styled-table {
+                width: 100%; border-collapse: collapse; margin: 20px 0;
+                font-size: 0.85rem; font-family: 'Inter', sans-serif;
+                border-radius: 12px 12px 0 0; overflow: hidden;
             }
-            
-            /* Select box - Enhanced */
-            [data-baseweb="select"] {
-                background: linear-gradient(135deg, rgba(30, 41, 59, 0.9), rgba(51, 65, 85, 0.7)) !important;
-                border: 2px solid rgba(59, 130, 246, 0.3) !important;
-                border-radius: 16px !important;
-                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2) !important;
+            .styled-table th, .styled-table td {
+                padding: 12px 15px; text-align: center;
             }
-            
-            [data-baseweb="select"]:hover {
-                border-color: rgba(59, 130, 246, 0.5) !important;
+            .styled-table td:first-child, .styled-table th:first-child {
+                text-align: left;
             }
-            [data-baseweb="select"] * {
-                color: #e2e8f0 !important;
+            .styled-table thead tr { background-color: #3b82f6; color: #ffffff; }
+            .styled-table tbody tr {
+                border-bottom: 1px solid #334155; background-color: rgba(30, 41, 59, 0.6); color: #f1f5f9;
             }
-            
-            /* Info boxes - Gradient */
-            [data-testid="stAlert"] {
-                background: linear-gradient(135deg, rgba(30, 41, 59, 0.8), rgba(51, 65, 85, 0.6)) !important;
-                border-radius: 16px !important;
-                border-left: 4px solid #3b82f6 !important;
-                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2) !important;
+            .styled-table tbody tr:nth-of-type(even) { background-color: rgba(15, 23, 42, 0.6); }
+
+            /* Data Grid Styling */
+            .data-grid {
+                display: grid;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 10px;
+                margin-bottom: 15px;
             }
-            
-            /* Badges - More Vibrant */
-            .badge {
-                display: inline-block;
-                padding: 0.5rem 1.25rem;
-                border-radius: 16px;
-                font-weight: 800;
-                font-size: 0.8rem;
-                text-transform: uppercase;
-                letter-spacing: 0.08em;
-                box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+            .data-item {
+                background: rgba(255, 255, 255, 0.05);
+                padding: 12px;
+                border-radius: 8px;
+                border: 1px solid rgba(255, 255, 255, 0.1);
             }
-            
-            .badge-powder {
-                background: linear-gradient(135deg, #dc2626, #991b1b);
-                color: white;
-                animation: pulse-badge 2s ease-in-out infinite;
-            }
-            
-            @keyframes pulse-badge {
-                0%, 100% { transform: scale(1); }
-                50% { transform: scale(1.05); }
-            }
-            
-            /* Text input - Enhanced */
-            [data-testid="stTextInput"] input {
-                background: rgba(30, 41, 59, 0.8) !important;
-                border: 2px solid rgba(59, 130, 246, 0.3) !important;
-                border-radius: 12px !important;
-                color: white !important;
-                font-weight: 500 !important;
-                padding: 0.75rem !important;
-            }
-            
-            [data-testid="stTextInput"] input:focus {
-                border-color: #3b82f6 !important;
-                box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2) !important;
-            }
-            
-            /* Divider - Gradient */
-            hr {
-                margin: 3rem 0 !important;
-                border: none !important;
-                height: 2px !important;
-                background: linear-gradient(90deg, transparent, rgba(59, 130, 246, 0.5), rgba(139, 92, 246, 0.5), transparent) !important;
-            }
-            
-            /* Footer - Enhanced */
-            .footer {
-                text-align: center;
+            .data-label {
+                font-size: 0.7rem;
                 color: #94a3b8;
-                padding: 2.5rem 0;
-                font-size: 0.95rem;
-                margin-top: 3rem;
-                border-top: 2px solid rgba(59, 130, 246, 0.2);
-                background: linear-gradient(180deg, transparent, rgba(30, 41, 59, 0.3));
-                border-radius: 16px;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                margin-bottom: 4px;
+            }
+            .data-value {
+                font-size: 1.1rem;
+                font-weight: 700;
+                color: #ffffff;
+            }
+            .data-sub {
+                font-size: 0.8rem;
+                color: #cbd5e1;
+                margin-top: 2px;
+            }
+            .full-width {
+                grid-column: span 2;
+            }
+
+            /* Metric Cards */
+            [data-testid="stMetric"] {
+                background-color: rgba(30, 41, 59, 0.6) !important;
+                border-radius: 12px !important;
+                padding: 1rem !important;
+                border: 1px solid rgba(255,255,255,0.1) !important;
+            }
+            [data-testid="stMetricLabel"] { color: #94a3b8 !important; }
+            [data-testid="stMetricValue"] { color: white !important; }
+            
+            /* LARGE TABS */
+            .stTabs [data-baseweb="tab-list"] button {
+                font-size: 1.3rem !important;
+                font-weight: 900 !important;
+                padding-top: 10px !important;
+                padding-bottom: 10px !important;
             }
         </style>
     """, unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────────
-# PAGE RENDER
+# CHART HELPER
+# ──────────────────────────────────────────────────────────────
+def get_snotel_iframe_html(triplet: str, station_name: str, show_years: str | None) -> str:
+    try:
+        state = triplet.split(":")[1].strip().upper()
+    except Exception:
+        state = ""
+    name_enc = urlparse.quote(station_name)
+    base = f"https://nwcc-apps.sc.egov.usda.gov/awdb/site-plots/POR/WTEQ/{state}/{name_enc}.html"
+    params = ["hideAnno=true", "hideControls=true", "activeOnly=true"]
+    if show_years:
+        params.append(f"showYears={show_years.strip()}")
+    url = base + "?" + "&".join(params)
+    
+    SNOTEL_CROP_TOP = 310
+    SNOTEL_VIEW_HEIGHT = 440 
+    SNOTEL_CROP_BOTTOM = 480
+    inner_height = SNOTEL_VIEW_HEIGHT + SNOTEL_CROP_TOP + SNOTEL_CROP_BOTTOM
+    
+    return f"""
+    <div style="width:100%; height:{SNOTEL_VIEW_HEIGHT}px; overflow:hidden; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,.15); margin-top: 16px; background: white;">
+      <iframe src="{url}" style="width:100%; height:{inner_height}px; border:0; transform: translateY(-{SNOTEL_CROP_TOP}px);" loading="lazy"></iframe>
+    </div>
+    """
+
+# ──────────────────────────────────────────────────────────────
+# MODAL (DIALOG) LOGIC
+# ──────────────────────────────────────────────────────────────
+@st.dialog("Resort Details", width="large")
+def show_resort_modal(row):
+    # HEADER FIX: Zero spacing
+    st.markdown(f"""
+        <div style="margin-bottom: 40px;">
+            <div style="font-size: 2.2rem; font-weight: 900; color: white; line-height: 1.0;">{row['display_name']}</div>
+            <div style="font-size: 0.9rem; color: #94a3b8; margin-top: 4px;">Last Updated: {row['last_updated']}</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    nws = row.get('nws_forecast', {})
+    snotel = row.get('snotel_data', {})
+
+    tab1, tab2, tab3 = st.tabs(["🎿 CONDITIONS", "🏔️ SNOTEL", "🌦️ FORECAST"])
+
+    with tab1:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Base Depth", f"{row['base_depth']:.0f}\"")
+        c2.metric("Summit", f"{row['summit_depth']:.0f}\"")
+        c3.metric("Overnight", f"{row['snow_overnight']:.0f}\"")
+        
+        f_wind = f"{row.get('wind_speed', 0):.0f} mph" if pd.notna(row.get('wind_speed')) else "N/A"
+        c4.metric("Wind", f_wind)
+        
+        st.divider()
+        
+        details_to_show = []
+        def is_valid(val):
+            if val is None: return False
+            s = str(val).strip().lower()
+            return s not in ["", "n/a", "none", "0", "null"]
+
+        if is_valid(row.get('lifts_open')): details_to_show.append(f"**Lifts Open:** {row['lifts_open']}")
+        if is_valid(row.get('runs_open')): details_to_show.append(f"**Runs Open:** {row['runs_open']}")
+        if is_valid(row.get('conditions_surface')): details_to_show.append(f"**Surface:** {row['conditions_surface']}")
+            
+        if details_to_show:
+            for det in details_to_show: st.markdown(det)
+        else:
+            st.caption("No operational details reported.")
+        
+        if row.get('comments'):
+            st.info(f"📝 {row['comments']}")
+
+    with tab2:
+        s_name = snotel.get('station_name', 'Station N/A')
+        if "snotel" not in s_name.lower(): s_name += " SNOTEL"
+        
+        elev = snotel.get('elevation', '')
+        if elev: s_name += f" ({elev} ft)"
+        
+        val_obs_raw = snotel.get('latest_observation', 'N/A')
+        val_obs_display = val_obs_raw
+        try:
+            if len(val_obs_raw) > 10:
+                dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d %H:%M")
+                val_obs_display = dt_obs.strftime("%b %d, %I:%M %p")
+            else:
+                dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d")
+                val_obs_display = dt_obs.strftime("%b %d, %Y")
+        except: pass
+            
+        st.markdown(f"""
+        <div style="margin-bottom: 15px;">
+            <div style="font-size: 1.5rem; font-weight: 700; color: white; line-height: 1.0;">{s_name}</div>
+            <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 4px;">Observed: {val_obs_display}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if snotel.get('unavailable') is True:
+            st.error(f"Data Unavailable: {snotel.get('error_reason', 'Unknown error')}")
+        
+        val_snow = snotel.get('snow_depth', 'N/A')
+        if isinstance(val_snow, (int, float)): val_snow = f"{val_snow}\""
+            
+        val_swe = snotel.get('swe', 'N/A')
+        if isinstance(val_swe, (int, float)): val_swe = f"{val_swe}\""
+
+        val_density = snotel.get('density', 'N/A')
+        val_qual = snotel.get('snow_category', 'N/A')
+        
+        # FIX: Check if % is valid and remove % symbol if N/A
+        pct_raw = snotel.get('percent_of_median', 'N/A')
+        if str(pct_raw) == "N/A" or pct_raw is None:
+            val_pct = "N/A"
+        else:
+            val_pct = f"{pct_raw}%"
+        
+        if val_density == "N/A":
+             density_display = "N/A"
+        else:
+             density_display = f"{val_density}<div class='data-sub'>{val_qual}</div>"
+
+        st.markdown(f"""
+        <div class="data-grid">
+            <div class="data-item">
+                <div class="data-label">24h Snow</div>
+                <div class="data-value">{val_snow}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">24h SWE</div>
+                <div class="data-value">{val_swe}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">Density</div>
+                <div class="data-value">{density_display}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">Median %</div>
+                <div class="data-value">{val_pct}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        triplet = snotel.get("triplet")
+        station_name = snotel.get("station_name")
+        
+        if triplet and station_name:
+            # FIX: Input strictly on Left
+            col_input, col_label = st.columns([1, 2])
+            with col_input:
+                compare_year = st.text_input("Compare Year:", placeholder="e.g. 2011", key=f"year_{row['display_name']}")
+            with col_label:
+                st.write("")
+
+            html = get_snotel_iframe_html(triplet, station_name, compare_year)
+            components.html(html, height=440, scrolling=False)
+        else:
+            st.info("Chart unavailable (Missing triplet ID)")
+
+    with tab3:
+        st.markdown("### 48-Hour Weather Outlook")
+        
+        f_precip = f"{nws.get('total_precip_inches', 'N/A')}\""
+        f_prob = f"{nws.get('precip_probability_max', 'N/A')}%"
+        f_snow = f"{nws.get('total_snow_inches', 'N/A')}\""
+        f_level = f"{nws.get('snow_level_feet', 'N/A')} ft"
+        f_high = f"{nws.get('temp_high_f', 'N/A')}°F"
+        f_low = f"{nws.get('temp_low_f', 'N/A')}°F"
+        f_cond = nws.get('conditions', 'N/A')
+        
+        st.markdown(f"""
+        <div class="data-grid">
+            <div class="data-item">
+                <div class="data-label">Temperatures</div>
+                <div class="data-value">{f_high} / {f_low}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">Precip Chance</div>
+                <div class="data-value">{f_prob}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">Snow Forecast</div>
+                <div class="data-value">{f_snow}</div>
+                <div class="data-sub">Level: {f_level}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">Total Precip</div>
+                <div class="data-value">{f_precip}</div>
+            </div>
+            <div class="data-item full-width">
+                <div class="data-label">Short Forecast</div>
+                <div class="data-value" style="font-size: 1rem;">{f_cond}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────────────────────
+# DATA HELPERS
+# ──────────────────────────────────────────────────────────────
+@st.cache_resource
+def initialize_firebase():
+    try:
+        cred_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+        if cred_path:
+            if not os.path.exists(cred_path): return None
+            cred = credentials.Certificate(cred_path)
+        else:
+            creds = st.secrets["firebase_service_account"]
+            if isinstance(creds, str): creds_dict = ast.literal_eval(creds)
+            else: creds_dict = dict(creds)
+            cred = credentials.Certificate(creds_dict)
+        try: firebase_admin.get_app()
+        except ValueError: firebase_admin.initialize_app(cred)
+        return firestore.client()
+    except Exception: return None
+
+def get_display_name(resort_name: str) -> str:
+    name_map = {
+        "LookoutPass": "Lookout Pass", "BigMountain": "Big Mountain", "LostTrail": "Lost Trail",
+        "TetonPass": "Teton Pass", "Blacktail": "Blacktail", "Snowbowl": "Snowbowl",
+        "Discovery": "Discovery", "Showdown": "Showdown", "BridgerBowl": "Bridger Bowl",
+        "BigSky": "Big Sky", "RedLodge": "Red Lodge Mountain", "RedLodgeMountain": "Red Lodge Mountain",
+        "GreatDivide": "Great Divide", "BearPaw": "Bear Paw", "SilverMountain": "Silver Mountain",
+        "Schweitzer": "Schweitzer", "TurnerMountain": "Turner Mountain"
+    }
+    return name_map.get(resort_name, resort_name)
+
+@st.cache_data(ttl=600)
+def load_latest_data(_db):
+    master_rows = [{"display_name": k, "lat": v["lat"], "lon": v["lon"]} for k, v in RESORTS_DATA.items()]
+    df_master = pd.DataFrame(master_rows)
+
+    if _db is None:
+        for col in ["snow_24h_summit", "base_depth"]: df_master[col] = 0
+        return df_master
+
+    try:
+        latest_q = _db.collection("snow_reports").order_by("date", direction=firestore.Query.DESCENDING).limit(1).stream()
+        latest = [d.to_dict() for d in latest_q]
+        df_final = df_master.copy()
+
+        if latest:
+            latest_date = latest[0]["date"]
+            docs = _db.collection("snow_reports").where(filter=firestore.FieldFilter("date", "==", latest_date)).stream()
+            rows = [d.to_dict() for d in docs]
+            if rows:
+                df_fb = pd.DataFrame(rows)
+                if "resort" in df_fb.columns:
+                    df_fb["display_name"] = df_fb["resort"].apply(get_display_name)
+                    df_final = pd.merge(df_master, df_fb, on="display_name", how="left")
+        
+        num_cols = ["snow_24h_summit", "base_depth", "summit_depth", "snow_overnight", "temp_base", "temp_summit", "wind_speed"]
+        for c in num_cols:
+            if c not in df_final.columns: df_final[c] = 0
+            df_final[c] = pd.to_numeric(df_final[c], errors="coerce").fillna(0)
+            
+        for c in ["nws_forecast", "snotel_data"]:
+            if c not in df_final.columns: df_final[c] = [{}] * len(df_final)
+            df_final[c] = df_final[c].apply(lambda x: x if isinstance(x, dict) else {})
+
+        str_cols = ["lifts_open", "runs_open", "conditions_surface", "last_updated", "comments"]
+        for c in str_cols:
+            if c not in df_final.columns: df_final[c] = "N/A"
+            df_final[c] = df_final[c].fillna("N/A").astype(str)
+
+        df_final["last_updated_dt"] = pd.to_datetime(df_final["last_updated"], errors="coerce").apply(
+            lambda x: x.replace(tzinfo=LOCAL_TZ) if pd.notna(x) and x.tzinfo is None else x
+        )
+        today = datetime.now(LOCAL_TZ).date()
+        season_year = today.year if today.month >= 10 else today.year - 1
+        season_start = pd.Timestamp(season_year, 10, 1, tz=LOCAL_TZ)
+        
+        now_dt = datetime.now(LOCAL_TZ)
+        df_final["is_fresh"] = (now_dt - df_final['last_updated_dt']).dt.total_seconds() / 3600 < FRESHNESS_TOLERANCE_HOURS
+        df_final["is_season"] = df_final['last_updated_dt'] >= season_start
+        
+        mask_stale = ~df_final["is_season"] | ~df_final["is_fresh"]
+        df_final.loc[mask_stale, ["snow_24h_summit", "snow_overnight"]] = 0
+        df_final["is_powder"] = (df_final["snow_24h_summit"] >= 6)
+        
+        return df_final.sort_values(["snow_24h_summit", "display_name"], ascending=[False, True]).reset_index(drop=True)
+
+    except Exception as e:
+        st.error(f"Data error: {e}")
+        return df_master
+
+@st.cache_data(ttl=600)
+def load_historical_data(_db, days=5):
+    if _db is None: return pd.DataFrame()
+    try:
+        dates = [(datetime.now(LOCAL_TZ).date() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+        all_rows = []
+        for d in dates:
+            docs = _db.collection("snow_reports").where(filter=firestore.FieldFilter("date", "==", d)).stream()
+            for doc in docs:
+                r = doc.to_dict()
+                r["query_date"] = d
+                all_rows.append(r)
+        df = pd.DataFrame(all_rows)
+        if df.empty: return df
+        
+        df["query_date"] = pd.to_datetime(df["query_date"], errors="coerce").dt.tz_localize(LOCAL_TZ)
+        df["last_updated_dt"] = pd.to_datetime(df["last_updated"], errors="coerce").apply(
+            lambda x: x.replace(tzinfo=LOCAL_TZ) if pd.notna(x) and x.tzinfo is None else 
+            (x.astimezone(LOCAL_TZ) if pd.notna(x) and x.tzinfo is not None else x)
+        )
+        return df
+    except Exception: return pd.DataFrame()
+
+def prepare_chart_data(df_hist, df_current):
+    if df_hist.empty or df_current.empty: return pd.DataFrame()
+    resorts = df_current["display_name"].unique().tolist()
+    rows = []
+    today = datetime.now(LOCAL_TZ).date()
+    days = [(today - timedelta(days=i)) for i in range(4, -1, -1)]
+
+    df_hist["temp_disp"] = df_hist["resort"].apply(get_display_name)
+
+    for r_display in resorts:
+        subset = df_hist[df_hist["temp_disp"] == r_display]
+        for d in days:
+            qd = pd.Timestamp(d, tz=LOCAL_TZ)
+            row = subset[subset["query_date"].dt.date == d]
+            snow = 0.0
+            if not row.empty:
+                raw = float(row.iloc[0].get("snow_24h_summit", 0) or 0)
+                mid = datetime(qd.year, qd.month, qd.day, 12, tzinfo=LOCAL_TZ)
+                lu = row.iloc[0]["last_updated_dt"]
+                if raw > 0 and pd.notna(lu) and abs((lu - mid).total_seconds()) / 3600 <= FRESHNESS_TOLERANCE_HOURS:
+                    snow = raw
+            rows.append({"display_name": r_display, "date": d, "snow": snow})
+    
+    df = pd.DataFrame(rows)
+    if df.empty: return pd.DataFrame()
+    totals = df.groupby("display_name", as_index=False)["snow"].sum().rename(columns={"snow": "total_snow"})
+    return df.merge(totals, on="display_name")
+
+# ──────────────────────────────────────────────────────────────
+# MAP FUNCTION
+# ──────────────────────────────────────────────────────────────
+def create_map(df):
+    m = folium.Map(
+        location=[46.8, -113.5], zoom_start=7,
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        attr='Tiles &copy; Esri'
+    )
+    Fullscreen().add_to(m)
+
+    for _, row in df.iterrows():
+        if pd.isna(row['lat']) or pd.isna(row['lon']): continue
+        
+        snow_val = float(row['snow_24h_summit'])
+        has_data = row['last_updated'] != "N/A"
+        
+        if not has_data:
+            display_str = "n/a"
+            bg_color = "rgba(100, 116, 139, 0.8)"
+            text_color = "#e2e8f0"
+            border = "2px solid #475569"
+            is_powder = False
+        else:
+            display_str = f"{int(snow_val)}\"" if snow_val.is_integer() else f"{snow_val:.1f}\""
+            if snow_val == 0: display_str = "0\""
+            is_powder = snow_val >= 6
+            bg_color = "rgba(220, 38, 38, 0.9)" if is_powder else "rgba(255, 255, 255, 0.95)"
+            text_color = "white" if is_powder else "#1e293b"
+            border = "2px solid #b91c1c" if is_powder else "2px solid #3b82f6"
+        
+        html_icon = f"""
+        <div style="position: absolute; transform: translate(-50%, -50%); display: flex; flex-direction: column; align-items: center; justify-content: center; width: 120px;">
+            <div style="background: {bg_color}; color: {text_color}; border: {border}; border-radius: 50%; width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; font-family: sans-serif; font-weight: 900; font-size: 15px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); margin-bottom: 4px;">
+                {display_str}
+            </div>
+            <div style="background: rgba(255,255,255,0.9); padding: 2px 6px; border-radius: 8px; font-family: sans-serif; font-size: 11px; font-weight: 700; color: black; box-shadow: 0 2px 4px rgba(0,0,0,0.2); white-space: nowrap;">
+                {row['display_name']}
+            </div>
+        </div>
+        """
+        # Tooltip is the ID we use to trigger the Modal
+        folium.Marker(
+            location=[row['lat'], row['lon']],
+            icon=folium.DivIcon(html=html_icon),
+            tooltip=row['display_name']
+        ).add_to(m)
+    return m
+
+# ──────────────────────────────────────────────────────────────
+# MAIN APP
 # ──────────────────────────────────────────────────────────────
 load_css()
 db = initialize_firebase()
-if not db:
-    st.stop()
-
 df = load_latest_data(db)
-if df.empty:
-    st.markdown("""
-        <div class='hero'>
-            <h1 class='hero-title'>❄️ Northern Rockies Snow Report</h1>
-            <p class='hero-subtitle'>☁️ No data available yet. Check back soon!</p>
-        </div>
-    """, unsafe_allow_html=True)
-    st.stop()
-
 df_hist = load_historical_data(db, days=5)
 
-# --- NEW, CORRECTED HERO SECTION (Localizes Time) ---
-now_utc = datetime.now(ZoneInfo("UTC")) # Get time as UTC
-now_local = now_utc.astimezone(LOCAL_TZ) # Convert to MST/MDT
+now_local = datetime.now(LOCAL_TZ)
 st.markdown(f"""
     <div class='hero'>
         <h1 class='hero-title'>❄️ Northern Rockies Snow Report</h1>
-        <p class='hero-subtitle'>Real-time conditions • Live forecasts • Backcountry data</p>
-        <p class='hero-subtitle' style='font-size: 0.9rem; margin-top: 0.5rem; opacity: 0.9;'>
-            {now_local.strftime('%A, %B %d, %Y at %I:%M %p %Z')} 
-        </p>
+        <p class='hero-subtitle'>{now_local.strftime('%A, %B %d, %Y at %I:%M %p %Z')}</p>
     </div>
 """, unsafe_allow_html=True)
-# --- END NEW ---
 
-# --- NEW Powder Alert ---
+# 1. Powder Alert
 powder_resorts = df[df['is_powder'] == True]
 powder_count = len(powder_resorts)
 if powder_count > 0:
@@ -703,291 +594,95 @@ if powder_count > 0:
         <div class='powder-alert'>
             <div class='powder-alert-title'>🔥 POWDER ALERT!</div>
             <div class='powder-alert-text'>
-                <strong>{powder_count}</strong> {'resort is' if powder_count == 1 else 'resorts are'} reporting 6" or more of fresh snow in the last 24 hours
+                <strong>{powder_count}</strong> {'resort is' if powder_count == 1 else 'resorts are'} reporting 6" or more fresh snow!
             </div>
         </div>
     """, unsafe_allow_html=True)
-    
-    cols = st.columns(min(powder_count, 4))
-    for i, (idx, resort) in enumerate(powder_resorts.head(4).iterrows()):
-        with cols[i]:
-            st.metric(
-                label=resort['display_name'],
-                value=f"{resort['snow_24h_summit']:.0f}\"",
-                delta=resort['state']
-            )
-    
-    if powder_count > 4:
-        st.caption(f"...plus {powder_count - 4} more resorts! ⬇️ Check the leaderboard")
-    
-    st.markdown("<br>", unsafe_allow_html=True)
+    cols_per_row = 4
+    for i in range(0, powder_count, cols_per_row):
+        cols = st.columns(cols_per_row)
+        batch = powder_resorts.iloc[i:i+cols_per_row]
+        for idx, (_, resort) in enumerate(batch.iterrows()):
+            with cols[idx]:
+                st.metric(label=resort['display_name'], value=f"{resort['snow_24h_summit']:.0f}\"", delta="POWDER")
 
-# --- KEPT Leaderboard (with new header) ---
+# 2. Leaderboard
 st.markdown("<div class='section-header'>📊 Today's Snow Leaderboard</div>", unsafe_allow_html=True)
-cols = {
-    "display_name": "Resort",
-    "snow_24h_summit": "24h Snow",
-    "base_depth": "Base Depth",
-    "summit_depth": "Summit Depth",
-    "lifts_open": "Lifts",
-    "runs_open": "Runs",
-    "conditions_surface": "Surface",
-    "last_updated": "Last Updated",
-}
-df_ld = df[[k for k in cols.keys() if k in df.columns]].rename(columns=cols)
+cols_map = {"display_name": "Resort", "snow_24h_summit": "24h Snow", "base_depth": "Base Depth", "summit_depth": "Summit Depth", "lifts_open": "Lifts", "runs_open": "Runs", "conditions_surface": "Surface", "last_updated": "Last Updated"}
+df_ld = df[df['last_updated'] != "N/A"][[k for k in cols_map.keys() if k in df.columns]].rename(columns=cols_map)
+for c in ["24h Snow", "Base Depth", "Summit Depth"]:
+    if c in df_ld.columns: df_ld[c] = df_ld[c].apply(lambda x: f'{x:.0f}"')
+st.markdown(df_ld.to_html(classes="styled-table", index=False, border=0), unsafe_allow_html=True)
 
-numeric_cols = ["24h Snow", "Base Depth", "Summit Depth"]
-for c in numeric_cols:
-    if c in df_ld.columns:
-        df_ld[c] = pd.to_numeric(df_ld[c], errors="coerce").fillna(0)
-
-for col in ["Lifts", "Runs", "Surface", "Last Updated"]:
-    if col in df_ld.columns:
-        df_ld[col] = df_ld[col].astype(str).fillna("N/A")
-
-# --- FIX: Replaced use_container_width with width='stretch' and removed height=400 ---
-st.dataframe(
-    df_ld.style.format({"24h Snow": '{:.0f}"', "Base Depth": '{:.0f}"', "Summit Depth": '{:.0f}"'}),
-    hide_index=True,
-    width='stretch'
-)
-
-# --- KEPT 5-day chart (with new header) ---
+# 3. Chart
 st.markdown("<div class='section-header'>📈 5-Day Snowfall Trends</div>", unsafe_allow_html=True)
 cdf = prepare_chart_data(df_hist, df)
-if cdf.empty or cdf["snow"].sum() == 0:
-    st.info("❄️ No 5-day snowfall data available.")
+if cdf.empty or cdf["snow"].sum() == 0: st.info("❄️ No 5-day snowfall data available.")
 else:
-    sorted_totals = cdf.groupby("display_name", as_index=False)["total_snow"].max().sort_values("total_snow", ascending=False)
-    sorted_resort_names = sorted_totals["display_name"].tolist()
-
-    today = datetime.now(LOCAL_TZ).date()
-    days_for_legend = [(today - timedelta(days=i)) for i in range(4, -1, -1)]
-    sorted_day_labels = [d.strftime("%a %m/%d") for d in days_for_legend]
-
-    x_axis = alt.Axis(
-        labelColor="white",
-        grid=True,
-        gridColor="rgba(148,163,184,0.1)",
-        titleColor="white",
-        tickMinStep=1,
-        tickCount=7,
-        format="d",
-    )
-
-    colors = ["#cbd5e1", "#38bdf8", "#a78bfa", "#14b8a6", "#1e40af"]
+    max_snow = cdf.groupby("display_name")["snow"].sum().max()
+    sorted_names = cdf.groupby("display_name")["total_snow"].max().sort_values(ascending=False).index.tolist()
+    days_order = [(datetime.now(LOCAL_TZ).date() - timedelta(days=i)).strftime("%a %m/%d") for i in range(4, -1, -1)]
     cdf["day_label"] = pd.to_datetime(cdf["date"]).dt.strftime("%a %m/%d")
-
-    bars = alt.Chart(cdf).mark_bar().encode(
-        y=alt.Y(
-            "display_name:N",
-            title=None,
-            axis=alt.Axis(labelColor="white", labelFontSize=14),
-            sort=sorted_resort_names
-        ),
-        x=alt.X(
-            "snow:Q",
-            stack="zero",
-            title="5-Day Snowfall (inches)",
-            axis=x_axis,
-        ),
-        color=alt.Color(
-            "day_label:N",
-            title="Day",
-            scale=alt.Scale(range=colors),
-            sort=sorted_day_labels,
-            legend=alt.Legend(
-                labelColor="white",
-                titleColor="white",
-                orient="top",
-                direction="horizontal",
-            ),
-        ),
-        tooltip=[
-            alt.Tooltip("display_name:N", title="Resort"),
-            alt.Tooltip("day_label:N", title="Day"),
-            alt.Tooltip("snow:Q", title="Snow", format=".1f"),
-        ],
+    
+    base = alt.Chart(cdf).encode(
+        y=alt.Y("display_name:N", sort=sorted_names, title=None, axis=alt.Axis(labelColor="white", labelFontSize=14)),
     )
-
-    segment_labels = (
-        alt.Chart(cdf)
-        .transform_window(
-            sort=[alt.SortField("date", order="ascending")],
-            frame=[None, 0],
-            groupby=["display_name"],
-            cumulative_sum="sum(snow)",
-        )
-        .transform_calculate(
-            snow_start="datum.cumulative_sum - datum.snow",
-            snow_midpoint="(datum.cumulative_sum + datum.snow_start) / 2"
-        )
-        .transform_filter("datum.snow >= 1")
-        .mark_text(align="center", baseline="middle", fontSize=12, fontWeight="bold", color="black")
-        .encode(
-            y=alt.Y("display_name:N", sort=sorted_resort_names),
-            x=alt.X("snow_midpoint:Q", axis=None),
-            text=alt.Text("snow:Q", format=".0f"),
-        )
+    
+    bars = base.mark_bar().encode(
+        x=alt.X("snow:Q", title="Snow (in)", axis=alt.Axis(labelColor="white", grid=True, tickMinStep=1, format='d'), scale=alt.Scale(domain=[0, max_snow * 1.2])),
+        color=alt.Color("day_label:N", sort=days_order, legend=alt.Legend(labelColor="white", titleColor="white", orient="top"), scale=alt.Scale(range=["#cbd5e1", "#38bdf8", "#a78bfa", "#14b8a6", "#1e40af"])),
+        tooltip=["display_name", "day_label", "snow"]
     )
-
+    
+    text = base.transform_stack(
+        stack='snow',
+        groupby=['display_name'],
+        sort=[alt.SortField('day_label', order='ascending')],
+        as_=['stack_start', 'stack_end']
+    ).transform_calculate(
+        midpoint="(datum.stack_start + datum.stack_end) / 2"
+    ).mark_text(color='black', fontWeight='bold').encode(
+        x=alt.X('midpoint:Q'),
+        text=alt.Text("snow:Q", format=".0f"),
+        order=alt.Order("day_label:N", sort="ascending"),
+        opacity=alt.condition(alt.datum.snow > 0, alt.value(1), alt.value(0))
+    )
+    
     totals = cdf.groupby("display_name", as_index=False)["total_snow"].max()
-    totals_chart = alt.Chart(totals).transform_calculate(
-        total_label = "datum.total_snow > 0 ? format(datum.total_snow, '.0f') + ' Total' : ''"
-    ).mark_text(
-        align="left", baseline="middle", dx=6, color="white", fontWeight="bold", fontSize=14
-    ).encode(
-        y=alt.Y("display_name:N", sort=sorted_resort_names),
-        x=alt.X("total_snow:Q", axis=None),
-        text=alt.Text("total_label:N")
+    total_text = alt.Chart(totals).mark_text(align='left', dx=5, color='white', fontWeight='bold').encode(
+        y=alt.Y("display_name:N", sort=sorted_names),
+        x=alt.X("total_snow:Q"),
+        text=alt.Text("total_snow:Q", format=".0f")
     )
 
-    chart = (
-        alt.layer(bars, segment_labels, totals_chart)
-        .configure_view(strokeWidth=0)
-        .properties(background="transparent", height=alt.Step(50))
-    )
-    st.altair_chart(chart, width="stretch", theme=None)
+    st.altair_chart(alt.layer(bars, text, total_text), width="stretch")
 
-st.caption("💡 Chart shows 5-day snowfall (only fresh daily reports counted).")
+# 4. Map (With Session State Check)
+st.markdown("<div class='section-header'>🗺️ Live Snow Map (Click for Details)</div>", unsafe_allow_html=True)
+m = create_map(df)
+map_output = st_folium(m, width="100%", height=700, return_on_hover=False)
 
-# --- KEPT Forecast map (with new header) ---
-st.markdown("<div class='section-header'>🌨️ Snowfall Forecast</div>", unsafe_allow_html=True)
-st.caption("💡 Click anywhere on the map for detailed point forecasts. Use the menu (⋮) to switch layers.")
+if map_output and map_output.get("last_object_clicked_tooltip"):
+    resort_name = map_output["last_object_clicked_tooltip"]
+    
+    # Simple state check to prevent infinite rerun loop
+    if "last_clicked" not in st.session_state or st.session_state["last_clicked"] != resort_name:
+        st.session_state["last_clicked"] = resort_name
+        selected_row = df[df["display_name"] == resort_name]
+        if not selected_row.empty:
+            show_resort_modal(selected_row.iloc[0])
+    else:
+        # Logic for same-click: 
+        # Currently we do nothing to avoid loop.
+        # User must click map/other pin to reset state.
+        pass
+
+# 6. Windy
+st.markdown("<div class='section-header'>🌨️ Regional Forecast Model</div>", unsafe_allow_html=True)
 components.html(
-    """
-<div style="border-radius: 16px; overflow: hidden; box-shadow: 0 8px 32px rgba(0,0,0,0.3);">
-  <iframe width="100%" height="550"
-    src="https://embed.windy.com/embed.html?type=map&zoom=6&lat=46.4&lon=-113.4&overlay=snowAccu&product=ecmwf"
-    frameborder="0"></iframe></div>""",
-    height=570,
-    scrolling=False,
+    """<div style="border-radius: 16px; overflow: hidden; box-shadow: 0 8px 32px rgba(0,0,0,0.3);">
+      <iframe width="100%" height="550" src="https://embed.windy.com/embed.html?type=map&zoom=6&lat=46.4&lon=-113.4&overlay=snowAccu&product=ecmwf" frameborder="0"></iframe>
+    </div>""", height=570
 )
 
-st.divider()
-
-# --- REPLACED: New Detailed Resort Info Section ---
-st.markdown("<div class='section-header'>🔍 Detailed Resort Information</div>", unsafe_allow_html=True)
-
-# --- FIX: Added caption text ---
-st.caption("💡 Select any resort to view comprehensive conditions, forecasts, and backcountry data")
-
-selected_display_name = st.selectbox(
-    "Select a resort:",
-    df["display_name"].tolist(),
-    index=0,
-    label_visibility="collapsed"
-)
-
-if selected_display_name:
-    r = df[df["display_name"] == selected_display_name].iloc[0]
-    
-    # --- Native Header Card ---
-    with st.container(border=True):
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            st.markdown(f"<h2 style='color: white; font-size: 2rem; font-weight: 800; margin: 0;'>{r['display_name']}</h2>", unsafe_allow_html=True)
-            st.caption(f"⏱️ Last updated: {r.get('last_updated') or 'N/A'}")
-        with c2:
-            if r.get("is_powder"):
-                st.markdown('<span class="badge badge-powder">🔥 POWDER!</span>', unsafe_allow_html=True)
-        
-        st.markdown("---") 
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("24-Hour Snow", f"{r.get('snow_24h_summit', 0):.0f}\"")
-        c2.metric("Base Depth", f"{r.get('base_depth', 0):.0f}\"")
-        c3.metric("Summit Depth", f"{r.get('summit_depth', 0):.0f}\"")
-        c4.metric("Overnight", f"{r.get('snow_overnight', 0):.0f}\"")
-
-    
-    # --- Native Two-Column Layout ---
-    col_left, col_right = st.columns([1, 1], gap="large")
-    
-    # --- LAYOUT FIX: "Operations Status" moved to left column, first ---
-    with col_left:
-        # Native Operations
-        with st.container(border=True):
-            st.markdown("<h3 style='color: #a78bfa;'>🎿 Operations Status</h3>", unsafe_allow_html=True)
-            lift_pct, lift_text = parse_open_status(r.get('lifts_open'))
-            st.progress(lift_pct, text=f"Lifts: {lift_text}")
-            
-            run_pct, run_text = parse_open_status(r.get('runs_open'))
-            st.progress(run_pct, text=f"Runs: {run_text}")
-
-        # Native Snow & Weather
-        with st.container(border=True):
-            st.markdown("<h3 style='color: #60a5fa;'>❄️ Snow & Weather</h3>", unsafe_allow_html=True)
-            c1, c2 = st.columns(2)
-            c1.metric("Base Temp", f"{r.get('temp_base', 0):.0f}°F" if pd.notna(r.get('temp_base')) and r.get('temp_base') != 0 else "N/A")
-            c2.metric("Summit Temp", f"{r.get('temp_summit', 0):.0f}°F" if pd.notna(r.get('temp_summit')) and r.get('temp_summit') != 0 else "N/A")
-            c1.metric("Wind Speed", f"{r.get('wind_speed', 0):.0f} mph" if pd.notna(r.get('wind_speed')) and r.get('wind_speed') != 0 else "N/A")
-            c2.metric("Surface", r.get('conditions_surface', 'N/A') or "N/A")
-            weather = r.get('weather_current', 'N/A') or "N/A"
-            if weather != "N/A":
-                st.caption(f"Current Weather: **{weather}**")
-
-    with col_right:
-        # Native NWS Forecast
-        with st.container(border=True):
-            st.markdown("<h3 style='color: #5eead4;'>🌦️ 48-Hour Forecast</h3>", unsafe_allow_html=True)
-            nws = r.get("nws_forecast", {}) or {}
-            if isinstance(nws, dict) and nws:
-                c1, c2 = st.columns(2)
-                c1.metric("Forecast Snow", f"{float(nws.get('total_snow_inches', 0) or 0):.1f}\"")
-                c2.metric("Precip. Chance", f"{nws.get('precip_probability_max', 0)}%")
-                c1.metric("Low Temp", f"{nws.get('temp_low_f', 'N/A')}°F")
-                c2.metric("High Temp", f"{nws.get('temp_high_f', 'N/A')}°F")
-            else:
-                st.info("Forecast data unavailable")
-        
-        # Native SNOTEL
-        with st.container(border=True):
-            st.markdown("<h3 style='color: #fbbf24;'>🏔️ SNOTEL Backcountry</h3>", unsafe_allow_html=True)
-            snotel = r.get("snotel_data", {}) or {}
-            triplet = snotel.get("triplet")
-            station_name = snotel.get("station_name")
-            
-            if triplet and station_name:
-                st.caption(f"Station: **{station_name}**")
-                c1, c2 = st.columns(2)
-                c1.metric("24h Snow Δ", f"{snotel.get('snow_depth', 'N/A')}\"")
-                c2.metric("% Median SWE", f"{snotel.get('percent_of_median', 'N/A')}%")
-                c1.metric("24h SWE Δ", f"{snotel.get('swe', 'N/A')}\"")
-                c2.metric("Density", f"{snotel.get('density', 'N/A')}%")
-                
-                # --- LAYOUT FIX: SNOTEL chart & input moved here ---
-                st.markdown("<br>", unsafe_allow_html=True)
-                show_years = st.text_input(
-                    "Compare year:",
-                    value="",
-                    placeholder="e.g. 2023",
-                    key=f"snotel_{r['resort']}"
-                ) or None
-                
-                html = get_snotel_iframe_html(triplet, station_name, show_years)
-                components.html(html, height=SNOTEL_VIEW_HEIGHT, scrolling=False)
-
-            else:
-                st.info("SNOTEL data unavailable")
-    
-    # Comments section (full width below)
-    if r.get("comments"):
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.info(r['comments'])
-    
-    # --- LAYEAYOUT FIX: SNOTEL Chart section removed from here ---
-
-# --- END REPLACED SECTION ---
-
-
-# --- NEW Footer ---
-st.markdown("""
-    <div class='footer'>
-        <strong>Northern Rockies Snow Report</strong><br>
-        Data refreshes every 10 minutes • Built with ❤️ for powder seekers<br>
-        <span style='font-size: 0.8rem; color: #475569;'>
-            Combining resort reports, NWS forecasts, and SNOTEL backcountry data
-        </span>
-    </div>
-""", unsafe_allow_html=True)
+st.markdown("<br><div style='text-align: center; color: #94a3b8;'>Northern Rockies Snow Report</div>", unsafe_allow_html=True)
