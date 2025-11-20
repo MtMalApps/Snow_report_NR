@@ -29,6 +29,11 @@ import sys
 import warnings  # to suppress Pandas warnings in output
 from nws_storm_outlook_v3 import NWSStormOutlook
 #from googleapiclient.errors import HttpError
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from zoneinfo import ZoneInfo
+
+
+
 
 # =============================================================================
 # CONFIGURATION
@@ -86,6 +91,8 @@ def normalize_text(s: str) -> str:
     
     return s
 
+
+
 # =============================================================================
 # BASE SCRAPER CLASS
 # =============================================================================
@@ -94,61 +101,68 @@ class BaseSnowReportScraper(ABC):
     Abstract base class for ski resort snow report scrapers.
     All resort-specific scrapers inherit from this class.
     """
-    
+
     STANDARD_COLUMNS = [
         # Core metadata
         'resort',               # Resort name
         'date',                 # Date data were accessed (YYYY-MM-DD)
         'timestamp',            # Time data were accessed (YYYY-MM-DD HH:MM:SS)
         'last_updated',         # Resort's reported last update time
-        
-        # Snowfall measurements (NEW SNOW)
-        'snow_overnight',       # Overnight snowfall (since lifts closed)
-        'snow_24h_base',        # 24-hour snowfall at base
-        'snow_24h_summit',      # 24-hour snowfall at summit
-        'snow_48h_base',        # 48-hour snowfall at base
-        'snow_48h_summit',      # 48-hour snowfall at summit
-        'snow_7day',            # 7-day snowfall total (for future)
-        
-        # Snow depth measurements (TOTAL BASE DEPTH)
-        'base_depth',           # Base depth (settled base)
-        'summit_depth',         # Summit depth (settled base)
-        
-        # Temperature
-        'temp_base',            # Base temperature
-        'temp_summit',          # Summit temperature
-        
-        # Wind conditions
-        'wind_speed',           # Wind speed measurement
-        
-        # Conditions
-        'conditions_surface',   # Surface conditions (powder, packed, etc.)
-        'weather_current',      # Current weather description
-        
-        # Operations
-        'lifts_open',           # Number/fraction of lifts operating
-        'runs_open',            # Number/fraction of runs open
-        
-        # Additional info
-        'comments',             # Additional notes/forecast/comments
-        
-        # --- DASHBOARD DATA COLUMNS ---
-        'nws_forecast',         # The full NWS forecast object
-        'snotel_data',          # The full SNOTEL data object (Contains Density & Category)
 
-        # Old NWS fields (kept for backward compatibility)
-        'forecast_base_temp_high',    
-        'forecast_base_temp_low',     
-        'forecast_summit_temp_high',  
-        'forecast_summit_temp_low',   
-        'forecast_precipitation',     
-        'forecast_snow',              
+        # Snowfall measurements
+        'snow_overnight',
+        'snow_24h_base',
+        'snow_24h_summit',
+        'snow_48h_base',
+        'snow_48h_summit',
+        'snow_7day',
+
+        # Snow depth
+        'base_depth',
+        'summit_depth',
+
+        # Temperatures
+        'temp_base',
+        'temp_summit',
+
+        # Wind
+        'wind_speed',
+
+        # Conditions
+        'conditions_surface',
+        'weather_current',
+
+        # Operations
+        'lifts_open',
+        'runs_open',
+
+        # Notes
+        'comments',
+
+        # --- DATA QUALITY FLAG ---
+        # "api_ok", "api_offseason", "html_fallback"
+        'data_source',
+
+        # --- DASHBOARD EXTRA FIELDS ---
+        'nws_forecast',
+        'snotel_data',
+
+        # Old NWS legacy fields (kept for backward compatibility)
+        'forecast_base_temp_high',
+        'forecast_base_temp_low',
+        'forecast_summit_temp_high',
+        'forecast_summit_temp_low',
+        'forecast_precipitation',
+        'forecast_snow',
     ]
 
+    # ----------------------------------------------------------------------
+    #  INITIALIZER
+    # ----------------------------------------------------------------------
     def __init__(self, resort_name: str):
         self.resort_name = resort_name
         self.csv_filename = os.path.join(DATA_DIR, f"{resort_name}_snow_report.csv")
-        
+
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -156,33 +170,38 @@ class BaseSnowReportScraper(ABC):
             'Connection': 'keep-alive',
         }
 
+    # ----------------------------------------------------------------------
+    #  NUMERIC CLEANER
+    # ----------------------------------------------------------------------
     @staticmethod
-    def clean_numeric(value) -> float:
+    def clean_numeric(value):
         """
         Clean numeric values consistently across all scrapers.
         Removes quotes, units, whitespace. Returns 0 for invalid values.
         """
         if value is None or value == '' or value == 'N/A':
             return 0.0
-        
+
         value_str = str(value).strip()
-        
-        # Handle slash notation (take first number)
+
+        # Handle slash notation (like 0/5")
         if '/' in value_str:
             value_str = value_str.split('/')[0]
-        
-        # Remove common units and quotes
-        for char in ['"', '°', 'F', 'C', 'mph', 'in', '%']:
-            value_str = value_str.replace(char, '')
-        
-        # Extract just digits, decimal, and minus
+
+        # Strip common units
+        for bad in ['"', '°', 'F', 'C', 'mph', 'in', '%']:
+            value_str = value_str.replace(bad, '')
+
         cleaned = ''.join(c for c in value_str if c.isdigit() or c in ['.', '-'])
-        
+
         try:
             return float(cleaned) if cleaned else 0.0
         except ValueError:
             return 0.0
 
+    # ----------------------------------------------------------------------
+    #  REQUIRED ABSTRACT METHODS
+    # ----------------------------------------------------------------------
     @abstractmethod
     def get_url(self) -> str:
         """Return the URL to scrape for this resort."""
@@ -192,148 +211,122 @@ class BaseSnowReportScraper(ABC):
     def process_data(self, response) -> Dict:
         """
         Process the HTTP response and return standardized data.
-        
+
         Must return a dictionary with ALL keys from STANDARD_COLUMNS.
-        Fields not available from the resort should be set to None.
+        Missing data should be None.
         """
-        pass    
-    
+        pass
+
+    # ----------------------------------------------------------------------
+    #  BLANK RECORD HELPER  ← REQUIRED BY SILVER SCRAPER
+    # ----------------------------------------------------------------------
+    def blank_record(self) -> Dict:
+        """
+        Return a fully-populated "empty" record with all STANDARD_COLUMNS = None.
+        Subclasses (like SilverMountainScraper) can safely start from this.
+        """
+        return {col: None for col in self.STANDARD_COLUMNS}
+
+    # ----------------------------------------------------------------------
+    #  TIMESTAMP HELPER  ← REQUIRED BY SILVER SCRAPER
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def now_string() -> str:
+        """
+        Consistent timestamp helper used by scrapers.
+        """
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ----------------------------------------------------------------------
+    #  BASE FETCH METHOD (SilverMountain overrides this)
+    # ----------------------------------------------------------------------
     def get_snow_report(self) -> Optional[Dict]:
-        """Fetch and process snow report data from the resort website."""
+        """
+        Fetch and process snow report data from the resort website.
+        Silver Mountain *overrides* this method completely.
+        """
         try:
-            # First try with standard SSL verification
             response = requests.get(self.get_url(), headers=self.headers, timeout=10)
             response.raise_for_status()
-            
-            snow_data = self.process_data(response)
-            if snow_data:
-                snow_data.update({
+            data = self.process_data(response)
+
+            if data:
+                data.update({
                     'resort': self.resort_name,
                     'date': datetime.now().strftime('%Y-%m-%d'),
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 })
-            return snow_data    
+            return data
+
         except requests.exceptions.SSLError:
-            # If SSL fails, try again without verification
+            # Retry without SSL verification
             try:
-                print(f"SSL verification failed for {self.resort_name}, retrying without verification...")
                 response = requests.get(self.get_url(), headers=self.headers, timeout=10, verify=False)
                 response.raise_for_status()
-                
-                snow_data = self.process_data(response)
-                if snow_data:
-                    snow_data.update({
+                data = self.process_data(response)
+
+                if data:
+                    data.update({
                         'resort': self.resort_name,
                         'date': datetime.now().strftime('%Y-%m-%d'),
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     })
-                return snow_data
-                
+                return data
             except Exception as e:
-                print(f"Error fetching snow report for {self.resort_name} (without SSL verification): {e}")
+                print(f"Error fetching {self.resort_name} (SSL disabled): {e}")
                 return None
-        except requests.RequestException as e:
+
+        except Exception as e:
             print(f"Error fetching snow report for {self.resort_name}: {e}")
             return None
-            
-            
-    def save_to_csv(self, data: Dict):
-        """Save snow report data to CSV file with deduplication."""
-        try:
-            # Standardize last_updated parsing
-            last_updated_dt = None
-            if data.get('last_updated'):
-                try:
-                    for fmt in [
-                        '%Y-%m-%d %I:%M %p',
-                        '%Y-%m-%d %H:%M %p',
-                        '%Y-%m-%d %I:%M%p',
-                        '%Y-%m-%d %H:%M',
-                        '%Y-%m-%d %I:%M  %p',
-                        '%B %d, %Y %I:%M %p'
-                    ]:
-                        try:
-                            last_updated_dt = datetime.strptime(data['last_updated'], fmt)
-                            break
-                        except ValueError:
-                            continue
-                    if last_updated_dt:
-                        data['last_updated'] = last_updated_dt.strftime('%Y-%m-%d %I:%M %p')
-                except Exception as e:
-                    print(f"Could not parse last_updated: {data.get('last_updated')} - Error: {e}")
-    
-            # Standardize data with all required columns
-            standardized_data = {col: None for col in self.STANDARD_COLUMNS}
-            standardized_data.update({
-                k: normalize_text(v) if isinstance(v, str) else v
-                for k, v in data.items() if v is not None
-            })
-    
-            # Create DataFrame
-            df = pd.DataFrame([standardized_data], columns=self.STANDARD_COLUMNS)
-    
-            if os.path.exists(self.csv_filename):
-                # Read existing CSV
-                dtype_dict = {col: str for col in self.STANDARD_COLUMNS}
-                existing_df = pd.read_csv(self.csv_filename, dtype=dtype_dict)
-    
-                # Convert date columns
-                existing_df['date'] = pd.to_datetime(existing_df['date'], errors='coerce')
-    
-                def parse_last_updated(x):
-                    formats = [
-                        '%Y-%m-%d %I:%M %p',
-                        '%Y-%m-%d %H:%M %p',
-                        '%Y-%m-%d %I:%M%p',
-                        '%Y-%m-%d %H:%M',
-                        '%Y-%m-%d %I:%M  %p',
-                        '%B %d, %Y %I:%M %p'
-                    ]
-                    for f in formats:
-                        try:
-                            return pd.to_datetime(x, format=f)
-                        except Exception:
-                            continue
-                    return pd.NaT
-    
-                existing_df['last_updated'] = existing_df['last_updated'].apply(parse_last_updated)
-    
-                # Remove entries for the same date as this update (if we parsed it)
-                if last_updated_dt:
-                    existing_df = existing_df[
-                        (existing_df['date'].dt.date != last_updated_dt.date()) &
-                        (existing_df['last_updated'].dt.date != last_updated_dt.date())
-                    ]
-    
-                # Prepare new row’s date fields
-                df['date'] = pd.to_datetime(df['date'], errors='coerce')
-                df['last_updated'] = df['last_updated'].apply(parse_last_updated)
-    
-                # Append
-                df = pd.concat([existing_df, df], ignore_index=True, sort=False)
-    
-            # Sort and deduplicate (keep latest per date)
-            df = df.sort_values(['date', 'last_updated'], ascending=True).dropna(subset=['date'])
-            df = df.drop_duplicates(subset='date', keep='last')
-    
-            # Convert datetime back to string for saving
 
-            if pd.api.types.is_datetime64_any_dtype(df['date']):
-                df['date'] = df['date'].dt.strftime('%Y-%m-%d')
-            
-            if pd.api.types.is_datetime64_any_dtype(df['last_updated']):
-                df['last_updated'] = df['last_updated'].dt.strftime('%Y-%m-%d %I:%M %p')
-    
-            # Save to CSV
-            df.to_csv(self.csv_filename, index=False, encoding='utf-8-sig')
-            # print(f"Data saved to {self.csv_filename}") # This is now logged in main()
-    
+    # ----------------------------------------------------------------------
+    #  SAFE CSV SAVE METHOD (SILENTLY SKIPS None DATA)
+    # ----------------------------------------------------------------------
+    def save_to_csv(self, data: Dict):
+        """
+        Save snow report data to CSV with dedupe (keep latest timestamp per date).
+        Skips None instead of crashing.
+        """
+        try:
+            if data is None:
+                print(f"save_to_csv: No data for {self.resort_name}, skipping CSV write.")
+                return
+
+            # Standardize full row
+            row = {col: None for col in self.STANDARD_COLUMNS}
+            row.update({
+                k: normalize_text(v) if isinstance(v, str) else v
+                for k, v in data.items()
+                if v is not None
+            })
+
+            df_new = pd.DataFrame([row], columns=self.STANDARD_COLUMNS)
+
+            # Load existing CSV
+            if os.path.exists(self.csv_filename):
+                df_old = pd.read_csv(self.csv_filename, dtype=str, keep_default_na=False)
+
+                # Ensure schema consistency
+                for col in self.STANDARD_COLUMNS:
+                    if col not in df_old.columns:
+                        df_old[col] = None
+
+                df_all = pd.concat([df_old, df_new], ignore_index=True)
+            else:
+                df_all = df_new
+
+            # Sort + dedupe latest by date
+            df_all = df_all.sort_values(['date', 'timestamp'], ascending=True)
+            df_all = df_all.drop_duplicates(subset='date', keep='last')
+
+            df_all.to_csv(self.csv_filename, index=False, encoding='utf-8-sig')
+
         except Exception as e:
             print(f"Error saving to CSV: {e}")
             import traceback
             traceback.print_exc()
-
-          
+      
 # =============================================================================
 # RESORT-SPECIFIC SCRAPERS
 # =============================================================================
@@ -979,276 +972,209 @@ class BlacktailScraper(BaseSnowReportScraper):
         return data
 
 
-class SchweitzerScraper(BaseSnowReportScraper):
-    def __init__(self):
-        super().__init__("Schweitzer")
 
-    def get_url(self):
-        return "https://www.schweitzer.com/mountain-info/mountain-report"
-
-    def process_data(self, response):
-        soup = BeautifulSoup(response.text, 'html.parser')
-        data = {col: None for col in self.STANDARD_COLUMNS}
-
-        # --- 1. Parse Last Updated ---
-        # Schweitzer usually puts this in a subtle text block
-        # Format: "Last Updated: Wednesday, Nov 19, 2025 1:00 PM"
-        timestamp_elem = soup.find(string=re.compile(r'Last Updated', re.I))
-        if timestamp_elem:
-            try:
-                # Clean up the string (e.g., remove "Last Updated: ")
-                time_text = timestamp_elem.strip().split('Updated')[-1].strip().lstrip(':').strip()
-                # Try parsing standard format
-                parsed_date = datetime.strptime(time_text, '%A, %b %d, %Y %I:%M %p')
-                data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
-            except Exception:
-                # Fallback: just save the raw string
-                data['last_updated'] = timestamp_elem.strip()
-
-        # --- 2. Parse Snowfall & Depth (Grid Layout) ---
-        # They often use classes like "snow-report-item" or simple text labels
-        def find_val(label_text):
-            # Helper to find a label and get the number next to/below it
-            elem = soup.find(string=re.compile(label_text, re.I))
-            if elem:
-                # Try next sibling
-                val = elem.find_next(text=True).strip()
-                if not any(c.isdigit() for c in val): 
-                    # If next text isn't a number, try the parent's next sibling
-                    parent = elem.parent
-                    if parent:
-                        val = parent.find_next(text=True).strip()
-                return self.clean_numeric(val)
-            return None
-
-        data['snow_overnight'] = find_val(r'Overnight')
-        data['snow_24h_base'] = find_val(r'24 (Hr|Hour)')
-        data['snow_48h_base'] = find_val(r'48 (Hr|Hour)')
-        data['snow_7day'] = find_val(r'7 Day')
-        data['base_depth'] = find_val(r'Base Depth')
-        data['summit_depth'] = find_val(r'Summit Depth') # Sometimes called "Upper Mtn"
-
-        # --- 3. Parse Weather / Temps ---
-        # Look for temperature blocks
-        temp_elem = soup.find(string=re.compile(r'Temp', re.I))
-        if temp_elem:
-            val = temp_elem.find_next(text=True).strip()
-            data['temp_base'] = self.clean_numeric(val)
-
-        # --- 4. Parse Lifts & Runs ---
-        # Often found in a "Lift Status" accordion or summary block
-        # We look for the text "X of Y Open"
-        text_content = soup.get_text()
-        
-        # Lifts regex (e.g., "Lifts Open: 5/10")
-        lifts_match = re.search(r'Lifts\s*(?:Open)?\s*[:\n]\s*(\d+)\s*/\s*(\d+)', text_content, re.I)
-        if lifts_match:
-            data['lifts_open'] = f"{lifts_match.group(1)}/{lifts_match.group(2)}"
-
-        # Runs regex (e.g., "Runs Open: 50/92")
-        runs_match = re.search(r'(?:Runs|Trails)\s*(?:Open)?\s*[:\n]\s*(\d+)\s*/\s*(\d+)', text_content, re.I)
-        if runs_match:
-            data['runs_open'] = f"{runs_match.group(1)}/{runs_match.group(2)}"
-            
-        # --- 5. Surface Conditions ---
-        # Look for keywords in the text content
-        surface_keywords = ["Powder", "Packed Powder", "Machine Groomed", "Groomed", "Variable", "Corn", "Spring Conditions"]
-        found_conditions = []
-        for cond in surface_keywords:
-            if re.search(rf'\b{cond}\b', text_content, re.I):
-                found_conditions.append(cond)
-                break # Usually only the first/main one matters
-        
-        if found_conditions:
-            data['conditions_surface'] = found_conditions[0]
-
-        return data
 
 class SilverMountainScraper(BaseSnowReportScraper):
+    """
+    Silver Mountain scraper - calls their API directly (no Playwright needed)
+    Tested and working as of Nov 2025
+    """
+    
     def __init__(self):
         super().__init__("SilverMountain")
-
+        self.BASE_URL = "https://www.silvermt.com"
+    
     def get_url(self):
-        # The "expanded conditions" page usually has the cleanest text data
-        return "https://www.silvermt.com/index.php/conditions"
-
-    def process_data(self, response):
-        soup = BeautifulSoup(response.text, 'html.parser')
+        return f"{self.BASE_URL}/mountain-info/expanded-conditions"
+    
+    def get_token(self) -> Optional[str]:
+        """Get API token from Silver Mountain"""
+        try:
+            url = f"{self.BASE_URL}/api/access_token"
+            params = {'xid': '6c153b1f29c65c918831da5de0e73d2e0aca6f2a'}
+            
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            return response.text.strip('"')
+        except Exception as e:
+            print(f"Silver Mountain: Error getting token: {e}")
+            return None
+    
+    def process_data(self, response) -> Dict:
+        """
+        Get Silver Mountain data from their APIs.
+        Calls 2 endpoints:
+          1. /api - weather/bulletin
+          2. /api/snow-api - snow depths
+        """
         data = {col: None for col in self.STANDARD_COLUMNS}
         
-        # Get all text to parse with Regex (Silver Mt structure is often just text lists)
-        full_text = soup.get_text(separator=' ', strip=True)
-        
-        # --- 1. Parse Last Updated ---
-        # Look for: "Last updated: 2025-11-18T15:37:00" or "Updated: Nov 18"
-        # We try a few patterns
-        timestamp_patterns = [
-            r'Last updated[:\s]*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', # ISO format
-            r'Updated[:\s]*(\w+\s+\d{1,2},\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*[AP]M)', # Human format
-        ]
-        
-        for pat in timestamp_patterns:
-            match = re.search(pat, full_text, re.I)
-            if match:
-                try:
-                    raw_date = match.group(1)
-                    if 'T' in raw_date: # ISO Format
-                        dt = datetime.strptime(raw_date.split('.')[0], '%Y-%m-%dT%H:%M:%S')
-                        data['last_updated'] = dt.strftime('%Y-%m-%d %I:%M %p')
-                    else: # "Nov 18, 2025 at 3:37 PM"
-                        dt = datetime.strptime(raw_date, '%B %d, %Y at %I:%M %p')
-                        data['last_updated'] = dt.strftime('%Y-%m-%d %I:%M %p')
-                    break
-                except Exception:
-                    continue
-        
-        # --- 2. Split into Base (Lodge) vs Summit ---
-        # The page usually lists "Lodge" stats first, then "Summit" stats.
-        # We split the text at the word "Summit" to differentiate duplicate labels like "24 Hours"
-        
-        # Default to using full text for everything if split fails
-        base_section = full_text
-        summit_section = full_text
-        
-        # Try to split
-        if "Summit" in full_text:
-            parts = full_text.split("Summit", 1)
-            if len(parts) == 2:
-                base_section = parts[0] # Text before "Summit" header
-                summit_section = parts[1] # Text after "Summit" header
-        
-        # Helper to extract number after a label
-        def get_val(txt_block, label_pattern):
-            # Look for "Label... 12" or "Label 12"
-            # This regex finds the label, ignores non-digits, then grabs the number
-            m = re.search(rf'{label_pattern}.*?(\d+(?:\.\d+)?)', txt_block, re.I)
-            if m:
-                return self.clean_numeric(m.group(1))
-            return None
-
-        # --- 3. Snow Totals ---
-        # Base Area
-        data['snow_24h_base'] = get_val(base_section, r'24\s*Hours')
-        data['snow_48h_base'] = get_val(base_section, r'48\s*Hours')
-        data['base_depth'] = get_val(base_section, r'Snow\s*Depth')
-        
-        # Summit Area
-        data['snow_24h_summit'] = get_val(summit_section, r'24\s*Hours')
-        data['snow_48h_summit'] = get_val(summit_section, r'48\s*Hours')
-        data['summit_depth'] = get_val(summit_section, r'Snow\s*Depth')
-        
-        # Overnight usually appears once or in both; we grab the first reasonable one
-        data['snow_overnight'] = get_val(full_text, r'12\s*Hours') or get_val(full_text, r'Overnight')
-
-        # --- 4. Temps ---
-        # Look for "Temperature... 32" in respective sections
-        data['temp_base'] = get_val(base_section, r'Temperature')
-        data['temp_summit'] = get_val(summit_section, r'Temperature')
-        
-        # --- 5. Wind ---
-        data['wind_speed'] = get_val(summit_section, r'Wind') # Summit wind is what matters
-
-        # --- 6. Surface Conditions ---
-        # Look for standard keywords
-        surface_keywords = ["Powder", "Packed Powder", "Machine Groomed", "Groomed", "Variable", "Corn", "Spring Conditions", "Early Season"]
-        for cond in surface_keywords:
-            if re.search(rf'\b{cond}\b', full_text, re.I):
-                data['conditions_surface'] = cond
-                break
+        try:
+            # Get token
+            token = self.get_token()
+            if not token:
+                print("Silver Mountain: Failed to get API token")
+                return data
+            
+            # Call API #1: Weather/Bulletin data
+            weather_url = f"{self.BASE_URL}/api"
+            weather_params = {'token': token}
+            
+            weather_response = requests.get(weather_url, params=weather_params, timeout=10)
+            weather_response.raise_for_status()
+            weather_data = weather_response.json()
+            
+            # Call API #2: Snow data
+            snow_url = f"{self.BASE_URL}/api/snow-api"
+            snow_params = {
+                'xid': '6c153b1f29c65c918831da5de0e73d2e0aca6f2a',
+                'token': token
+            }
+            
+            snow_response = requests.get(snow_url, params=snow_params, timeout=10)
+            snow_response.raise_for_status()
+            snow_data = snow_response.json()
+            
+            # Parse weather/bulletin data
+            if weather_data.get('content', {}).get('resorts'):
+                resort = weather_data['content']['resorts'][0]
                 
-        # --- 7. Operations ---
-        data['lifts_open'] = get_val(full_text, r'Lifts\s*Operating')
-        data['runs_open'] = get_val(full_text, r'Trails\s*Open')
+                # Bulletin - strip HTML tags
+                if resort.get('weatherSkyInfos'):
+                    for bulletin_obj in resort['weatherSkyInfos']:
+                        if bulletin_obj.get('type') == 'WEATHER_BULLETIN_OF_THE_DAY':
+                            bulletin_html = bulletin_obj['data'][0]['data']
+                            # Strip HTML tags
+                            bulletin_text = re.sub(r'<[^>]+>', ' ', bulletin_html)
+                            bulletin_text = re.sub(r'\s+', ' ', bulletin_text).strip()
+                            data['comments'] = bulletin_text
+                
+                # Last updated timestamp
+                weather_zones = resort.get('weatherZones', [])
+                if len(weather_zones) > 1:
+                    summit_zone = weather_zones[1]
+                    if summit_zone.get('weatherInfos'):
+                        data['last_updated'] = summit_zone['weatherInfos'][0].get('lastModified')
+            
+            # Parse snow data
+            if snow_data.get('content', {}).get('resorts'):
+                snow_zones = snow_data['content']['resorts'][0]['snowZones']
+                
+                # Base/Lodge (snowZones[0])
+                lodge = snow_zones[0]
+                data['snow_overnight'] = self.clean_numeric(lodge['freshSnowFallDepth12H']['countryValue'])
+                data['snow_24h_base'] = self.clean_numeric(lodge['freshSnowFallDepth24H']['countryValue'])
+                data['snow_48h_base'] = self.clean_numeric(lodge['freshSnowFallDepth48H']['countryValue'])
+                data['base_depth'] = self.clean_numeric(lodge['snowTotalDepth']['countryValue'])
+                data['conditions_surface'] = lodge.get('snowQuality')  # Pass through as-is (e.g., "EARLY_SEASON")
+                
+                # Summit (snowZones[1])
+                summit = snow_zones[1]
+                data['snow_24h_summit'] = self.clean_numeric(summit['freshSnowFallDepth24H']['countryValue'])
+                data['snow_48h_summit'] = self.clean_numeric(summit['freshSnowFallDepth48H']['countryValue'])
+                data['summit_depth'] = self.clean_numeric(summit['snowTotalDepth']['countryValue'])
+            
+        except Exception as e:
+            print(f"Silver Mountain: Error processing data: {e}")
+            import traceback
+            traceback.print_exc()
         
-        # --- 8. Comments ---
-        # Just grab the weather summary if available
-        weather_match = re.search(r'Current\s*Weather\.?\s*([^\.]+)', full_text, re.I)
-        if weather_match:
-            data['weather_current'] = weather_match.group(1).strip()
-
         return data
-        
-        
-class GreatDivideScraper(BaseSnowReportScraper):
+
+
+
+class SchweitzerScraper(BaseSnowReportScraper):
+    """
+    Schweitzer Mountain scraper - uses mtnpowder.com API
+    Tested and working as of Nov 2025
+    """
+    
     def __init__(self):
-        super().__init__("GreatDivide")
-
+        super().__init__("Schweitzer")
+        self.base_url = "https://mtnpowder.com/feed/v3.json"
+        self.bearer_token = "KfmBnMqN4SP3Y4A3Qfy0achT8VGoWOfQtyRm7jwgQFE"
+        self.resort_id = 168
+    
     def get_url(self):
-        return "https://skigd.com/the-mountain/conditions-weather/current-conditions/"
-
-    def process_data(self, response):
-        soup = BeautifulSoup(response.text, 'html.parser')
-        data = {col: None for col in self.STANDARD_COLUMNS}
-
-        # --- 1. Parse Last Updated ---
-        # Usually in a format like "Last Updated: 11/18/2025"
-        timestamp_elem = soup.find(string=re.compile(r'Last Updated', re.I))
-        if timestamp_elem:
-            try:
-                date_str = timestamp_elem.strip().split('Updated')[-1].strip().lstrip(':').strip()
-                # Try a few date formats
-                for fmt in ['%m/%d/%Y', '%B %d, %Y', '%b %d, %Y']:
-                    try:
-                        dt = datetime.strptime(date_str, fmt)
-                        # Since GD often just gives a date, we default to 6 AM
-                        data['last_updated'] = dt.strftime('%Y-%m-%d 06:00 AM')
-                        break
-                    except ValueError:
-                        continue
-            except Exception:
-                data['last_updated'] = timestamp_elem.strip()
-
-        # --- 2. Parse Snow Report Grid ---
-        # Great Divide usually uses blocks with numbers and labels
-        # We scan for labels and grab the number immediately preceding or following
-        text_content = soup.get_text(separator=' ', strip=True)
-        
-        def get_val_by_label(label_regex):
-            # Finds a number near the label
-            # Look for: "12" New Snow" or "New Snow: 12""
-            patterns = [
-                rf'(\d+(?:\.\d+)?)\s*["”]?\s*{label_regex}', # Number BEFORE label
-                rf'{label_regex}[:\s]*(\d+(?:\.\d+)?)'      # Number AFTER label
-            ]
-            for pat in patterns:
-                match = re.search(pat, text_content, re.I)
-                if match:
-                    return self.clean_numeric(match.group(1))
+        return self.base_url
+    
+    def strip_html(self, html_text):
+        if not html_text or html_text == "--":
             return None
+        from html import unescape
+        text = unescape(html_text)
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text if text else None
+    
+    def safe_get(self, value):
+        if value == "--" or value is None or value == "":
+            return None
+        return value
+    
+    def get_snow_report(self) -> Optional[Dict]:
+        try:
+            params = {
+                "bearer_token": self.bearer_token,
+                "resortId[]": self.resort_id
+            }
+            
+            logging.info(f"Fetching Schweitzer data from mtnpowder.com API...")
+            response = requests.get(self.base_url, params=params, timeout=30)
+            response.raise_for_status()
+            
+            data = self.process_data(response)
+            
+            if data:
+                data.update({
+                    'resort': self.resort_name,
+                    'date': datetime.now().strftime('%Y-%m-%d'),
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                })
+            return data
+            
+        except Exception as e:
+            logging.error(f"Error fetching Schweitzer: {e}")
+            return None
+    
+    def process_data(self, response) -> Dict:
+        data = {col: None for col in self.STANDARD_COLUMNS}
+        
+        try:
+            api_data = response.json()
+            resort = api_data.get('Resorts', [{}])[0]
+            snow_report = resort.get('SnowReport', {})
+            base_area = snow_report.get('BaseArea', {})
+            summit_area = snow_report.get('SummitArea', {})
+            
+            data['snow_overnight'] = self.safe_get(base_area.get('SinceLiftsClosedIn'))
+            data['snow_24h_base'] = self.safe_get(base_area.get('Last24HoursIn'))
+            data['snow_48h_base'] = self.safe_get(base_area.get('Last48HoursIn'))
+            data['base_depth'] = self.safe_get(base_area.get('BaseIn'))
+            
+            data['snow_24h_summit'] = self.safe_get(summit_area.get('Last24HoursIn'))
+            data['snow_48h_summit'] = self.safe_get(summit_area.get('Last48HoursIn'))
+            data['summit_depth'] = self.safe_get(summit_area.get('BaseIn'))
+            
+            data['conditions_surface'] = self.safe_get(snow_report.get('BaseConditions'))
+            data['comments'] = self.strip_html(snow_report.get('Report', ''))
+            
+            data['lifts_open'] = f"{snow_report.get('TotalOpenLifts', 0)} / {snow_report.get('TotalLifts', 0)}"
+            data['runs_open'] = f"{snow_report.get('TotalOpenTrails', 0)} / {snow_report.get('TotalTrails', 0)}"
+            data['weather_current'] = resort.get('OperatingStatus', '')
+            data['last_updated'] = self.safe_get(snow_report.get('LastUpdate'))
+            
+            for key in ['snow_overnight', 'snow_24h_base', 'snow_48h_base', 
+                       'snow_24h_summit', 'snow_48h_summit', 'base_depth', 'summit_depth']:
+                if data[key] is not None:
+                    data[key] = self.clean_numeric(data[key])
+            
+            return data
+            
+        except Exception as e:
+            logging.error(f"Error parsing Schweitzer data: {e}")
+            return data
 
-        data['snow_overnight'] = get_val_by_label(r'Overnight')
-        data['snow_24h_base'] = get_val_by_label(r'24\s*Hr')
-        data['snow_48h_base'] = get_val_by_label(r'48\s*Hr')
-        data['snow_7day'] = get_val_by_label(r'7\s*Day')
-        data['base_depth'] = get_val_by_label(r'Base')
-        data['summit_depth'] = get_val_by_label(r'Summit')
-
-        # Fallback: If 24h base/summit split isn't clear, use generic 24h for both
-        if data['snow_24h_base'] is not None and data['snow_24h_summit'] is None:
-             data['snow_24h_summit'] = data['snow_24h_base']
-
-        # --- 3. Temps ---
-        data['temp_base'] = get_val_by_label(r'Base\s*Temp')
-        data['temp_summit'] = get_val_by_label(r'Summit\s*Temp')
-
-        # --- 4. Surface Conditions ---
-        surface_keywords = ["Powder", "Packed Powder", "Machine Groomed", "Groomed", "Variable", "Corn", "Spring Conditions"]
-        for cond in surface_keywords:
-            if re.search(rf'\b{cond}\b', text_content, re.I):
-                data['conditions_surface'] = cond
-                break
-
-        # --- 5. Operations ---
-        # Look for "Lifts Open: 5"
-        lifts_val = get_val_by_label(r'Lifts\s*Open')
-        if lifts_val is not None:
-            data['lifts_open'] = str(int(lifts_val)) # "5"
-
-        runs_val = get_val_by_label(r'Runs\s*Open')
-        if runs_val is not None:
-            data['runs_open'] = str(int(runs_val))
-
-        return data  
 
 
 # =============================================================================
@@ -1579,13 +1505,14 @@ def main():
             BlacktailScraper(),
             SchweitzerScraper(),
             SilverMountainScraper(),
-            GreatDivideScraper(),
+            # GreatDivideScraper(),
         ]
         
         resort_data_list = []
         for scraper in scrapers:
             logging.info(f"Fetching data for {scraper.resort_name}...")
             snow_data = scraper.get_snow_report()
+            
             
             if snow_data:
                 resort_name = snow_data["resort"]
