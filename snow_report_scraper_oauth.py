@@ -29,7 +29,7 @@ import sys
 import warnings  # to suppress Pandas warnings in output
 from nws_storm_outlook_v3 import NWSStormOutlook
 #from googleapiclient.errors import HttpError
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+#from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from zoneinfo import ZoneInfo
 
 
