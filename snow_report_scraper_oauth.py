@@ -1435,9 +1435,22 @@ class MaverickScraper(BaseSnowReportScraper):
                  return data
             
             raw_text = normalize_text(raw_data_content)
-            data['comments'] = raw_text # Store the raw text in comments for debug
             
             # --- Regex Parsing of the Raw Text Content ---
+            
+            # Extract and store explicit surface conditions if they exist
+            surface_condition_match = re.search(r'Primary Surface Conditions:\s*(.*?)\n', raw_text, re.IGNORECASE | re.DOTALL)
+            
+            condition_value = ""
+            if surface_condition_match:
+                condition_value = surface_condition_match.group(1).strip()
+            
+            # FINAL FIX: If value is blank OR if it contains only the SECONDARY label (which happens if Primary is blank)
+            if not condition_value or condition_value == "Secondary Surface Conditions:":
+                 data['conditions_surface'] = None
+            else:
+                 data['conditions_surface'] = normalize_text(condition_value)
+
             patterns = {
                 'snow_overnight': r'Overnight:\s*(\d+)',
                 'snow_24h_base': r'Last 24 hours:\s*(\d+)',
@@ -1455,22 +1468,29 @@ class MaverickScraper(BaseSnowReportScraper):
 
             # Date extraction from the first line of raw text
             date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', raw_text)
+            last_updated_date = None
             if date_match:
                 try:
                     parsed_date = datetime.strptime(date_match.group(1), '%m/%d/%Y')
-                    data['last_updated'] = parsed_date.strftime('%Y-%m-%d 06:00 AM')
+                    last_updated_date = parsed_date.strftime('%Y-%m-%d 06:00 AM')
                 except Exception:
-                    data['last_updated'] = date_match.group(1).strip()
+                    last_updated_date = date_match.group(1).strip()
             
-            data['conditions_surface'] = "Static HTML Content"
+            data['last_updated'] = last_updated_date
+            
+            # NEW COMMENT LOGIC: Clean, concise comment reflecting status.
+            if last_updated_date and '10/14' in last_updated_date:
+                 data['comments'] = "Resort status is static/pre-season. Data last updated on 10/14/2025."
+            else:
+                 data['comments'] = "Data extracted from static content on the website."
+            
             data['data_source'] = 'json_extraction_api'
 
         except Exception as e:
             logging.error(f"Error parsing Maverick data from JSON: {e}", exc_info=True)
-            data['comments'] = f"Fatal error processing JSON data. Check logs. {str(e)}"
+            data['comments'] = f"Fatal error processing JSON data: {str(e)}"
         
         return data
-
 
 
 # =============================================================================
