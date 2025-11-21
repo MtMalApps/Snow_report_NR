@@ -978,6 +978,7 @@ class SilverMountainScraper(BaseSnowReportScraper):
     """
     Silver Mountain scraper - calls their API directly (no Playwright needed)
     Tested and working as of Nov 2025
+    Date format fixed to match other scrapers
     """
     
     def __init__(self):
@@ -1049,12 +1050,21 @@ class SilverMountainScraper(BaseSnowReportScraper):
                             bulletin_text = re.sub(r'\s+', ' ', bulletin_text).strip()
                             data['comments'] = bulletin_text
                 
-                # Last updated timestamp
+                # Last updated timestamp - FORMAT TO MATCH OTHER SCRAPERS
                 weather_zones = resort.get('weatherZones', [])
                 if len(weather_zones) > 1:
                     summit_zone = weather_zones[1]
                     if summit_zone.get('weatherInfos'):
-                        data['last_updated'] = summit_zone['weatherInfos'][0].get('lastModified')
+                        last_updated_raw = summit_zone['weatherInfos'][0].get('lastModified')
+                        if last_updated_raw:
+                            try:
+                                # Parse ISO 8601 format: 2025-11-20T23:37:00.000-07:00
+                                parsed = datetime.fromisoformat(last_updated_raw.replace('Z', '+00:00'))
+                                # Format to match Showdown: 2025-11-20 03:17 PM
+                                data['last_updated'] = parsed.strftime('%Y-%m-%d %I:%M %p')
+                            except Exception as e:
+                                logging.warning(f"Silver Mountain: Could not parse date '{last_updated_raw}': {e}")
+                                data['last_updated'] = last_updated_raw
             
             # Parse snow data
             if snow_data.get('content', {}).get('resorts'):
@@ -1087,6 +1097,7 @@ class SchweitzerScraper(BaseSnowReportScraper):
     """
     Schweitzer Mountain scraper - uses mtnpowder.com API
     Tested and working as of Nov 2025
+    Date format fixed to match other scrapers
     """
     
     def __init__(self):
@@ -1096,31 +1107,51 @@ class SchweitzerScraper(BaseSnowReportScraper):
         self.resort_id = 168
     
     def get_url(self):
+        """Return base URL (not used directly, but required by base class)"""
         return self.base_url
     
     def strip_html(self, html_text):
+        """Strip HTML tags and clean up text"""
         if not html_text or html_text == "--":
             return None
+        
         from html import unescape
+        # Unescape HTML entities
         text = unescape(html_text)
+        
+        # Remove HTML tags
         text = re.sub(r'<[^>]+>', '', text)
-        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Clean up whitespace
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+        
         return text if text else None
     
     def safe_get(self, value):
+        """Convert '--' or empty strings to None"""
         if value == "--" or value is None or value == "":
             return None
         return value
     
     def get_snow_report(self) -> Optional[Dict]:
+        """
+        Override base class method to call Schweitzer API directly.
+        Bearer token is passed as query parameter, not header.
+        """
         try:
+            # Bearer token is passed as query parameter
             params = {
                 "bearer_token": self.bearer_token,
-                "resortId[]": self.resort_id
+                "resortId[]": self.resort_id  # Note the brackets!
             }
             
             logging.info(f"Fetching Schweitzer data from mtnpowder.com API...")
-            response = requests.get(self.base_url, params=params, timeout=30)
+            response = requests.get(
+                self.base_url,
+                params=params,
+                timeout=30
+            )
             response.raise_for_status()
             
             data = self.process_data(response)
@@ -1131,22 +1162,31 @@ class SchweitzerScraper(BaseSnowReportScraper):
                     'date': datetime.now().strftime('%Y-%m-%d'),
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 })
+            
             return data
             
         except Exception as e:
-            logging.error(f"Error fetching Schweitzer: {e}")
+            logging.error(f"Error fetching Schweitzer snow report: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def process_data(self, response) -> Dict:
+        """Parse mtnpowder.com API response"""
         data = {col: None for col in self.STANDARD_COLUMNS}
         
         try:
             api_data = response.json()
+            
+            # Navigate to snow report data
             resort = api_data.get('Resorts', [{}])[0]
             snow_report = resort.get('SnowReport', {})
+            
+            # Extract area data
             base_area = snow_report.get('BaseArea', {})
             summit_area = snow_report.get('SummitArea', {})
             
+            # Map snowfall data
             data['snow_overnight'] = self.safe_get(base_area.get('SinceLiftsClosedIn'))
             data['snow_24h_base'] = self.safe_get(base_area.get('Last24HoursIn'))
             data['snow_48h_base'] = self.safe_get(base_area.get('Last48HoursIn'))
@@ -1156,14 +1196,37 @@ class SchweitzerScraper(BaseSnowReportScraper):
             data['snow_48h_summit'] = self.safe_get(summit_area.get('Last48HoursIn'))
             data['summit_depth'] = self.safe_get(summit_area.get('BaseIn'))
             
+            # Conditions
             data['conditions_surface'] = self.safe_get(snow_report.get('BaseConditions'))
             data['comments'] = self.strip_html(snow_report.get('Report', ''))
             
-            data['lifts_open'] = f"{snow_report.get('TotalOpenLifts', 0)} / {snow_report.get('TotalLifts', 0)}"
-            data['runs_open'] = f"{snow_report.get('TotalOpenTrails', 0)} / {snow_report.get('TotalTrails', 0)}"
-            data['weather_current'] = resort.get('OperatingStatus', '')
-            data['last_updated'] = self.safe_get(snow_report.get('LastUpdate'))
+            # Lifts and runs
+            total_lifts = snow_report.get('TotalLifts', 0)
+            open_lifts = snow_report.get('TotalOpenLifts', 0)
+            total_trails = snow_report.get('TotalTrails', 0)
+            open_trails = snow_report.get('TotalOpenTrails', 0)
             
+            data['lifts_open'] = f"{open_lifts} / {total_lifts}"
+            data['runs_open'] = f"{open_trails} / {total_trails}"
+            
+            # Operating status
+            data['weather_current'] = resort.get('OperatingStatus', '')
+            
+            # Last update - FORMAT TO MATCH OTHER SCRAPERS
+            last_updated_raw = self.safe_get(snow_report.get('LastUpdate'))
+            if last_updated_raw:
+                try:
+                    # Parse ISO 8601 format: 2025-11-12T15:17:22-0800
+                    parsed = datetime.fromisoformat(last_updated_raw.replace('Z', '+00:00'))
+                    # Format to match Showdown: 2025-11-20 03:17 PM
+                    data['last_updated'] = parsed.strftime('%Y-%m-%d %I:%M %p')
+                except Exception as e:
+                    logging.warning(f"Schweitzer: Could not parse date '{last_updated_raw}': {e}")
+                    data['last_updated'] = last_updated_raw
+            else:
+                data['last_updated'] = None
+            
+            # Clean numeric values
             for key in ['snow_overnight', 'snow_24h_base', 'snow_48h_base', 
                        'snow_24h_summit', 'snow_48h_summit', 'base_depth', 'summit_depth']:
                 if data[key] is not None:
@@ -1173,6 +1236,8 @@ class SchweitzerScraper(BaseSnowReportScraper):
             
         except Exception as e:
             logging.error(f"Error parsing Schweitzer data: {e}")
+            import traceback
+            traceback.print_exc()
             return data
 
 
