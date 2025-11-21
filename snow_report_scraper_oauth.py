@@ -1241,6 +1241,237 @@ class SchweitzerScraper(BaseSnowReportScraper):
             return data
 
 
+class BridgerBowlScraper(BaseSnowReportScraper):
+    """
+    Bridger Bowl scraper - uses a GraphQL POST request to fetch the snow report data.
+    The required query was identified via network inspection.
+    This version corrects the base_depth/seasonal_snowfall mapping based on testing.
+    """
+    
+    def __init__(self):
+        super().__init__("BridgerBowl")
+        self.BASE_URL = "https://api.bridgerbowl.com/graphql"
+
+    # The GraphQL query payload identified from the network logs.
+    GRAPHQL_PAYLOAD = {
+        "operationName": "Query",
+        "variables": {},
+        "query": """query Query {
+          snow_report {
+            new_snow
+            recent_snow
+            seasonal_snow
+            settled_snow
+            snow_density
+            icon
+            blue_light
+            conditions_primary
+            conditions_secondary
+            __typename
+          }
+        }"""
+    }
+
+    def get_url(self) -> str:
+        """Returns the primary API endpoint URL for this resort."""
+        return self.BASE_URL
+
+    def get_snow_report(self) -> Optional[Dict]:
+        """
+        Overrides the base method to execute the GraphQL POST request.
+        """
+        try:
+            logging.info(f"Fetching {self.resort_name} data from GraphQL API...")
+
+            headers = {
+                'Content-Type': 'application/json',
+                **self.headers 
+            }
+            
+            # The POST request sends the GraphQL query as the JSON body
+            response = requests.post(
+                self.BASE_URL,
+                headers=headers,
+                json=self.GRAPHQL_PAYLOAD,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            data = self.process_data(response)
+            
+            # Add core metadata (resort, date, timestamp, data_source)
+            if data:
+                data.update({
+                    'resort': self.resort_name,
+                    'date': datetime.now().strftime('%Y-%m-%d'),
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'data_source': 'api_graphql',
+                })
+            return data
+            
+        except Exception as e:
+            logging.error(f"Error fetching {self.resort_name} data (GraphQL): {e}", exc_info=True)
+            return None
+
+    def process_data(self, response) -> Dict:
+        """Parses the GraphQL JSON response into the STANDARD_COLUMNS schema."""
+        data = self.blank_record()
+        
+        try:
+            api_data = response.json()
+            snow_report = api_data.get('data', {}).get('snow_report', {})
+            
+            primary = snow_report.get('conditions_primary')
+            
+            # 1. Snowfall and Depth Mapping
+            data['snow_overnight'] = self.clean_numeric(snow_report.get('new_snow'))
+            data['snow_24h_base'] = self.clean_numeric(snow_report.get('recent_snow')) 
+            
+            # FIX: Map the high, incorrect "base_depth" (settled_snow) to seasonal_snowfall
+            # and map the true seasonal total to a new column or drop it, since the numbers are confusing.
+            # We'll prioritize the current Base Depth to be 0 if the resort is closed,
+            # and set the high number (e.g., 65") to the seasonal total.
+            
+            # Based on the error, "settled_snow" (65) is the total S.T.D.
+            data['seasonal_snowfall'] = self.clean_numeric(snow_report.get('settled_snow'))
+            
+            # Set base depth to 0 if closed, otherwise use 0 (since GraphQL doesn't specify top/bottom depth well)
+            if primary and 'Closed' in primary:
+                 data['base_depth'] = 0.0
+                 data['summit_depth'] = 0.0
+            else:
+                 # If open, default to a safe value or None, as the API structure is ambiguous
+                 data['base_depth'] = self.clean_numeric(snow_report.get('settled_snow')) if snow_report.get('settled_snow') < 100 else 0.0
+            
+            # 2. Conditions and Comments
+            secondary = snow_report.get('conditions_secondary')
+            
+            data['conditions_surface'] = primary
+            
+            comment_parts = []
+            if primary:
+                 comment_parts.append(f"Primary Condition: {primary}")
+            if secondary:
+                 comment_parts.append(f"Secondary Condition: {secondary}")
+            
+            data['comments'] = " | ".join(comment_parts) if comment_parts else None
+            
+            # 3. Last Updated (Using fetch time)
+            data['last_updated'] = datetime.now().strftime('%Y-%m-%d %I:%M %p')
+            
+        except Exception as e:
+            logging.error(f"{self.resort_name}: Error parsing data: {e}", exc_info=True)
+            return data
+            
+        return data
+
+
+class MaverickScraper(BaseSnowReportScraper):
+    """
+    Maverick scraper - extracts raw snow report text content directly from the 
+    __BOOTSTRAP_STATE__ JSON object embedded in the HTML.
+    """
+    
+    def __init__(self):
+        super().__init__("Maverick")
+
+    def get_url(self) -> str:
+        """Returns the URL for the static snow report page."""
+        return "https://www.skimaverick.com/weather"
+
+    def _find_text_content(self, data: Any) -> Optional[str]:
+        """
+        Recursively searches for the raw text content inside the nested JSON.
+        The raw text is always under the key 'insert' and contains 'Overnight'.
+        """
+        if isinstance(data, dict):
+            if 'insert' in data and isinstance(data['insert'], str) and 'Overnight' in data['insert']:
+                return data['insert']
+            for value in data.values():
+                result = self._find_text_content(value)
+                if result:
+                    return result
+        elif isinstance(data, list):
+            for item in data:
+                result = self._find_text_content(item)
+                if result:
+                    return result
+        return None
+
+    def process_data(self, response) -> Dict:
+        """
+        1. Find the __BOOTSTRAP_STATE__ JSON string.
+        2. Clean the JSON string of control characters.
+        3. Use recursive search to extract and parse the raw snow report content.
+        """
+        data = self.blank_record()
+        
+        try:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Find the script tag containing the JSON object
+            script_tag = soup.find('script', string=re.compile(r'window\.__BOOTSTRAP_STATE__'))
+            
+            if not script_tag:
+                 data['comments'] = "Could not find __BOOTSTRAP_STATE__ JSON script tag."
+                 data['data_source'] = 'error_no_json'
+                 return data
+            
+            # 1. Extract the raw JSON string
+            json_text = script_tag.string.split('=', 1)[1].strip().rstrip(';')
+            
+            # 2. AGGRESSIVE CLEANING FIX: Remove all invalid control characters
+            json_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_text)
+            
+            # 3. Load the JSON
+            bootstrap_data = json.loads(json_text)
+
+            # 4. Use the recursive search to find the content block
+            raw_data_content = self._find_text_content(bootstrap_data)
+            
+            if not raw_data_content:
+                 data['comments'] = "Found bootstrap JSON but could not find the snow report data using recursive search."
+                 data['data_source'] = 'error_no_content'
+                 return data
+            
+            raw_text = normalize_text(raw_data_content)
+            data['comments'] = raw_text # Store the raw text in comments for debug
+            
+            # --- Regex Parsing of the Raw Text Content ---
+            patterns = {
+                'snow_overnight': r'Overnight:\s*(\d+)',
+                'snow_24h_base': r'Last 24 hours:\s*(\d+)',
+                'snow_48h_base': r'Last 48 hours:\s*(\d+)',
+                'snow_7day': r'Last 7 days:\s*(\d+)',
+                'base_depth': r'Snow Depth \(base\):\s*(\d+)',
+                'summit_depth': r'Snow Depth \(summit\):\s*(\d+)',
+                'seasonal_snowfall': r'Annual Snowfall:\s*(\d+)',
+            }
+            
+            for key, pattern in patterns.items():
+                match = re.search(pattern, raw_text, re.IGNORECASE | re.DOTALL) 
+                if match:
+                    data[key] = self.clean_numeric(match.group(1))
+
+            # Date extraction from the first line of raw text
+            date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', raw_text)
+            if date_match:
+                try:
+                    parsed_date = datetime.strptime(date_match.group(1), '%m/%d/%Y')
+                    data['last_updated'] = parsed_date.strftime('%Y-%m-%d 06:00 AM')
+                except Exception:
+                    data['last_updated'] = date_match.group(1).strip()
+            
+            data['conditions_surface'] = "Static HTML Content"
+            data['data_source'] = 'json_extraction_api'
+
+        except Exception as e:
+            logging.error(f"Error parsing Maverick data from JSON: {e}", exc_info=True)
+            data['comments'] = f"Fatal error processing JSON data. Check logs. {str(e)}"
+        
+        return data
+
+
 
 # =============================================================================
 # SNOTEL DATA INTEGRATION (HOURLY)
@@ -1570,6 +1801,8 @@ def main():
             BlacktailScraper(),
             SchweitzerScraper(),
             SilverMountainScraper(),
+            BridgerBowlScraper(),
+            MaverickScraper(),
             # GreatDivideScraper(),
         ]
         
