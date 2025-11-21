@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from bs4 import BeautifulSoup
 import re
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any  
 import time
 import logging
 import json
