@@ -28,10 +28,10 @@ st.set_page_config(
 )
 
 LOCAL_TZ = ZoneInfo("America/Denver")
-FRESHNESS_TOLERANCE_HOURS = 30
+FRESHNESS_TOLERANCE_HOURS = 18
 
 # ──────────────────────────────────────────────────────────────
-# COORDINATES
+# COORDINATES (MASTER LIST)
 # ──────────────────────────────────────────────────────────────
 RESORTS_DATA = {
     "Snowbowl": {"lat": 47.032417, "lon": -113.9915282},
@@ -65,7 +65,7 @@ def load_css():
                 font-family: 'Inter', sans-serif;
             }
             
-            /* FORCE DARK BACKGROUND */
+            /* FORCE DARK BACKGROUND GLOBALLY */
             .stApp {
                 background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
                 background-attachment: fixed;
@@ -81,51 +81,102 @@ def load_css():
                 color: #e2e8f0;
             }
 
-            /* Hero */
+            /* Hero Section */
             .hero {
                 background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 50%, #ec4899 100%);
-                padding: 2.5rem; border-radius: 24px; margin-bottom: 2rem;
-                box-shadow: 0 20px 60px rgba(59, 130, 246, 0.4); text-align: center;
+                padding: 2.5rem;
+                border-radius: 24px;
+                margin-bottom: 2rem;
+                box-shadow: 0 20px 60px rgba(59, 130, 246, 0.4);
+                text-align: center;
             }
-            .hero-title { font-size: 3rem !important; font-weight: 900; color: white !important; margin: 0; }
-            
+            .hero-title {
+                font-size: 3rem !important;
+                font-weight: 900 !important;
+                color: white !important;
+                margin: 0 !important;
+                text-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            }
+            .hero-subtitle {
+                color: rgba(255, 255, 255, 0.95) !important;
+                font-size: 1.1rem;
+                margin-top: 0.5rem;
+            }
+
             /* Powder Alert */
             .powder-alert {
                 background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
-                padding: 1.5rem; border-radius: 20px; margin-bottom: 2rem;
+                padding: 1.5rem;
+                border-radius: 20px;
+                margin-bottom: 2rem;
+                box-shadow: 0 12px 40px rgba(220, 38, 38, 0.5);
                 border: 2px solid rgba(255, 255, 255, 0.2);
                 animation: pulse-glow 2s ease-in-out infinite;
             }
+            .powder-alert-title { font-size: 1.5rem; font-weight: 900; color: white !important; }
+            .powder-alert-text { color: rgba(255,255,255,0.95) !important; font-size: 1.1rem; }
+            
             @keyframes pulse-glow {
-                0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.7); }
-                70% { box-shadow: 0 0 0 10px rgba(220, 38, 38, 0); }
-                100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0); }
+                0%, 100% { box-shadow: 0 12px 40px rgba(220, 38, 38, 0.5); transform: scale(1); }
+                50% { box-shadow: 0 12px 60px rgba(220, 38, 38, 0.7); transform: scale(1.01); }
             }
 
-            /* Section Header */
+            /* Section Headers */
             .section-header {
-                font-size: 1.5rem; font-weight: 800; color: white; margin: 2rem 0 1rem 0;
-                padding: 0.75rem 1.25rem; background: rgba(59, 130, 246, 0.15);
-                border-left: 4px solid #3b82f6; border-radius: 8px;
+                font-size: 1.75rem;
+                font-weight: 800;
+                color: white !important;
+                margin: 2.5rem 0 1.5rem 0;
+                padding: 1rem 1.5rem;
+                background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(139, 92, 246, 0.1));
+                border-left: 4px solid #3b82f6;
+                border-radius: 12px;
             }
             
-            /* TABLE STYLING */
+            /* Custom Table Styling */
             .styled-table {
-                width: 100%; border-collapse: collapse; margin: 20px 0;
-                font-size: 0.85rem; font-family: 'Inter', sans-serif;
-                border-radius: 12px 12px 0 0; overflow: hidden;
+                width: 100%;
+                border-collapse: collapse;
+                margin: 25px 0;
+                font-size: 0.8rem;
+                font-family: 'Inter', sans-serif;
+                box-shadow: 0 0 20px rgba(0, 0, 0, 0.15);
+                border-radius: 12px 12px 0 0;
+                overflow: hidden;
             }
             .styled-table th, .styled-table td {
-                padding: 12px 15px; text-align: center;
+                padding: 10px 15px;
+                text-align: center;
             }
             .styled-table td:first-child, .styled-table th:first-child {
                 text-align: left;
             }
-            .styled-table thead tr { background-color: #3b82f6; color: #ffffff; }
-            .styled-table tbody tr {
-                border-bottom: 1px solid #334155; background-color: rgba(30, 41, 59, 0.6); color: #f1f5f9;
+
+            .styled-table thead tr {
+                background-color: #3b82f6;
+                color: #ffffff;
             }
-            .styled-table tbody tr:nth-of-type(even) { background-color: rgba(15, 23, 42, 0.6); }
+            .styled-table thead th {
+                background-color: rgba(59, 130, 246, 0.3);
+                color: #e2e8f0;
+                text-transform: uppercase;
+                font-weight: 700;
+                letter-spacing: 0.05em;
+                border-bottom: 2px solid #475569;
+            }
+            
+            .styled-table tbody tr {
+                border-bottom: 1px solid #334155;
+                background-color: rgba(30, 41, 59, 0.4);
+                color: #f1f5f9;
+            }
+            .styled-table tbody tr:nth-of-type(even) {
+                background-color: rgba(15, 23, 42, 0.4);
+            }
+            .styled-table tbody tr:hover {
+                background-color: rgba(59, 130, 246, 0.2);
+                color: white;
+            }
 
             /* Data Grid Styling */
             .data-grid {
@@ -171,7 +222,7 @@ def load_css():
             [data-testid="stMetricLabel"] { color: #94a3b8 !important; }
             [data-testid="stMetricValue"] { color: white !important; }
             
-            /* LARGE TABS */
+            /* LARGER TABS CSS */
             .stTabs [data-baseweb="tab-list"] button {
                 font-size: 1.3rem !important;
                 font-weight: 900 !important;
@@ -185,6 +236,7 @@ def load_css():
 # CHART HELPER
 # ──────────────────────────────────────────────────────────────
 def get_snotel_iframe_html(triplet: str, station_name: str, show_years: str | None) -> str:
+    """Return HTML snippet for NRCS SNOTEL graph."""
     try:
         state = triplet.split(":")[1].strip().upper()
     except Exception:
@@ -196,14 +248,20 @@ def get_snotel_iframe_html(triplet: str, station_name: str, show_years: str | No
         params.append(f"showYears={show_years.strip()}")
     url = base + "?" + "&".join(params)
     
-    SNOTEL_CROP_TOP = 310
+    # CROP SETTINGS
+    SNOTEL_CROP_TOP = 270    
     SNOTEL_VIEW_HEIGHT = 440 
     SNOTEL_CROP_BOTTOM = 480
+    
     inner_height = SNOTEL_VIEW_HEIGHT + SNOTEL_CROP_TOP + SNOTEL_CROP_BOTTOM
     
     return f"""
     <div style="width:100%; height:{SNOTEL_VIEW_HEIGHT}px; overflow:hidden; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,.15); margin-top: 16px; background: white;">
-      <iframe src="{url}" style="width:100%; height:{inner_height}px; border:0; transform: translateY(-{SNOTEL_CROP_TOP}px);" loading="lazy"></iframe>
+      <iframe
+        src="{url}"
+        style="width:100%; height:{inner_height}px; border:0; transform: translateY(-{SNOTEL_CROP_TOP}px);"
+        loading="lazy"
+      ></iframe>
     </div>
     """
 
@@ -212,9 +270,9 @@ def get_snotel_iframe_html(triplet: str, station_name: str, show_years: str | No
 # ──────────────────────────────────────────────────────────────
 @st.dialog("Resort Details", width="large")
 def show_resort_modal(row):
-    # HEADER FIX: Zero spacing
+    # TIGHT HEADER LAYOUT
     st.markdown(f"""
-        <div style="margin-bottom: 40px;">
+        <div style="line-height: 1.1; margin-bottom: 40px;">
             <div style="font-size: 2.2rem; font-weight: 900; color: white; line-height: 1.0;">{row['display_name']}</div>
             <div style="font-size: 0.9rem; color: #94a3b8; margin-top: 4px;">Last Updated: {row['last_updated']}</div>
         </div>
@@ -273,7 +331,7 @@ def show_resort_modal(row):
         except: pass
             
         st.markdown(f"""
-        <div style="margin-bottom: 15px;">
+        <div style="line-height: 1.2; margin-bottom: 15px;">
             <div style="font-size: 1.5rem; font-weight: 700; color: white; line-height: 1.0;">{s_name}</div>
             <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 4px;">Observed: {val_obs_display}</div>
         </div>
@@ -291,7 +349,6 @@ def show_resort_modal(row):
         val_density = snotel.get('density', 'N/A')
         val_qual = snotel.get('snow_category', 'N/A')
         
-        # FIX: Check if % is valid and remove % symbol if N/A
         pct_raw = snotel.get('percent_of_median', 'N/A')
         if str(pct_raw) == "N/A" or pct_raw is None:
             val_pct = "N/A"
@@ -330,12 +387,11 @@ def show_resort_modal(row):
         station_name = snotel.get("station_name")
         
         if triplet and station_name:
-            # FIX: Input strictly on Left
             col_input, col_label = st.columns([1, 2])
             with col_input:
                 compare_year = st.text_input("Compare Year:", placeholder="e.g. 2011", key=f"year_{row['display_name']}")
             with col_label:
-                st.write("")
+                st.write("") 
 
             html = get_snotel_iframe_html(triplet, station_name, compare_year)
             components.html(html, height=440, scrolling=False)
@@ -456,12 +512,16 @@ def load_latest_data(_db):
         season_year = today.year if today.month >= 10 else today.year - 1
         season_start = pd.Timestamp(season_year, 10, 1, tz=LOCAL_TZ)
         
+        # --- FRESHNESS LOGIC FIX (CALENDAR DAY CHECK) ---
         now_dt = datetime.now(LOCAL_TZ)
-        df_final["is_fresh"] = (now_dt - df_final['last_updated_dt']).dt.total_seconds() / 3600 < FRESHNESS_TOLERANCE_HOURS
-        df_final["is_season"] = df_final['last_updated_dt'] >= season_start
         
-        mask_stale = ~df_final["is_season"] | ~df_final["is_fresh"]
-        df_final.loc[mask_stale, ["snow_24h_summit", "snow_overnight"]] = 0
+        is_report_today = df_final['last_updated_dt'].dt.date == now_dt.date()
+        is_season = df_final['last_updated_dt'] >= season_start
+        
+        # If it's this season AND the report date is NOT today's date, zero out fresh snow.
+        mask_stale_snow = is_season & ~is_report_today
+        df_final.loc[mask_stale_snow, ["snow_24h_summit", "snow_overnight"]] = 0
+        
         df_final["is_powder"] = (df_final["snow_24h_summit"] >= 6)
         
         return df_final.sort_values(["snow_24h_summit", "display_name"], ascending=[False, True]).reset_index(drop=True)
@@ -506,13 +566,14 @@ def prepare_chart_data(df_hist, df_current):
         subset = df_hist[df_hist["temp_disp"] == r_display]
         for d in days:
             qd = pd.Timestamp(d, tz=LOCAL_TZ)
+            # Filter history by the date the data was SCRAPED (query_date)
             row = subset[subset["query_date"].dt.date == d]
             snow = 0.0
             if not row.empty:
                 raw = float(row.iloc[0].get("snow_24h_summit", 0) or 0)
-                mid = datetime(qd.year, qd.month, qd.day, 12, tzinfo=LOCAL_TZ)
-                lu = row.iloc[0]["last_updated_dt"]
-                if raw > 0 and pd.notna(lu) and abs((lu - mid).total_seconds()) / 3600 <= FRESHNESS_TOLERANCE_HOURS:
+                # FIX: ONLY count snow if the report's internal LAST_UPDATED date matches the bar date (d)
+                report_day = row.iloc[0]["last_updated_dt"].date()
+                if raw > 0 and report_day == d:
                     snow = raw
             rows.append({"display_name": r_display, "date": d, "snow": snow})
     
@@ -628,9 +689,17 @@ else:
         y=alt.Y("display_name:N", sort=sorted_names, title=None, axis=alt.Axis(labelColor="white", labelFontSize=14)),
     )
     
+    # Adding Zero Line (Vertical Line at X=0)
+    zero_line = alt.Chart(pd.DataFrame({'zero': [0]})).mark_rule(color='white', size=2).encode(
+        x=alt.X('zero:Q')
+    )
+    
     bars = base.mark_bar().encode(
-        x=alt.X("snow:Q", title="Snow (in)", axis=alt.Axis(labelColor="white", grid=True, tickMinStep=1, format='d'), scale=alt.Scale(domain=[0, max_snow * 1.2])),
-        color=alt.Color("day_label:N", sort=days_order, legend=alt.Legend(labelColor="white", titleColor="white", orient="top"), scale=alt.Scale(range=["#cbd5e1", "#38bdf8", "#a78bfa", "#14b8a6", "#1e40af"])),
+        x=alt.X("snow:Q", title="Snow (in)", 
+                axis=alt.Axis(labelColor="white", grid=False, tickMinStep=1, format='d', 
+                              domain=True, domainColor="white", domainWidth=2),
+                scale=alt.Scale(domain=[0, max_snow * 1.2])),
+        color=alt.Color("day_label:N", title=None, sort=days_order, legend=alt.Legend(labelColor="white", titleColor="white", orient="top", title=None), scale=alt.Scale(range=["#cbd5e1", "#38bdf8", "#a78bfa", "#14b8a6", "#1e40af"])),
         tooltip=["display_name", "day_label", "snow"]
     )
     
@@ -648,14 +717,20 @@ else:
         opacity=alt.condition(alt.datum.snow > 0, alt.value(1), alt.value(0))
     )
     
+    # CALCULATE TOTALS AND ADD CUSTOM LABEL FIELD
     totals = cdf.groupby("display_name", as_index=False)["total_snow"].max()
+    
+    # --- FINAL FIX HERE ---
+    totals['total_label'] = totals['total_snow'].apply(lambda x: f"{x:.0f}\" Total")
+    # ----------------------
+    
     total_text = alt.Chart(totals).mark_text(align='left', dx=5, color='white', fontWeight='bold').encode(
         y=alt.Y("display_name:N", sort=sorted_names),
         x=alt.X("total_snow:Q"),
-        text=alt.Text("total_snow:Q", format=".0f")
+        text=alt.Text("total_label:N"), # Use the new custom column
     )
 
-    st.altair_chart(alt.layer(bars, text, total_text), width="stretch")
+    st.altair_chart(alt.layer(bars, text, total_text, zero_line), width="stretch")
 
 # 4. Map (With Session State Check)
 st.markdown("<div class='section-header'>🗺️ Live Snow Map (Click for Details)</div>", unsafe_allow_html=True)
@@ -665,17 +740,15 @@ map_output = st_folium(m, width="100%", height=700, return_on_hover=False)
 if map_output and map_output.get("last_object_clicked_tooltip"):
     resort_name = map_output["last_object_clicked_tooltip"]
     
-    # Simple state check to prevent infinite rerun loop
     if "last_clicked" not in st.session_state or st.session_state["last_clicked"] != resort_name:
         st.session_state["last_clicked"] = resort_name
         selected_row = df[df["display_name"] == resort_name]
         if not selected_row.empty:
             show_resort_modal(selected_row.iloc[0])
     else:
-        # Logic for same-click: 
-        # Currently we do nothing to avoid loop.
-        # User must click map/other pin to reset state.
-        pass
+        # Logic for same-click: Force state reset for the next run.
+        st.session_state["last_clicked"] = None
+        st.rerun()
 
 # 6. Windy
 st.markdown("<div class='section-header'>🌨️ Regional Forecast Model</div>", unsafe_allow_html=True)
@@ -685,4 +758,4 @@ components.html(
     </div>""", height=570
 )
 
-st.markdown("<br><div style='text-align: center; color: #94a3b8;'>Northern Rockies Snow Report</div>", unsafe_allow_html=True)
+st.markdown("<br><div style='text-align: center; color: #94a3b8;'>Northern Rockies Snow Report • Built with 💙</div>", unsafe_allow_html=True)
