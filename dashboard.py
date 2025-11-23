@@ -702,29 +702,43 @@ st.markdown("<div class='section-header'>📈 5-Day Snowfall Trends</div>", unsa
 cdf = prepare_chart_data(df_hist, df)
 if cdf.empty or cdf["snow"].sum() == 0: st.info("❄️ No 5-day snowfall data available.")
 else:
+    # Calculate max snow for X-axis scaling
     max_snow = cdf.groupby("display_name")["snow"].sum().max()
+    # Sort resorts by total snow (descending)
     sorted_names = cdf.groupby("display_name")["total_snow"].max().sort_values(ascending=False).index.tolist()
+    
+    # Prepare date labels
     days_order = [(datetime.now(LOCAL_TZ).date() - timedelta(days=i)).strftime("%a %m/%d") for i in range(4, -1, -1)]
     cdf["day_label"] = pd.to_datetime(cdf["date"]).dt.strftime("%a %m/%d")
     
+    # --- CHART DEFINITION ---
     base = alt.Chart(cdf).encode(
-        y=alt.Y("display_name:N", sort=sorted_names, title=None, axis=alt.Axis(labelColor="white", labelFontSize=14)),
+        y=alt.Y("display_name:N", 
+                sort=sorted_names, 
+                title=None, 
+                # FIX: Force white text for visibility against dark background
+                axis=alt.Axis(labelColor="white", labelFontSize=14, titleColor="white", tickColor="white", domainColor="white")
+        )
     )
     
-    # Adding Zero Line (Vertical Line at X=0)
-    zero_line = alt.Chart(pd.DataFrame({'zero': [0]})).mark_rule(color='white', size=2).encode(
-        x=alt.X('zero:Q')
-    )
+    # Zero line
+    zero_line = alt.Chart(pd.DataFrame({'zero': [0]})).mark_rule(color='white', size=2).encode(x=alt.X('zero:Q'))
     
+    # Bars
     bars = base.mark_bar().encode(
-        x=alt.X("snow:Q", title="Snow (in)", 
-                axis=alt.Axis(labelColor="white", grid=False, tickMinStep=1, format='d', 
-                              domain=True, domainColor="white", domainWidth=2),
-                scale=alt.Scale(domain=[0, max_snow * 1.2])),
-        color=alt.Color("day_label:N", title=None, sort=days_order, legend=alt.Legend(labelColor="white", titleColor="white", orient="top", title=None), scale=alt.Scale(range=["#cbd5e1", "#38bdf8", "#a78bfa", "#14b8a6", "#1e40af"])),
-        tooltip=["display_name", "day_label", "snow"]
+        x=alt.X("snow:Q", 
+                title="Snow (in)", 
+                # FIX: Force white axis text/lines
+                axis=alt.Axis(labelColor="white", titleColor="white", grid=False, tickMinStep=1, format='d', domainColor="white"),
+                scale=alt.Scale(domain=[0, max_snow * 1.2 if max_snow > 0 else 5])),
+        color=alt.Color("day_label:N", 
+                        title=None, 
+                        sort=days_order, 
+                        legend=alt.Legend(labelColor="white", titleColor="white", orient="top"),
+                        scale=alt.Scale(range=["#cbd5e1", "#38bdf8", "#a78bfa", "#14b8a6", "#1e40af"]))
     )
     
+    # Text labels inside bars
     text = base.transform_stack(
         stack='snow',
         groupby=['display_name'],
@@ -739,20 +753,28 @@ else:
         opacity=alt.condition(alt.datum.snow > 0, alt.value(1), alt.value(0))
     )
     
-    # CALCULATE TOTALS AND ADD CUSTOM LABEL FIELD
+    # Total labels on the right
     totals = cdf.groupby("display_name", as_index=False)["total_snow"].max()
-    
-    # --- FINAL FIX HERE ---
     totals['total_label'] = totals['total_snow'].apply(lambda x: f"{x:.0f}\" Total")
-    # ----------------------
     
-    total_text = alt.Chart(totals).mark_text(align='left', dx=5, color='white', fontWeight='bold').encode(
+    total_text = alt.Chart(totals).mark_text(
+        align='left', 
+        dx=5, 
+        color='white',  # FIX: Ensure totals are white
+        fontWeight='bold'
+    ).encode(
         y=alt.Y("display_name:N", sort=sorted_names),
         x=alt.X("total_snow:Q"),
-        text=alt.Text("total_label:N"), # Use the new custom column
+        text=alt.Text("total_label:N"),
     )
 
-    st.altair_chart(alt.layer(bars, text, total_text, zero_line), width="stretch")
+    # Render chart with fixed height per row to fix spacing
+    chart = alt.layer(bars, text, total_text, zero_line).properties(
+        # FIX: height='step' ensures every resort gets ~40px of space
+        height={"step": 40} 
+    )
+
+    st.altair_chart(chart, use_container_width=True)
 
 # 4. Map (With Session State Check)
 st.markdown("<div class='section-header'>🗺️ Live Snow Map (Click for Details)</div>", unsafe_allow_html=True)
