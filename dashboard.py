@@ -707,7 +707,7 @@ else:
     # Sort resorts by total snow (descending)
     sorted_names = cdf.groupby("display_name")["total_snow"].max().sort_values(ascending=False).index.tolist()
     
-    # Prepare date labels
+    # Prepare date labels (Oldest to Newest for Left-to-Right timeline)
     days_order = [(datetime.now(LOCAL_TZ).date() - timedelta(days=i)).strftime("%a %m/%d") for i in range(4, -1, -1)]
     cdf["day_label"] = pd.to_datetime(cdf["date"]).dt.strftime("%a %m/%d")
     
@@ -716,7 +716,6 @@ else:
         y=alt.Y("display_name:N", 
                 sort=sorted_names, 
                 title=None, 
-                # FIX: Force white text for visibility against dark background
                 axis=alt.Axis(labelColor="white", labelFontSize=14, titleColor="white", tickColor="white", domainColor="white")
         )
     )
@@ -728,11 +727,11 @@ else:
     bars = base.mark_bar().encode(
         x=alt.X("snow:Q", 
                 title="Snow (in)", 
-                # FIX: Force white axis text/lines
                 axis=alt.Axis(labelColor="white", titleColor="white", grid=False, tickMinStep=1, format='d', domainColor="white"),
                 scale=alt.Scale(domain=[0, max_snow * 1.2 if max_snow > 0 else 5])),
         color=alt.Color("day_label:N", 
                         title=None, 
+                        # FIX: Sort by the explicit days_order list (Oldest -> Newest)
                         sort=days_order, 
                         legend=alt.Legend(labelColor="white", titleColor="white", orient="top"),
                         scale=alt.Scale(range=["#cbd5e1", "#38bdf8", "#a78bfa", "#14b8a6", "#1e40af"]))
@@ -742,14 +741,16 @@ else:
     text = base.transform_stack(
         stack='snow',
         groupby=['display_name'],
-        sort=[alt.SortField('day_label', order='ascending')],
+        # FIX: Sort by raw DATE, not the label string, to ensure correct timeline order
+        sort=[alt.SortField('date', order='ascending')],
         as_=['stack_start', 'stack_end']
     ).transform_calculate(
         midpoint="(datum.stack_start + datum.stack_end) / 2"
     ).mark_text(color='black', fontWeight='bold').encode(
         x=alt.X('midpoint:Q'),
         text=alt.Text("snow:Q", format=".0f"),
-        order=alt.Order("day_label:N", sort="ascending"),
+        # FIX: Ensure text order matches bar order
+        order=alt.Order("date:T", sort="ascending"),
         opacity=alt.condition(alt.datum.snow > 0, alt.value(1), alt.value(0))
     )
     
@@ -760,7 +761,7 @@ else:
     total_text = alt.Chart(totals).mark_text(
         align='left', 
         dx=5, 
-        color='white',  # FIX: Ensure totals are white
+        color='white',
         fontWeight='bold'
     ).encode(
         y=alt.Y("display_name:N", sort=sorted_names),
@@ -768,9 +769,8 @@ else:
         text=alt.Text("total_label:N"),
     )
 
-    # Render chart with fixed height per row to fix spacing
+    # Render chart with fixed height per row
     chart = alt.layer(bars, text, total_text, zero_line).properties(
-        # FIX: height='step' ensures every resort gets ~40px of space
         height={"step": 40} 
     )
 
