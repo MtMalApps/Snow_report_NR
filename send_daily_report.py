@@ -461,10 +461,13 @@ class EmailSnowReportMessenger:
                     df = pd.read_csv(csv_file)
                     
                     df['report_date'] = pd.to_datetime(df['date'], format='%Y-%m-%d', errors='coerce')
-                    df['last_updated_dt'] = (
-                        pd.to_datetime(df['last_updated'], format='mixed', errors='coerce')
-                        .dt.date
-                    )
+                    # Fix: Add utc=True to handle mixed timezones and silence the warning
+                    # We convert to UTC first, which ensures we get a valid datetime object
+                    temp_dates = pd.to_datetime(df['last_updated'], format='mixed', errors='coerce', utc=True)
+                    
+                    # Convert to the local timezone (optional, but good for accuracy) 
+                    # or just extract the date. Since we just need the date:
+                    df['last_updated_dt'] = temp_dates.dt.date
                     
                     if df['report_date'].isna().all():
                         raise ValueError("All report_dates are NaT")
