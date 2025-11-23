@@ -553,7 +553,7 @@ def load_historical_data(_db, days=5):
         return df
     except Exception: return pd.DataFrame()
 
-def prepare_chart_data(df_hist, df_current):
+def prepare_chart_datadef prepare_chart_data(df_hist, df_current):
     if df_hist.empty or df_current.empty: return pd.DataFrame()
     resorts = df_current["display_name"].unique().tolist()
     rows = []
@@ -561,6 +561,19 @@ def prepare_chart_data(df_hist, df_current):
     days = [(today - timedelta(days=i)) for i in range(4, -1, -1)]
 
     df_hist["temp_disp"] = df_hist["resort"].apply(get_display_name)
+
+    # --- HELPER: Safely convert strings like 'N/A' or '6"' to float ---
+    def safe_float(val):
+        try:
+            if val is None: return 0.0
+            # Remove quotes and whitespace
+            s = str(val).replace('"', '').strip()
+            # Handle common non-numeric strings
+            if not s or s.lower() in ['n/a', 'none', 'null', '', 'trace']: return 0.0
+            return float(s)
+        except (ValueError, TypeError):
+            return 0.0
+    # ---------------------------------------------------------------
 
     for r_display in resorts:
         subset = df_hist[df_hist["temp_disp"] == r_display]
@@ -570,16 +583,21 @@ def prepare_chart_data(df_hist, df_current):
             row = subset[subset["query_date"].dt.date == d]
             snow = 0.0
             if not row.empty:
-                # NEW: Look for summit, fallback to base if summit is missing/zero
-                val_summit = float(row.iloc[0].get("snow_24h_summit", 0) or 0)
-                val_base = float(row.iloc[0].get("snow_24h_base", 0) or 0)
+                # Use the safe helper instead of direct float conversion
+                val_summit = safe_float(row.iloc[0].get("snow_24h_summit"))
+                val_base = safe_float(row.iloc[0].get("snow_24h_base"))
                 
                 raw = val_summit if val_summit > 0 else val_base
                 
-                # FIX: ONLY count snow if the report's internal LAST_UPDATED date matches the bar date (d)
-                report_day = row.iloc[0]["last_updated_dt"].date()
-                if raw > 0 and report_day == d:
-                    snow = raw
+                # Check date match
+                try:
+                    report_day = row.iloc[0]["last_updated_dt"].date()
+                    if raw > 0 and report_day == d:
+                        snow = raw
+                except Exception:
+                    # If date parsing fails, assume stale and keep snow as 0
+                    pass
+                    
             rows.append({"display_name": r_display, "date": d, "snow": snow})
     
     df = pd.DataFrame(rows)
