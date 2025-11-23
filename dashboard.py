@@ -571,10 +571,11 @@ def prepare_chart_data(df_hist, df_current):
             snow = 0.0
             if not row.empty:
                 # NEW: Look for summit, fallback to base if summit is missing/zero
-				val_summit = float(row.iloc[0].get("snow_24h_summit", 0) or 0)
-				val_base = float(row.iloc[0].get("snow_24h_base", 0) or 0)
-				
-				raw = val_summit if val_summit > 0 else val_base
+                val_summit = float(row.iloc[0].get("snow_24h_summit", 0) or 0)
+                val_base = float(row.iloc[0].get("snow_24h_base", 0) or 0)
+                
+                raw = val_summit if val_summit > 0 else val_base
+                
                 # FIX: ONLY count snow if the report's internal LAST_UPDATED date matches the bar date (d)
                 report_day = row.iloc[0]["last_updated_dt"].date()
                 if raw > 0 and report_day == d:
