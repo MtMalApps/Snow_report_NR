@@ -339,8 +339,9 @@ class EmailSnowReportMessenger:
     """
     Manages email distribution of snow reports with dark theme HTML formatting.
     """
-    def __init__(self, gmail_address: str, credentials_path: str = "credentials.json",
+    def __init__(self, db, gmail_address: str, credentials_path: str = "credentials.json",
                  token_path: str = "token.json"):
+        self.db = db  # <--- NEW: Store the database connection
         self.gmail_address = gmail_address
         self.credentials_path = credentials_path
         self.token_path = token_path
@@ -448,81 +449,117 @@ class EmailSnowReportMessenger:
     # -------------------------------------------------------------------------
 
     def _prepare_chart_data(self, resort_data_list: List[Dict]) -> List[Dict]:
-        """Prepare 5-day snow accumulation chart data from CSV files."""
-        chart_data = []
-        today = datetime.now().date()
-
-        for resort_data in resort_data_list:
-            resort_name = resort_data['resort']
-            csv_file = os.path.join(DATA_DIR, f"{resort_name}_snow_report.csv")
-
+            """
+            Prepare 5-day snow accumulation chart data by querying Firebase history.
+            """
+            chart_data = []
+            today = datetime.now(LOCAL_TZ).date()
+            
+            # 1. Fetch last 5 days of history from Firebase
+            history_map = {}  # { resort_name: { date_obj: snow_amount } }
+            
+            dates_to_check = []
+            for i in range(5):
+                d = today - timedelta(days=i)
+                dates_to_check.append(d)
+    
+            print("📊 Fetching 5-day history from Firebase for charts...")
             try:
-                if os.path.exists(csv_file):
-                    df = pd.read_csv(csv_file)
+                for date_obj in dates_to_check:
+                    date_str = date_obj.strftime("%Y-%m-%d")
                     
-                    df['report_date'] = pd.to_datetime(df['date'], format='%Y-%m-%d', errors='coerce')
-                    # Fix: Add utc=True to handle mixed timezones and silence the warning
-                    # We convert to UTC first, which ensures we get a valid datetime object
-                    temp_dates = pd.to_datetime(df['last_updated'], format='mixed', errors='coerce', utc=True)
+                    # Query Firebase for that specific date
+                    docs = self.db.collection('snow_reports').where('date', '==', date_str).stream()
                     
-                    # Convert to the local timezone (optional, but good for accuracy) 
-                    # or just extract the date. Since we just need the date:
-                    df['last_updated_dt'] = temp_dates.dt.date
-                    
-                    if df['report_date'].isna().all():
-                        raise ValueError("All report_dates are NaT")
+                    for doc in docs:
+                        data = doc.to_dict()
+                        r_name = data.get('resort')
                         
-                    df = df.dropna(subset=['report_date']).sort_values('report_date', ascending=False)
-                    most_recent_update = df['report_date'].iloc[0].date()
-                    days_since_update = (today - most_recent_update).days
-
-                    values = [0] * 5
-                    date_labels = [(today - timedelta(days=i)) for i in range(5)]
-
-                    for i, date in enumerate(date_labels):
-                        day_data = df[df['report_date'].dt.date == date]
+                        if not r_name: 
+                            continue
+    
+                        # --- CRITICAL FIX: CHECK FOR STALE DATA ---
+                        # We must ensure the report's internal 'last_updated' matches the query date.
+                        # Otherwise, we are plotting old snow as new snow.
+                        last_updated_str = data.get('last_updated', '')
+                        is_fresh_for_date = False
                         
-                        if not day_data.empty:
-                            row = day_data.iloc[0]
-                            
-                            is_stale = (row['last_updated_dt'] is pd.NaT) or (row['last_updated_dt'] != date)
-                            if is_stale:
-                                values[i] = 0
-                                continue
-
-                            snow = row['snow_24h_summit']
-                            if pd.isna(snow):
-                                snow = row['snow_24h_base']
-                            if isinstance(snow, str):
-                                snow = snow.replace('"', '').strip()
+                        if last_updated_str and last_updated_str != 'N/A':
                             try:
-                                values[i] = float(snow) if snow else 0
+                                # Try parsing the internal date
+                                # Matches formats like "2025-11-23 08:00 AM" or "2025-11-23 14:00:00"
+                                lu_dt = pd.to_datetime(last_updated_str, errors='coerce')
+                                if pd.notna(lu_dt):
+                                    # Convert to local date to compare
+                                    if lu_dt.tz is None:
+                                        lu_dt = lu_dt.replace(tzinfo=LOCAL_TZ)
+                                    else:
+                                        lu_dt = lu_dt.astimezone(LOCAL_TZ)
+                                    
+                                    if lu_dt.date() == date_obj:
+                                        is_fresh_for_date = True
                             except Exception:
-                                values[i] = 0
-
-                    total = sum(values)
-                    chart_data.append({
-                        'resort': resort_name,
-                        'values': values,
-                        'date_labels': date_labels,
-                        'total': total,
-                        'has_current_data': days_since_update < 2,
-                        'most_recent_update': most_recent_update
-                    })
-                else:
-                    raise FileNotFoundError("No CSV file")
+                                pass
+                        
+                        # If the data isn't actually from this date, skip it (it's a stale scrape)
+                        if not is_fresh_for_date:
+                            continue
+                        # ------------------------------------------
+    
+                        if r_name not in history_map:
+                            history_map[r_name] = {}
+                        
+                        snow_val = 0.0
+                        try:
+                            s_sum = data.get('snow_24h_summit', 0)
+                            s_base = data.get('snow_24h_base', 0)
+                            
+                            def clean_snow(val):
+                                if isinstance(val, (int, float)): return float(val)
+                                if isinstance(val, str):
+                                    val = val.replace('"', '').strip()
+                                    return float(val) if val else 0.0
+                                return 0.0
+    
+                            v_sum = clean_snow(s_sum)
+                            v_base = clean_snow(s_base)
+                            
+                            # Use summit if available, else base
+                            snow_val = v_sum if v_sum > 0 else v_base
+                        except Exception:
+                            snow_val = 0.0
+    
+                        history_map[r_name][date_obj] = snow_val
+    
             except Exception as e:
-                print(f"Chart prep error for {resort_name}: {e}")
+                print(f"⚠️ Error fetching history from Firebase: {e}")
+    
+            # 2. Build the chart data structure
+            for resort_data in resort_data_list:
+                resort_name = resort_data['resort']
+                
+                values = [0] * 5
+                date_labels = dates_to_check
+                
+                r_history = history_map.get(resort_name, {})
+                
+                for i, date_obj in enumerate(date_labels):
+                    if date_obj in r_history:
+                        values[i] = r_history[date_obj]
+                
+                total = sum(values)
+                most_recent_update = today 
+                
                 chart_data.append({
                     'resort': resort_name,
-                    'values': [0, 0, 0, 0, 0],
-                    'date_labels': [today - timedelta(days=i) for i in range(5)],
-                    'total': 0,
-                    'has_current_data': False,
-                    'most_recent_update': None
+                    'values': values,
+                    'date_labels': date_labels,
+                    'total': total,
+                    'has_current_data': True,
+                    'most_recent_update': most_recent_update
                 })
-
-        return chart_data
+    
+            return chart_data
     
     # -------------------------------------------------------------------------
     # HTML GENERATION - HEADER
@@ -1395,6 +1432,7 @@ def main():
     # Initialize messenger and send report
     print("\n📧 Preparing email report...")
     messenger = EmailSnowReportMessenger(
+        db=db,  # <--- NEW: Passing the database object
         gmail_address=gmail_address,
         credentials_path=credentials_path,
         token_path=token_path
