@@ -553,7 +553,7 @@ def load_historical_data(_db, days=5):
         return df
     except Exception: return pd.DataFrame()
 
-def prepare_chart_datadef prepare_chart_data(df_hist, df_current):
+def prepare_chart_data(df_hist, df_current):
     if df_hist.empty or df_current.empty: return pd.DataFrame()
     resorts = df_current["display_name"].unique().tolist()
     rows = []
@@ -595,7 +595,6 @@ def prepare_chart_datadef prepare_chart_data(df_hist, df_current):
                     if raw > 0 and report_day == d:
                         snow = raw
                 except Exception:
-                    # If date parsing fails, assume stale and keep snow as 0
                     pass
                     
             rows.append({"display_name": r_display, "date": d, "snow": snow})
