@@ -630,42 +630,40 @@ class BigMountainScraper(BaseSnowReportScraper):
         
         data = {col: None for col in self.STANDARD_COLUMNS}
         
-        date = None
-        time_str = None
+        # --- DATE PARSING FIX ---
+        # Try to find the date, but default to NOW if we find data but miss the date
+        date_found = False
         for p_tag in soup.find_all('p'):
             strong_tag = p_tag.find('strong')
             if strong_tag:
                 text = strong_tag.text
                 if re.search(r'\w+,\s+\w+\.?\s+\d{1,2},\s+\d{4}', text):
-                    date = text.rstrip(':')
-                elif re.search(r'\d+(?::\d+)?\s*[ap]\.m\.', text, re.IGNORECASE):
-                    time_str = re.search(r'(\d+(?::\d+)?\s*[ap]\.m\.)', text, re.IGNORECASE).group(1)
-                    
-        if date:
-            try:
-                if time_str:
-                    date_str = f"{date} {time_str}"
-                    date_str = date_str.replace('.', '').replace('  ', ' ').strip()
-                    if ':' not in time_str:
-                        date_str = date_str.replace(' am', ':00 am').replace(' pm', ':00 pm')
-                    parsed_date = datetime.strptime(date_str, '%A, %b %d, %Y %I:%M %p')
-                    data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
-                else:
-                    date_str = f"{date} 6:00 AM"
-                    date_str = date_str.replace('.', '').replace('  ', ' ').strip()
-                    parsed_date = datetime.strptime(date_str, '%A, %b %d, %Y %I:%M %p')
-                    data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
-            except ValueError as e:
-                print(f"Error parsing BigMountain date: {e}")
-                if time_str:
-                    data['last_updated'] = f"{date} {time_str}"
-                else:
-                    data['last_updated'] = date
+                    date_found = True
+                    try:
+                        clean_date = text.replace('.', '').replace('  ', ' ').strip().rstrip(':')
+                        # Add default time if missing
+                        if 'm' not in clean_date.lower(): 
+                            clean_date += " 6:00 AM"
+                        
+                        # Normalize format
+                        clean_date = re.sub(r'(\d)(am|pm)', r'\1 \2', clean_date, flags=re.I)
+                        
+                        parsed_date = datetime.strptime(clean_date, '%A, %b %d, %Y %I:%M %p')
+                        data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
+                        break
+                    except:
+                        data['last_updated'] = text
         
+        # --- FALLBACK: If we didn't find a date text, use current time ---
+        if not data['last_updated']:
+            data['last_updated'] = datetime.now().strftime('%Y-%m-%d %I:%M %p')
+        
+        # --- WEATHER ---
         weather_data = self._get_weather_data()
         if weather_data:
             data.update(weather_data)
         
+        # --- SNOW TOTALS ---
         summit_cols = soup.find_all('div', class_='wp-block-column')
         for col in summit_cols:
             h5 = col.find('h5')
