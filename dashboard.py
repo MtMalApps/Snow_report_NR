@@ -233,10 +233,10 @@ def load_css():
     """, unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────────
-# CHART HELPER
+# CHART HELPER (LEGACY IFRAME)
 # ──────────────────────────────────────────────────────────────
 def get_snotel_iframe_html(triplet: str, station_name: str, show_years: str | None) -> str:
-    """Return HTML snippet for NRCS SNOTEL graph."""
+    """Return HTML snippet for NRCS SNOTEL graph (Legacy)."""
     try:
         state = triplet.split(":")[1].strip().upper()
     except Exception:
@@ -264,6 +264,211 @@ def get_snotel_iframe_html(triplet: str, station_name: str, show_years: str | No
       ></iframe>
     </div>
     """
+
+# ──────────────────────────────────────────────────────────────
+# NEW SNOTEL CHARTING LOGIC (ALTAIR)
+# ──────────────────────────────────────────────────────────────
+def parse_snotel_history(history_list):
+    """
+    Convert the raw history list from Firebase into a Pandas DataFrame
+    ready for Altair charting.
+    """
+    if not history_list:
+        return pd.DataFrame()
+        
+    data = []
+    # Calculate hourly snowfall from total depth changes
+    # We sort just in case
+    sorted_hist = sorted(history_list, key=lambda x: x.get('timestamp', ''))
+    
+    prev_depth = None
+    
+    for entry in sorted_hist:
+        ts_str = entry.get('timestamp')
+        if not ts_str: continue
+        
+        # Parse timestamp
+        try:
+            # Handles "2025-11-26 10:00" format
+            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+            
+        depth = entry.get('snow_depth')
+        temp = entry.get('temp')
+        
+        # Calculate hourly delta (new snow)
+        # If depth increases, it's new snow. If it decreases (settling), we clamp to 0 for the bar chart
+        hourly_snow = 0.0
+        if prev_depth is not None and depth is not None:
+            delta = depth - prev_depth
+            if delta > 0:
+                hourly_snow = delta
+        
+        # Update prev for next loop
+        if depth is not None:
+            prev_depth = depth
+            
+        data.append({
+            'time': dt,
+            'total_depth': depth,
+            'hourly_snow': hourly_snow,
+            'temp': temp
+        })
+        
+    return pd.DataFrame(data)
+
+def render_snotel_charts(history_df):
+    """
+    Render the 48-hour Storm Signature charts using Altair.
+    STYLE: Classic Line (No Fill), No leading zeros in time.
+    FIXED: Right-side alignment and 32F label visibility.
+    """
+    if history_df.empty:
+        st.caption("No hourly history available for charting.")
+        return
+
+    # Shared padding ensures the charts align vertically
+    # We give extra room on the right (65px) for the Depth axis and the 32F label
+    SHARED_PADDING = {"left": 10, "top": 10, "right": 65, "bottom": 20}
+
+    # Shared X-Axis Config
+    x_axis_config = alt.Axis(
+        format='%-I %p',      
+        labelAngle=-45,
+        tickCount=48,         
+        grid=False,           
+        domain=True,          
+        domainColor="#cbd5e1",
+        domainWidth=1,
+        labelColor="#94a3b8",
+        title=None
+    )
+
+    # 1. SNOTEL SNOW PROFILE
+    base = alt.Chart(history_df).encode(
+        x=alt.X('time:T', axis=x_axis_config)
+    )
+
+    # Bar Chart (Hourly Snow)
+    bars = base.mark_bar(
+        color='#38bdf8', 
+        opacity=0.7,
+        width=8,
+        cornerRadiusTopLeft=2, 
+        cornerRadiusTopRight=2
+    ).encode(
+        y=alt.Y('hourly_snow:Q', 
+            title="Hourly (in)",
+            axis=alt.Axis(
+                titleColor='#38bdf8', 
+                grid=False,
+                domain=True, 
+                domainColor="#cbd5e1"
+            )
+        ),
+        tooltip=[
+            alt.Tooltip('time', format='%a %-I:%M %p', title="Time"), 
+            alt.Tooltip('hourly_snow', title="Hourly Snow (in)"),
+            alt.Tooltip('total_depth', title="Total Depth (in)")
+        ]
+    )
+
+    # Line Chart (Total Depth)
+    line = base.mark_line(
+        color='white', 
+        strokeWidth=2,
+        interpolate='monotone' 
+    ).encode(
+        y=alt.Y('total_depth:Q', 
+            title="Total Depth (in)",
+            scale=alt.Scale(zero=False, padding=5),
+            axis=alt.Axis(
+                titleColor='white', 
+                labelColor='white',
+                grid=True, 
+                gridOpacity=0.1, 
+                gridDash=[4,4],
+                domain=True,       
+                domainColor="white"
+            )
+        )
+    )
+
+    snow_chart = alt.layer(bars, line).resolve_scale(
+        y='independent'
+    ).properties(
+        height=300, 
+        padding=SHARED_PADDING, # <--- SYNCED PADDING
+        title=alt.TitleParams("SNOTEL Snow Profile (48h)", color='white', fontSize=16, anchor='start')
+    )
+    
+    st.altair_chart(snow_chart, width="stretch")
+
+    # 2. SNOTEL TEMPERATURE TREND
+    if history_df['temp'].notna().any():
+        min_t = history_df['temp'].min()
+        max_t = history_df['temp'].max()
+        y_dom = [min_t - 5, max_t + 5] if pd.notna(min_t) else [0, 40]
+
+        temp_base = alt.Chart(history_df).encode(
+            x=alt.X('time:T', axis=x_axis_config)
+        )
+        
+        temp_line = temp_base.mark_line(
+            strokeWidth=3,
+            interpolate='monotone'
+        ).encode(
+            y=alt.Y('temp:Q', 
+                title="Temp (°F)", 
+                scale=alt.Scale(domain=y_dom),
+                axis=alt.Axis(
+                    labelColor="#cbd5e1", 
+                    titleColor="#cbd5e1", 
+                    grid=True, 
+                    gridOpacity=0.1,
+                    domain=True, 
+                    domainColor="#cbd5e1"
+                )
+            ),
+            color=alt.condition(
+                alt.datum.temp <= 32,
+                alt.value("#60a5fa"),  # Blue if freezing
+                alt.value("#f472b6")   # Pink if warm
+            ),
+            tooltip=[
+                alt.Tooltip('time', format='%a %-I:%M %p', title="Time"), 
+                alt.Tooltip('temp', title="Temp (°F)")
+            ]
+        )
+        
+        # Freeze line at 32
+        freeze_rule = alt.Chart(pd.DataFrame({'y': [32]})).mark_rule(
+            color='#94a3b8', strokeDash=[2, 2], strokeWidth=1
+        ).encode(y='y')
+        
+        # Label for 32F - Pushed to the right into the padding area
+        freeze_text = alt.Chart(pd.DataFrame({
+            'y': [32], 
+            'x': [history_df['time'].iloc[-1]] # Attach to last time point
+        })).mark_text(
+            align='left',      # Align text to start at the point
+            baseline='middle', 
+            dx=6,              # Push it 6px to the right (into the padding)
+            text='32°F', 
+            color='#94a3b8', 
+            fontSize=11,
+            fontWeight='bold'
+        ).encode(x='x', y='y')
+
+        temp_chart = (temp_line + freeze_rule + freeze_text).properties(
+            height=200,
+            padding=SHARED_PADDING, # <--- SYNCED PADDING
+            title=alt.TitleParams("SNOTEL Temperature Trend", color='#cbd5e1', fontSize=14, anchor='start')
+        )
+
+        st.altair_chart(temp_chart, width="stretch")
+
 
 # ──────────────────────────────────────────────────────────────
 # MODAL (DIALOG) LOGIC
@@ -313,90 +518,108 @@ def show_resort_modal(row):
             st.info(f"📝 {row['comments']}")
 
     with tab2:
-        s_name = snotel.get('station_name', 'Station N/A')
-        if "snotel" not in s_name.lower(): s_name += " SNOTEL"
-        
-        elev = snotel.get('elevation', '')
-        if elev: s_name += f" ({elev} ft)"
-        
-        val_obs_raw = snotel.get('latest_observation', 'N/A')
-        val_obs_display = val_obs_raw
-        try:
-            if len(val_obs_raw) > 10:
-                dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d %H:%M")
-                val_obs_display = dt_obs.strftime("%b %d, %I:%M %p")
+            s_name = snotel.get('station_name', 'Station N/A')
+            if "snotel" not in s_name.lower(): s_name += " SNOTEL"
+            
+            elev = snotel.get('elevation', '')
+            if elev: s_name += f" ({elev} ft)"
+            
+            val_obs_raw = snotel.get('latest_observation', 'N/A')
+            val_obs_display = val_obs_raw
+            try:
+                if len(val_obs_raw) > 10:
+                    dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d %H:%M")
+                    val_obs_display = dt_obs.strftime("%b %d, %I:%M %p")
+                else:
+                    dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d")
+                    val_obs_display = dt_obs.strftime("%b %d, %Y")
+            except: pass
+                
+            st.markdown(f"""
+            <div style="line-height: 1.2; margin-bottom: 15px;">
+                <div style="font-size: 1.5rem; font-weight: 700; color: white; line-height: 1.0;">{s_name}</div>
+                <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 4px;">Observed: {val_obs_display}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            if snotel.get('unavailable') is True:
+                st.error(f"Data Unavailable: {snotel.get('error_reason', 'Unknown error')}")
+            
+            val_snow = snotel.get('snow_depth', 'N/A')
+            if isinstance(val_snow, (int, float)): val_snow = f"{val_snow}\""
+                
+            val_swe = snotel.get('swe', 'N/A')
+            if isinstance(val_swe, (int, float)): val_swe = f"{val_swe}\""
+    
+            # Use new total fields if available, otherwise fallback
+            val_total_depth = snotel.get('snotel_total_depth', 'N/A')
+            if isinstance(val_total_depth, (int, float)): val_total_depth = f"{val_total_depth}\""
+            
+            val_total_swe = snotel.get('snotel_total_swe', 'N/A')
+            if isinstance(val_total_swe, (int, float)): val_total_swe = f"{val_total_swe}\""
+    
+            val_density = snotel.get('density', 'N/A')
+            val_qual = snotel.get('snow_category', 'N/A')
+            
+            pct_raw = snotel.get('percent_of_median', 'N/A')
+            val_pct = f"{pct_raw}%" if (str(pct_raw) != "N/A" and pct_raw is not None) else "N/A"
+            
+            density_display = "N/A" if val_density == "N/A" else f"{val_density}<div class='data-sub'>{val_qual}</div>"
+    
+            # --- 1. METRICS GRID (TOP) ---
+            st.markdown(f"""
+            <div class="data-grid">
+                <div class="data-item">
+                    <div class="data-label">24h Snow</div>
+                    <div class="data-value">{val_snow}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Total Depth</div>
+                    <div class="data-value">{val_total_depth}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">24h SWE</div>
+                    <div class="data-value">{val_swe}</div>
+                </div>
+                 <div class="data-item">
+                    <div class="data-label">Total SWE</div>
+                    <div class="data-value">{val_total_swe}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Density</div>
+                    <div class="data-value">{density_display}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Median %</div>
+                    <div class="data-value">{val_pct}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+    
+            # --- 2. NEW CHARTS (MIDDLE) ---
+            history_list = snotel.get('history', [])
+            if history_list:
+                hist_df = parse_snotel_history(history_list)
+                render_snotel_charts(hist_df)
+                st.markdown("---")
+    
+            # --- 3. IFRAME CHART (BOTTOM) ---
+            triplet = snotel.get("triplet")
+            station_name = snotel.get("station_name")
+            
+            if triplet and station_name:
+                col_input, col_label = st.columns([1, 2])
+                with col_input:
+                    compare_year = st.text_input("Compare Year:", placeholder="e.g. 2011", key=f"year_{row['display_name']}")
+                with col_label:
+                    st.write("") 
+    
+                html = get_snotel_iframe_html(triplet, station_name, compare_year)
+                components.html(html, height=440, scrolling=False)
             else:
-                dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d")
-                val_obs_display = dt_obs.strftime("%b %d, %Y")
-        except: pass
-            
-        st.markdown(f"""
-        <div style="line-height: 1.2; margin-bottom: 15px;">
-            <div style="font-size: 1.5rem; font-weight: 700; color: white; line-height: 1.0;">{s_name}</div>
-            <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 4px;">Observed: {val_obs_display}</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        if snotel.get('unavailable') is True:
-            st.error(f"Data Unavailable: {snotel.get('error_reason', 'Unknown error')}")
-        
-        val_snow = snotel.get('snow_depth', 'N/A')
-        if isinstance(val_snow, (int, float)): val_snow = f"{val_snow}\""
-            
-        val_swe = snotel.get('swe', 'N/A')
-        if isinstance(val_swe, (int, float)): val_swe = f"{val_swe}\""
-
-        val_density = snotel.get('density', 'N/A')
-        val_qual = snotel.get('snow_category', 'N/A')
-        
-        pct_raw = snotel.get('percent_of_median', 'N/A')
-        if str(pct_raw) == "N/A" or pct_raw is None:
-            val_pct = "N/A"
-        else:
-            val_pct = f"{pct_raw}%"
-        
-        if val_density == "N/A":
-             density_display = "N/A"
-        else:
-             density_display = f"{val_density}<div class='data-sub'>{val_qual}</div>"
-
-        st.markdown(f"""
-        <div class="data-grid">
-            <div class="data-item">
-                <div class="data-label">24h Snow</div>
-                <div class="data-value">{val_snow}</div>
-            </div>
-            <div class="data-item">
-                <div class="data-label">24h SWE</div>
-                <div class="data-value">{val_swe}</div>
-            </div>
-            <div class="data-item">
-                <div class="data-label">Density</div>
-                <div class="data-value">{density_display}</div>
-            </div>
-            <div class="data-item">
-                <div class="data-label">Median %</div>
-                <div class="data-value">{val_pct}</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        triplet = snotel.get("triplet")
-        station_name = snotel.get("station_name")
-        
-        if triplet and station_name:
-            col_input, col_label = st.columns([1, 2])
-            with col_input:
-                compare_year = st.text_input("Compare Year:", placeholder="e.g. 2011", key=f"year_{row['display_name']}")
-            with col_label:
-                st.write("") 
-
-            html = get_snotel_iframe_html(triplet, station_name, compare_year)
-            components.html(html, height=440, scrolling=False)
-        else:
-            st.info("Chart unavailable (Missing triplet ID)")
+                st.info("Chart unavailable (Missing triplet ID)")
 
     with tab3:
         st.markdown("### 48-Hour Weather Outlook")
@@ -614,8 +837,8 @@ def load_historical_data(_db, days=5):
         for d in dates:
             docs = (
                 _db.collection("snow_reports")
-                   .where(filter=firestore.FieldFilter("date", "==", d))
-                   .stream()
+                    .where(filter=firestore.FieldFilter("date", "==", d))
+                    .stream()
             )
             for doc in docs:
                 r = doc.to_dict()
