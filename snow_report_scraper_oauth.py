@@ -1640,7 +1640,7 @@ class RedLodgeScraper(BaseSnowReportScraper):
 class SNOTELDataFetcher:
     """
     Fetches backcountry snow data from SNOTEL stations via the AWDB REST API.
-    Uses HOURLY data to calculate real-time 24-hour snow totals (catching early morning storms).
+    Uses HOURLY data to build a history of Snow Depth, SWE, and Temperature.
     """
     STATION_INFO = {
             # Existing
@@ -1721,203 +1721,193 @@ class SNOTELDataFetcher:
             'elevation': elevation,
             'snow_depth': 'N/A',
             'swe': 'N/A',
+            'snotel_total_depth': 'N/A',
+            'snotel_total_swe': 'N/A', 
             'density': 'N/A',
             'percent_of_median': 'N/A', 
             'snow_category': 'N/A',
             'latest_observation': latest_observation,
+            'history': [], # Empty history list
             'unavailable': bool(error_reason),
             'error_reason': error_reason 
         }
 
-    def _calculate_24h_delta(self, values_list: List[Dict]) -> Optional[tuple]:
-            """
-            Helper to find the most recent reading and the reading 24h ago.
-            Returns (current_val, prev_val, current_date) or None.
-            values_list example: [{'date': '2025-11-19 06:00:00', 'value': 12.5}, ...]
-            """
-            if not values_list or len(values_list) < 2:
-                return None
-                
-            # Helper to parse date strings that might lack seconds
-            def parse_date(date_str):
-                for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
-                    try:
-                        return datetime.strptime(date_str, fmt)
-                    except ValueError:
-                        continue
-                raise ValueError(f"Date format not recognized: {date_str}")
-    
-            # Sort by date just in case the API returns them out of order
-            # We use the helper here to ensure sorting works regardless of format
-            try:
-                sorted_values = sorted(values_list, key=lambda x: parse_date(x['date']))
-            except Exception:
-                # Fallback to string sort if parsing fails during sort
-                sorted_values = sorted(values_list, key=lambda x: x['date'])
-            
-            # Get the very last reading (most recent)
-            current = sorted_values[-1]
-            current_date_str = current['date']
-            current_val = current['value']
-            
-            try:
-                curr_dt = parse_date(current_date_str)
-                target_prev_dt = curr_dt - timedelta(hours=24)
-                
-                # Find reading closest to target_prev_dt
-                prev_val = None
-                min_diff = float('inf')
-                
-                for entry in sorted_values:
-                    try:
-                        entry_dt = parse_date(entry['date'])
-                        # We only care about readings roughly 24h ago (allow small variance)
-                        diff = abs((entry_dt - target_prev_dt).total_seconds())
-                        
-                        # If within 1.5 hours (5400 seconds) of the target time
-                        if diff < 5400: 
-                            if diff < min_diff:
-                                min_diff = diff
-                                prev_val = entry['value']
-                    except ValueError:
-                        continue # Skip malformed dates in the list
-                
-                if prev_val is not None:
-                    return (current_val, prev_val, current_date_str)
-                    
-            except Exception as e:
-                self._log.warning(f"Error calculating delta: {e}")
-                
-            return None
-
     def get_snowfall_report(self, resort_name: str):
-        # This single-fetch method is rarely used now that we batch, 
-        # but we update it for consistency.
-        # (Simplified to just return empty to save space, assuming batch is primary)
-        # Real implementation would mirror the batch logic below.
+        # Fallback method, rarely used. Returns empty struct to be safe.
         return self._create_empty_report(error_reason="Use batch fetch")
 
     def get_all_snowfall_reports(self) -> Dict[str, Dict]:
-            """
-            Fetches HOURLY SNOTEL data for all stations.
-            Calculates real-time 24-hour change.
-            """
-            self._log.info("Starting batch SNOTEL API fetch (HOURLY)...")
-            triplet_to_resort = {v['triplet']: k for k, v in self.STATION_INFO.items()}
-            all_triplets = ",".join(triplet_to_resort.keys())
-            
-            # We need yesterday and today to capture the full 24h window + buffer
-            url = (
-                "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
-                f"?stationTriplets={all_triplets}"
-                "&elements=WTEQ,SNWD"
-                "&duration=HOURLY"
-                "&beginDate=-1"     # Yesterday
-                "&endDate=0"        # Today
-            )
-            
-            final_reports = {}
-            try:
-                resp = self.session.get(url, timeout=self._timeout)
-                resp.raise_for_status()
-                api_data_list = resp.json()
+                """
+                Fetches HOURLY SNOTEL data for all stations.
+                Collects history (SNWD, WTEQ, TOBS) and calculates 24h deltas.
+                """
+                self._log.info("Starting batch SNOTEL API fetch (HOURLY)...")
+                triplet_to_resort = {v['triplet']: k for k, v in self.STATION_INFO.items()}
+                all_triplets = ",".join(triplet_to_resort.keys())
                 
-                if not api_data_list:
-                    raise ValueError("API response was empty.")
+                # --- FIX: Calculate explicit date instead of using relative "-2" ---
+                # This forces the API to respect our window regardless of server time
+                from datetime import datetime, timedelta
+                start_dt = datetime.now() - timedelta(days=2)
+                begin_date_str = start_dt.strftime("%Y-%m-%d")
                 
-                for station_data in api_data_list:
-                    triplet = station_data.get('stationTriplet')
-                    resort_name = triplet_to_resort.get(triplet)
+                url = (
+                    "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
+                    f"?stationTriplets={all_triplets}"
+                    "&elements=WTEQ,SNWD,TOBS"
+                    "&duration=HOURLY"
+                    f"&beginDate={begin_date_str}"  # Explicit start date
+                    "&endDate=9999-12-31"           # Explicit end date (force to current)
+                )
+                
+                final_reports = {}
+                try:
+                    resp = self.session.get(url, timeout=self._timeout)
+                    resp.raise_for_status()
+                    api_data_list = resp.json()
                     
-                    if not resort_name:
-                        continue
+                    if not api_data_list:
+                        raise ValueError("API response was empty.")
                     
-                    station_name = self.STATION_INFO[resort_name]['name']
-                    station_elev = self.STATION_INFO[resort_name]['elevation']
-                    
-                    # Parse the hourly data series
-                    snwd_series = []
-                    wteq_series = []
-                    
-                    for element_data in station_data.get('data', []):
-                        element_code = element_data['stationElement']['elementCode'].lower()
-                        values = element_data.get('values', [])
+                    for station_data in api_data_list:
+                        triplet = station_data.get('stationTriplet')
+                        resort_name = triplet_to_resort.get(triplet)
                         
-                        if element_code == 'snwd':
-                            snwd_series = values
-                        elif element_code == 'wteq':
-                            wteq_series = values
+                        if not resort_name:
+                            continue
+                        
+                        station_name = self.STATION_INFO[resort_name]['name']
+                        station_elev = self.STATION_INFO[resort_name]['elevation']
+                        
+                        # Store series by timestamp to merge them
+                        history_map = {}
+                        
+                        def get_or_create(ts):
+                            if ts not in history_map:
+                                history_map[ts] = {"timestamp": ts, "snow_depth": None, "swe": None, "temp": None}
+                            return history_map[ts]
     
-                    # --- FIX: Get Timestamp FIRST ---
-                    # Grab the latest time from the raw data, even if delta calc fails later
-                    obs_time = "N/A"
-                    if snwd_series:
-                        obs_time = snwd_series[-1].get('date', "N/A")
-                    elif wteq_series:
-                        # Fallback to WTEQ time if SNWD is missing
-                        obs_time = wteq_series[-1].get('date', "N/A")
+                        for element_data in station_data.get('data', []):
+                            element_code = element_data['stationElement']['elementCode'].lower()
+                            values = element_data.get('values', [])
+                            
+                            for v in values:
+                                date_str = v.get('date')
+                                val = v.get('value')
+                                if not date_str: continue
+                                
+                                entry = get_or_create(date_str)
+                                
+                                if element_code == 'snwd':
+                                    entry['snow_depth'] = val
+                                elif element_code == 'wteq':
+                                    entry['swe'] = val
+                                elif element_code == 'tobs':
+                                    entry['temp'] = val
     
-                    # Calculate Deltas
-                    snow_delta_data = self._calculate_24h_delta(snwd_series)
-                    swe_delta_data = self._calculate_24h_delta(wteq_series)
-                    
-                    snow_change = None
-                    swe_change = None
+                        # Convert map to sorted list
+                        full_history = sorted(history_map.values(), key=lambda x: x['timestamp'])
+                        
+                        # Ensure we don't upload too much if the query returns tons of data
+                        # (Last 48 entries is roughly 2 days of hourly data)
+                        recent_history = full_history[-48:] if len(full_history) > 48 else full_history
     
-                    if snow_delta_data:
-                        curr, prev, delta_time = snow_delta_data
-                        # If calc succeeded, update time to match the specific delta point used
-                        obs_time = delta_time 
-                        if curr is not None and prev is not None:
-                            snow_change = round(curr - prev, 1)
-                    
-                    if swe_delta_data:
-                        curr, prev, _ = swe_delta_data
-                        if curr is not None and prev is not None:
-                            swe_change = round(curr - prev, 2)
+                        # --- CALCULATE 24H SUMMARY METRICS ---
+                        obs_time = "N/A"
+                        total_depth = None
+                        total_swe = None
+                        snow_change = None
+                        swe_change = None
+                        
+                        if recent_history:
+                            latest = recent_history[-1]
+                            obs_time = latest['timestamp']
+                            total_depth = latest['snow_depth']
+                            total_swe = latest['swe']
+                            
+                            # Find 24h ago
+                            try:
+                                # Parse formatting
+                                fmt_opts = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M']
+                                latest_dt = None
+                                for f in fmt_opts:
+                                    try:
+                                        latest_dt = datetime.strptime(latest['timestamp'], f)
+                                        break
+                                    except: pass
+                                
+                                if latest_dt:
+                                    target_dt = latest_dt - timedelta(hours=24)
+                                    prev_depth = None
+                                    prev_swe = None
+                                    min_diff = 5400 # 1.5 hours in seconds
+                                    
+                                    for h in recent_history:
+                                        try:
+                                            h_dt = None
+                                            for f in fmt_opts:
+                                                try:
+                                                    h_dt = datetime.strptime(h['timestamp'], f)
+                                                    break
+                                                except: pass
+                                            
+                                            if h_dt:
+                                                diff = abs((h_dt - target_dt).total_seconds())
+                                                if diff < min_diff:
+                                                    min_diff = diff
+                                                    prev_depth = h['snow_depth']
+                                                    prev_swe = h['swe']
+                                        except: continue
+                                    
+                                    if total_depth is not None and prev_depth is not None:
+                                        snow_change = round(total_depth - prev_depth, 1)
+                                    
+                                    if total_swe is not None and prev_swe is not None:
+                                        swe_change = round(total_swe - prev_swe, 2)
+                            except Exception as e:
+                                self._log.warning(f"Error calculating summary delta for {resort_name}: {e}")
     
-                    # Calculate Density
-                    density = None
-                    # Ensure we have positive snow accumulation to calculate density
-                    if snow_change is not None and swe_change is not None and snow_change > 0.5 and swe_change > 0.01:
-                        density = round((swe_change / snow_change) * 100, 1)
-                    
-                    percent_of_median = "N/A" 
-    
-                    # Determine if there is new snow
-                    is_new_snow = (density is not None)
-    
-                    report = {
-                        'station_name': station_name,
-                        'triplet': triplet,
-                        'elevation': station_elev,
-                        'snow_depth': snow_change if snow_change is not None else 0,
-                        'swe': swe_change if swe_change is not None else 0,
-                        'density': density if is_new_snow else 'N/A',
-                        'percent_of_median': percent_of_median,
-                        'snow_category': self._snow_category(density) if is_new_snow else 'N/A',
-                        'latest_observation': obs_time,
-                        'unavailable': False,
-                        'error_reason': None if is_new_snow else "No new snow"
-                    }
-                    
-                    final_reports[resort_name] = report
-    
-            except Exception as e:
-                self._log.error(f"SNOTEL batch API fetch error: {e}", exc_info=True)
-                # Fallback loop is handled by the main loop missing keys
-            
-            # Fill missing resorts with empty reports
-            for resort_name in self.STATION_INFO.keys():
-                if resort_name not in final_reports:
-                    final_reports[resort_name] = self._create_empty_report(
-                        station_name=self.STATION_INFO[resort_name]['name'], 
-                        error_reason='batch_api_fail', 
-                        triplet=self.STATION_INFO[resort_name]['triplet'],
-                        elevation=self.STATION_INFO[resort_name]['elevation']
-                    )
-                    
-            return final_reports
+                        # Calculate Density
+                        density = None
+                        if snow_change is not None and swe_change is not None and snow_change > 0.5 and swe_change > 0.01:
+                            density = round((swe_change / snow_change) * 100, 1)
+                        
+                        percent_of_median = "N/A" 
+                        is_new_snow = (density is not None)
+        
+                        report = {
+                            'station_name': station_name,
+                            'triplet': triplet,
+                            'elevation': station_elev,
+                            'snow_depth': snow_change if snow_change is not None else 0,
+                            'swe': swe_change if swe_change is not None else 0,
+                            'snotel_total_depth': total_depth if total_depth is not None else 0, 
+                            'snotel_total_swe': total_swe if total_swe is not None else 0,
+                            'density': density if is_new_snow else 'N/A',
+                            'percent_of_median': percent_of_median,
+                            'snow_category': self._snow_category(density) if is_new_snow else 'N/A',
+                            'latest_observation': obs_time,
+                            'history': recent_history,
+                            'unavailable': False,
+                            'error_reason': None if is_new_snow else "No new snow"
+                        }
+                        
+                        final_reports[resort_name] = report
+        
+                except Exception as e:
+                    self._log.error(f"SNOTEL batch API fetch error: {e}", exc_info=True)
+                
+                # Fill missing resorts
+                for resort_name in self.STATION_INFO.keys():
+                    if resort_name not in final_reports:
+                        final_reports[resort_name] = self._create_empty_report(
+                            station_name=self.STATION_INFO[resort_name]['name'], 
+                            error_reason='batch_api_fail', 
+                            triplet=self.STATION_INFO[resort_name]['triplet'],
+                            elevation=self.STATION_INFO[resort_name]['elevation']
+                        )
+                        
+                return final_reports
 
 # =============================================================================
 # MAIN EXECUTION
