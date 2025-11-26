@@ -193,7 +193,7 @@ def get_latest_resort_data_from_firebase(db: firestore.Client) -> List[Dict]:
         return []
 
 # =============================================================================
-# STALE DATA LOGIC (mirrors dashboard behavior)
+# STALE DATA LOGIC (mirrors dashboard-style behavior)
 # =============================================================================
 
 def apply_stale_logic_to_resorts(resort_data_list: List[Dict]) -> List[Dict]:
@@ -201,6 +201,7 @@ def apply_stale_logic_to_resorts(resort_data_list: List[Dict]) -> List[Dict]:
     Apply seasonal and freshness logic to resort data so that:
     - Data from a previous season (before Oct 1 of current season) has ALL snow and depth set to 0.
     - Data from this season but older than FRESHNESS_TOLERANCE_HOURS has 24h/overnight snow cleared but keeps depths.
+    - Also computes snow_24h_display = max(24h_summit, 24h_base) for unified use.
     """
     if not resort_data_list:
         return resort_data_list
@@ -209,6 +210,19 @@ def apply_stale_logic_to_resorts(resort_data_list: List[Dict]) -> List[Dict]:
 
     if "last_updated" not in df.columns:
         return resort_data_list
+
+    # Ensure numeric snow/depth columns exist and are numeric
+    num_cols = [
+        "snow_24h_summit",
+        "snow_24h_base",
+        "base_depth",
+        "summit_depth",
+        "snow_overnight",
+    ]
+    for col in num_cols:
+        if col not in df.columns:
+            df[col] = 0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     # Parse last_updated to timezone-aware datetimes in LOCAL_TZ
     dt = pd.to_datetime(df["last_updated"], format="mixed", errors="coerce")
@@ -247,13 +261,16 @@ def apply_stale_logic_to_resorts(resort_data_list: List[Dict]) -> List[Dict]:
     age_hours = (now_dt - df["last_updated_dt"]).dt.total_seconds() / 3600
     is_fresh_snow = age_hours < FRESHNESS_TOLERANCE_HOURS
 
-    fresh_snow_cols = ["snow_24h_summit", "snow_overnight"]
+    fresh_snow_cols = ["snow_24h_summit", "snow_24h_base", "snow_overnight"]
     for col in fresh_snow_cols:
         if col in df.columns:
             df.loc[is_from_this_season & ~is_fresh_snow, col] = 0
 
-    # Optionally store a date-only version for other logic
+    # Store a date-only version for sorting / dashboard-style logic
     df["last_updated_date"] = df["last_updated_dt"].dt.date
+
+    # Unified 24h snow (summit vs base) for email & charts
+    df["snow_24h_display"] = df[["snow_24h_summit", "snow_24h_base"]].max(axis=1)
 
     return df.to_dict(orient="records")
 
@@ -341,7 +358,7 @@ class EmailSnowReportMessenger:
     """
     def __init__(self, db, gmail_address: str, credentials_path: str = "credentials.json",
                  token_path: str = "token.json"):
-        self.db = db  # <--- NEW: Store the database connection
+        self.db = db  # Store the database connection
         self.gmail_address = gmail_address
         self.credentials_path = credentials_path
         self.token_path = token_path
@@ -352,7 +369,7 @@ class EmailSnowReportMessenger:
     # UTILITY METHODS
     # -------------------------------------------------------------------------
     def _fmt_inches(self, value) -> str:
-        """Format inches with single quote mark."""
+        """Format inches with quote mark."""
         if value is None:
             return ""
         s = str(value).strip()
@@ -378,7 +395,18 @@ class EmailSnowReportMessenger:
         return s
     
     def get_24hr_snow(self, resort_data: Dict) -> float:
-        """Extract 24-hour snow amount (prefer summit, fallback base)."""
+        """
+        Extract 24-hour snow amount using the unified snow_24h_display
+        (max of summit/base), falling back to raw fields if needed.
+        """
+        # Prefer normalized, numeric snow_24h_display when present
+        if "snow_24h_display" in resort_data:
+            try:
+                return float(resort_data.get("snow_24h_display") or 0)
+            except (ValueError, TypeError):
+                pass
+
+        # Fallback: parse from summit/base fields
         try:
             snow = resort_data.get('snow_24h_summit') or resort_data.get('snow_24h_base', '0')
             snow = ''.join(c for c in str(snow) if c.isdigit() or c == '.')
@@ -387,25 +415,47 @@ class EmailSnowReportMessenger:
             return 0.0
     
     def get_master_sort_key(self, resort_data: Dict) -> tuple:
-        """Sort key: fresh first, then by snow amount (desc), then recency, then name."""
-        resort_name = resort_data.get('resort', '')
-        today = datetime.now().date()
-        
-        last_updated_str = resort_data.get('last_updated', '')
-        last_updated_date = None
-        if last_updated_str and last_updated_str != 'N/A':
-            for fmt in ('%Y-%m-%d %I:%M %p', '%Y-%m-%d %H:%M %p'):
+            """
+            Sort key similar to dashboard:
+            - Resorts with any report come first.
+            - Newest last_updated_date (date-only) first.
+            - Then by 24h snow (desc).
+            - Then by display name.
+            """
+            resort_name = resort_data.get('resort', '')
+            display_name = self._get_display_name(resort_name)
+    
+            last_updated_str = resort_data.get('last_updated', '') or ''
+            has_report = bool(last_updated_str and last_updated_str != 'N/A')
+    
+            # Use last_updated_date from stale logic if available
+            lud = resort_data.get("last_updated_date")
+            
+            # Handle various date formats (String, Datetime, or Pandas Timestamp)
+            if isinstance(lud, str):
                 try:
-                    last_updated_date = datetime.strptime(last_updated_str, fmt).date()
-                    break
+                    lud = datetime.fromisoformat(lud).date()
                 except ValueError:
-                    continue
-        
-        snow_amount = self.get_24hr_snow(resort_data)
-        is_fresh = 0 if (last_updated_date == today) else 1
-        snow_sort = -float(snow_amount)
-        date_sort = -(last_updated_date.toordinal() if last_updated_date else 0)
-        return (is_fresh, snow_sort, date_sort, resort_name)
+                    lud = None
+            elif isinstance(lud, datetime):
+                lud = lud.date()
+    
+            # --- FIX STARTS HERE ---
+            # NaT objects have toordinal() but raise ValueError when called.
+            try:
+                date_ord = lud.toordinal() if hasattr(lud, "toordinal") else 0
+            except (ValueError, AttributeError):
+                date_ord = 0
+            # --- FIX ENDS HERE ---
+    
+            snow_amount = self.get_24hr_snow(resort_data)
+    
+            return (
+                0 if has_report else 1,       # has_report first
+                -date_ord,                    # newest date first
+                -float(snow_amount),          # more snow first
+                display_name                  # tie-break on name
+            )
 
     def _get_display_name(self, resort_name: str) -> str:
         """Get display-friendly resort name."""
@@ -423,7 +473,7 @@ class EmailSnowReportMessenger:
 
     def _check_powder_alert(self, resort_data_list: List[Dict]) -> bool:
         """Check if any resort has powder alert worthy snow."""
-        today = datetime.now().date()
+        today = datetime.now(LOCAL_TZ).date()
         for resort_data in resort_data_list:
             last_updated_str = resort_data.get('last_updated', '')
             if not last_updated_str:
@@ -449,117 +499,115 @@ class EmailSnowReportMessenger:
     # -------------------------------------------------------------------------
 
     def _prepare_chart_data(self, resort_data_list: List[Dict]) -> List[Dict]:
-            """
-            Prepare 5-day snow accumulation chart data by querying Firebase history.
-            """
-            chart_data = []
-            today = datetime.now(LOCAL_TZ).date()
-            
-            # 1. Fetch last 5 days of history from Firebase
-            history_map = {}  # { resort_name: { date_obj: snow_amount } }
-            
-            dates_to_check = []
-            for i in range(5):
-                d = today - timedelta(days=i)
-                dates_to_check.append(d)
-    
-            print("📊 Fetching 5-day history from Firebase for charts...")
-            try:
-                for date_obj in dates_to_check:
-                    date_str = date_obj.strftime("%Y-%m-%d")
+        """
+        Prepare 5-day snow accumulation chart data by querying Firebase history,
+        mirroring dashboard logic:
+        - For each resort & query date, use max(24h_summit, 24h_base) for that day.
+        - Only count snow if the internal last_updated date matches that date.
+        """
+        chart_data: List[Dict] = []
+        today = datetime.now(LOCAL_TZ).date()
+        
+        # 1. Fetch last 5 days of history from Firebase
+        history_map: Dict[str, Dict[datetime.date, float]] = {}  # { resort_name: { date_obj: snow_amount } }
+        
+        dates_to_check: List[datetime.date] = []
+        for i in range(5):
+            d = today - timedelta(days=i)
+            dates_to_check.append(d)
+
+        print("📊 Fetching 5-day history from Firebase for charts...")
+        try:
+            for date_obj in dates_to_check:
+                date_str = date_obj.strftime("%Y-%m-%d")
+                
+                # Query Firebase for that specific date
+                docs = self.db.collection('snow_reports').where('date', '==', date_str).stream()
+                
+                for doc in docs:
+                    data = doc.to_dict()
+                    r_name = data.get('resort')
                     
-                    # Query Firebase for that specific date
-                    docs = self.db.collection('snow_reports').where('date', '==', date_str).stream()
+                    if not r_name: 
+                        continue
+
+                    # --- Check for stale data on that query date ---
+                    last_updated_str = data.get('last_updated', '')
+                    is_fresh_for_date = False
                     
-                    for doc in docs:
-                        data = doc.to_dict()
-                        r_name = data.get('resort')
-                        
-                        if not r_name: 
-                            continue
-    
-                        # --- CRITICAL FIX: CHECK FOR STALE DATA ---
-                        # We must ensure the report's internal 'last_updated' matches the query date.
-                        # Otherwise, we are plotting old snow as new snow.
-                        last_updated_str = data.get('last_updated', '')
-                        is_fresh_for_date = False
-                        
-                        if last_updated_str and last_updated_str != 'N/A':
-                            try:
-                                # Try parsing the internal date
-                                # Matches formats like "2025-11-23 08:00 AM" or "2025-11-23 14:00:00"
-                                lu_dt = pd.to_datetime(last_updated_str, errors='coerce')
-                                if pd.notna(lu_dt):
-                                    # Convert to local date to compare
-                                    if lu_dt.tz is None:
-                                        lu_dt = lu_dt.replace(tzinfo=LOCAL_TZ)
-                                    else:
-                                        lu_dt = lu_dt.astimezone(LOCAL_TZ)
-                                    
-                                    if lu_dt.date() == date_obj:
-                                        is_fresh_for_date = True
-                            except Exception:
-                                pass
-                        
-                        # If the data isn't actually from this date, skip it (it's a stale scrape)
-                        if not is_fresh_for_date:
-                            continue
-                        # ------------------------------------------
-    
-                        if r_name not in history_map:
-                            history_map[r_name] = {}
-                        
-                        snow_val = 0.0
+                    if last_updated_str and last_updated_str != 'N/A':
                         try:
-                            s_sum = data.get('snow_24h_summit', 0)
-                            s_base = data.get('snow_24h_base', 0)
-                            
-                            def clean_snow(val):
-                                if isinstance(val, (int, float)): return float(val)
-                                if isinstance(val, str):
-                                    val = val.replace('"', '').strip()
-                                    return float(val) if val else 0.0
-                                return 0.0
-    
-                            v_sum = clean_snow(s_sum)
-                            v_base = clean_snow(s_base)
-                            
-                            # Use summit if available, else base
-                            snow_val = v_sum if v_sum > 0 else v_base
+                            lu_dt = pd.to_datetime(last_updated_str, errors='coerce')
+                            if pd.notna(lu_dt):
+                                if lu_dt.tz is None:
+                                    lu_dt = lu_dt.replace(tzinfo=LOCAL_TZ)
+                                else:
+                                    lu_dt = lu_dt.astimezone(LOCAL_TZ)
+                                
+                                if lu_dt.date() == date_obj:
+                                    is_fresh_for_date = True
                         except Exception:
-                            snow_val = 0.0
-    
-                        history_map[r_name][date_obj] = snow_val
-    
-            except Exception as e:
-                print(f"⚠️ Error fetching history from Firebase: {e}")
-    
-            # 2. Build the chart data structure
-            for resort_data in resort_data_list:
-                resort_name = resort_data['resort']
-                
-                values = [0] * 5
-                date_labels = dates_to_check
-                
-                r_history = history_map.get(resort_name, {})
-                
-                for i, date_obj in enumerate(date_labels):
-                    if date_obj in r_history:
-                        values[i] = r_history[date_obj]
-                
-                total = sum(values)
-                most_recent_update = today 
-                
-                chart_data.append({
-                    'resort': resort_name,
-                    'values': values,
-                    'date_labels': date_labels,
-                    'total': total,
-                    'has_current_data': True,
-                    'most_recent_update': most_recent_update
-                })
-    
-            return chart_data
+                            pass
+                    
+                    # If the data isn't actually from this date, skip it
+                    if not is_fresh_for_date:
+                        continue
+
+                    if r_name not in history_map:
+                        history_map[r_name] = {}
+                    
+                    snow_val = 0.0
+                    try:
+                        s_sum = data.get('snow_24h_summit', 0)
+                        s_base = data.get('snow_24h_base', 0)
+                        
+                        def clean_snow(val):
+                            if isinstance(val, (int, float)):
+                                return float(val)
+                            if isinstance(val, str):
+                                val = val.replace('"', '').strip()
+                                return float(val) if val else 0.0
+                            return 0.0
+
+                        v_sum = clean_snow(s_sum)
+                        v_base = clean_snow(s_base)
+                        
+                        # Use max(summit, base) for that day (dashboard-style)
+                        snow_val = max(v_sum, v_base)
+                    except Exception:
+                        snow_val = 0.0
+
+                    history_map[r_name][date_obj] = snow_val
+
+        except Exception as e:
+            print(f"⚠️ Error fetching history from Firebase: {e}")
+
+        # 2. Build the chart data structure
+        for resort_data in resort_data_list:
+            resort_name = resort_data['resort']
+            
+            values = [0.0] * 5
+            date_labels = dates_to_check
+            
+            r_history = history_map.get(resort_name, {})
+            
+            for i, date_obj in enumerate(date_labels):
+                if date_obj in r_history:
+                    values[i] = r_history[date_obj]
+            
+            total = float(sum(values))
+            most_recent_update = today  # not used for sorting in email, but kept for completeness
+            
+            chart_data.append({
+                'resort': resort_name,
+                'values': values,
+                'date_labels': date_labels,
+                'total': total,
+                'has_current_data': True,
+                'most_recent_update': most_recent_update
+            })
+
+        return chart_data
     
     # -------------------------------------------------------------------------
     # HTML GENERATION - HEADER
@@ -666,7 +714,7 @@ class EmailSnowReportMessenger:
     def _generate_powder_alert_banner(self, sorted_resorts: List[Dict]) -> str:
         """Generate powder alert banner with resort badges."""
         powder_resorts = []
-        today = datetime.now().date()
+        today = datetime.now(LOCAL_TZ).date()
         
         for resort_data in sorted_resorts:
             last_updated_str = resort_data.get('last_updated', '')
@@ -703,12 +751,42 @@ class EmailSnowReportMessenger:
                 f"{resort['name']} &middot; {resort['snow']}\""
                 '</span>'
             )
+        
+        # --- START MODIFICATION FOR UNIVERSAL UNICODE ICON ---
+        CONTAINER_BG = "#0d1b31"
+        HIGHLIGHT_STYLE = "display:inline-flex; align-items:center; background:rgba(255, 255, 255, 0.1); padding:4px 8px; border-radius:6px;"
+        
+        # Use a simple Unicode snowflake (❄️) that email clients won't block
+        UNICODE_ICON = f'<span style="font-size:16px; color:{EmailTheme.TEXT_WHITE}; margin-right:6px;">❄️</span>'
+
+        highlighted_title = f"""
+            <span style="{HIGHLIGHT_STYLE}">
+                {UNICODE_ICON}
+                <div>
+                    <div style="font-weight:800; color:{EmailTheme.TEXT_WHITE}; font-size:16px;">
+                        POWDER ALERT
+                    </div>
+                    <div style="font-size:12px; font-weight:400; color:{EmailTheme.TEXT_PRIMARY}; margin-top:2px;">
+                        (&ge; {POWDER_ALERT_THRESHOLD}" in last 24 hrs)
+                    </div>
+                </div>
+            </span>
+        """
+        # --- END MODIFICATION FOR UNIVERSAL UNICODE ICON ---
 
         return f"""
           <tr>
-            <td style="padding:16px 24px; background:#051d33; border-bottom:1px solid {EmailTheme.BORDER_SUBTLE};">
-              <div style="font-family:Arial, Helvetica, sans-serif; font-size:14px; color:{EmailTheme.TEXT_PRIMARY}; line-height:1.5;">
-                <div style="font-weight:800; color:{EmailTheme.TEXT_WHITE}; margin-bottom:6px;">Powder Alert (&ge; {POWDER_ALERT_THRESHOLD}" in last 24 hrs)</div>
+            <td style="padding:16px 24px; background:{CONTAINER_BG}; border-bottom:1px solid {EmailTheme.BORDER_SUBTLE};">
+              <div style="font-family:Arial, Helvetica, sans-serif; line-height:1.5;">
+                
+                <div style="margin-bottom:12px;">
+                    {highlighted_title}
+                </div>
+                
+                <div style="font-weight:800; color:{EmailTheme.TEXT_PRIMARY}; font-size:14px; margin-bottom:6px;">
+                    Resorts with Fresh Snow:
+                </div>
+                
                 <div style="display:flex; flex-wrap:wrap; margin: -4px;">
                   {''.join(badges_html)}
                 </div>
@@ -716,7 +794,6 @@ class EmailSnowReportMessenger:
             </td>
           </tr>
         """
-    
     # -------------------------------------------------------------------------
     # HTML GENERATION - SUMMARY TABLE WITH CHARTS
     # -------------------------------------------------------------------------
@@ -735,7 +812,7 @@ class EmailSnowReportMessenger:
                 </tr>
                 """]
         
-        today = datetime.now().date()
+        today = datetime.now(LOCAL_TZ).date()
         
         for resort_data in sorted_resorts:
             resort_name = resort_data['resort']
@@ -1025,9 +1102,9 @@ class EmailSnowReportMessenger:
             value = resort_data.get(field_key)
             if value is None or str(value).strip().lower() in ('', 'none', 'n/a', '0', '0.0'):
                 if is_current and field_key in ['snow_24h_base', 'snow_24h_summit', 'snow_overnight'] and str(value) == '0':
-                     pass
+                    pass
                 else:
-                     continue
+                    continue
             
             if field_key in ['snow_24h_base', 'snow_24h_summit', 'snow_overnight', 'base_depth', 'summit_depth']:
                 formatted_value = self._fmt_inches(value)
@@ -1168,7 +1245,7 @@ class EmailSnowReportMessenger:
         if 'Powder' in str(snow_quality):
             badge_html = f'<div style="margin-top:8px; display:inline-block; background:{EmailTheme.SNOTEL_POWDER_BG}; color:{EmailTheme.SNOTEL_POWDER_TEXT}; padding:4px 8px; border-radius:999px; font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:700;">{snow_quality}</div>'
         elif snow_depth != 'melting/settling' and snow_depth_numeric > 0:
-                badge_html = f'<div style="margin-top:8px; display:inline-block; background:#eab308; color:#0b1220; padding:4px 8px; border-radius:999px; font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:700;">{snow_quality}</div>'
+            badge_html = f'<div style="margin-top:8px; display:inline-block; background:#eab308; color:#0b1220; padding:4px 8px; border-radius:999px; font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:700;">{snow_quality}</div>'
         else:
             badge_html = f'<div style="margin-top:8px; display:inline-block; background:{EmailTheme.SNOTEL_HISTORIC_BG}; color:{EmailTheme.SNOTEL_HISTORIC_TEXT}; padding:4px 8px; border-radius:999px; font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:700;">—</div>'
 
@@ -1292,10 +1369,10 @@ class EmailSnowReportMessenger:
             print("No subscribers found")
             return
         
-        # Apply stale logic so email matches dashboard behavior
+        # Apply stale logic so email matches dashboard-style behavior
         resort_data_list = apply_stale_logic_to_resorts(resort_data_list)
         
-        # Sort resorts
+        # Sort resorts using unified sort key
         sorted_resorts = sorted(resort_data_list, key=self.get_master_sort_key)
         
         # Check powder alert
@@ -1432,7 +1509,7 @@ def main():
     # Initialize messenger and send report
     print("\n📧 Preparing email report...")
     messenger = EmailSnowReportMessenger(
-        db=db,  # <--- NEW: Passing the database object
+        db=db,
         gmail_address=gmail_address,
         credentials_path=credentials_path,
         token_path=token_path
