@@ -320,154 +320,392 @@ def parse_snotel_history(history_list):
 
 def render_snotel_charts(history_df):
     """
-    Render the 48-hour Storm Signature charts using Altair.
-    STYLE: Classic Line (No Fill), No leading zeros in time.
-    FIXED: Right-side alignment and 32F label visibility.
+    Render SNOTEL 'storm signature' charts for the last ~48 hours:
+      0) Storm summary tiles (storm total, depth, temps)
+      1) Snow profile: total depth + hourly new snow
+      2) Temperature trend: line + powder band + freeze line
+
+    Designed to match the dark, neon-themed dashboard.
     """
     if history_df.empty:
         st.caption("No hourly history available for charting.")
         return
 
-    # Shared padding ensures the charts align vertically
-    # We give extra room on the right (65px) for the Depth axis and the 32F label
-    SHARED_PADDING = {"left": 10, "top": 10, "right": 65, "bottom": 20}
+    df = history_df.copy()
 
-    # Shared X-Axis Config
-    x_axis_config = alt.Axis(
-        format='%-I %p',      
-        labelAngle=-45,
-        tickCount=48,         
-        grid=False,           
-        domain=True,          
-        domainColor="#cbd5e1",
-        domainWidth=1,
-        labelColor="#94a3b8",
-        title=None
+    # Ensure we have time column
+    if "time" not in df.columns:
+        st.caption("No time data available for charting.")
+        return
+
+    # Clean + enforce types
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"])
+    if df.empty:
+        st.caption("No valid timestamp values after parsing.")
+        return
+
+    for col in ["total_depth", "hourly_snow", "temp"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Sort by time
+    df = df.sort_values("time")
+
+    # Trim to last ~48 hours if history is long
+    t_min = df["time"].min()
+    t_max = df["time"].max()
+    if pd.notna(t_min) and pd.notna(t_max):
+        span = t_max - t_min
+        if span > pd.Timedelta(hours=60):
+            cutoff = t_max - pd.Timedelta(hours=48)
+            df = df[df["time"] >= cutoff]
+
+    if df.empty:
+        st.caption("No recent data in the last 48 hours.")
+        return
+
+    # Recompute min/max after trimming
+    t_min = df["time"].min()
+    t_max = df["time"].max()
+
+    # ------------------------------------------------------------------
+    # 0. STORM SUMMARY (TOP)
+    # ------------------------------------------------------------------
+    # Storm total (only positive hourly_snow)
+    if "hourly_snow" in df.columns:
+        storm_total = float(df["hourly_snow"].fillna(0).clip(lower=0).sum())
+    else:
+        storm_total = float("nan")
+
+    # Depth change & current depth
+    depth_start = (
+        float(df["total_depth"].dropna().iloc[0])
+        if "total_depth" in df.columns and df["total_depth"].notna().any()
+        else float("nan")
+    )
+    depth_end = (
+        float(df["total_depth"].dropna().iloc[-1])
+        if "total_depth" in df.columns and df["total_depth"].notna().any()
+        else float("nan")
+    )
+    depth_change = (
+        depth_end - depth_start
+        if not math.isnan(depth_start) and not math.isnan(depth_end)
+        else float("nan")
     )
 
-    # 1. SNOTEL SNOW PROFILE
-    base = alt.Chart(history_df).encode(
-        x=alt.X('time:T', axis=x_axis_config)
+    # Time span
+    span_hours = (df["time"].max() - df["time"].min()).total_seconds() / 3600.0
+    span_hours_int = max(1, int(round(span_hours))) if span_hours > 0 else 0
+
+    # Temp stats
+    has_temp = "temp" in df.columns and df["temp"].notna().any()
+    if has_temp:
+        temp_min = float(df["temp"].min())
+        temp_max = float(df["temp"].max())
+    else:
+        temp_min = temp_max = float("nan")
+
+    # Formatting helpers
+    storm_total_display = (
+        f"{storm_total:.1f}\"" if not math.isnan(storm_total) and storm_total > 0 else "0.0\""
+    )
+    span_display = f"Last {span_hours_int} hours" if span_hours_int > 0 else "Recent period"
+
+    if not math.isnan(depth_change):
+        if abs(depth_change) < 0.05:
+            depth_change_display = "Flat"
+        else:
+            sign = "+" if depth_change > 0 else "–"
+            depth_change_display = f"{sign}{abs(depth_change):.1f}\""
+    else:
+        depth_change_display = "N/A"
+
+    depth_end_display = (
+        f"{depth_end:.1f}\""
+        if not math.isnan(depth_end)
+        else "N/A"
     )
 
-    # Bar Chart (Hourly Snow)
-    bars = base.mark_bar(
-        color='#38bdf8', 
-        opacity=0.7,
-        width=8,
-        cornerRadiusTopLeft=2, 
-        cornerRadiusTopRight=2
+    if not math.isnan(temp_min) and not math.isnan(temp_max):
+        temp_range = f"{temp_min:.0f}° / {temp_max:.0f}°"
+        if temp_max <= 32:
+            temp_comment = "All below freezing"
+        elif temp_min < 32 < temp_max:
+            temp_comment = "Crossed the freezing line"
+        else:
+            temp_comment = "Mostly above freezing"
+    else:
+        temp_range = "N/A"
+        temp_comment = "No temperature data"
+
+    # Summary row using existing grid styles
+    st.markdown(
+        f"""
+        <div class="data-grid" style="margin-bottom: 0.75rem;">
+            <div class="data-item">
+                <div class="data-label">Storm Total</div>
+                <div class="data-value">{storm_total_display}</div>
+                <div class="data-sub">{span_display}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">Depth</div>
+                <div class="data-value">{depth_end_display}</div>
+                <div class="data-sub">Change: {depth_change_display}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">Temperature</div>
+                <div class="data-value">{temp_range}</div>
+                <div class="data-sub">{temp_comment}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Build 2-hour tick positions for the x-axis
+    # ------------------------------------------------------------------
+    # Guard: if for some reason t_min/t_max are NaT, fall back to default axis
+    if pd.isna(t_min) or pd.isna(t_max):
+        tick_values = None
+    else:
+        # Floor to the previous full hour, ceil to the next full hour
+        start_floor = t_min.floor("H")
+        stop_ceil = t_max.ceil("H")
+        tick_range = pd.date_range(start=start_floor, end=stop_ceil, freq="2H")
+        tick_values = tick_range.to_pydatetime().tolist()
+
+    if tick_values:
+        x_axis = alt.Axis(
+            format="%-I %p",
+            labelAngle=-40,
+            labelColor="#94a3b8",
+            title=None,
+            grid=False,
+            values=tick_values,
+            domain=True,
+            domainColor="#64748b",
+            tickColor="#64748b",
+        )
+    else:
+        # Fallback: let Altair decide
+        x_axis = alt.Axis(
+            format="%-I %p",
+            labelAngle=-40,
+            labelColor="#94a3b8",
+            title=None,
+            grid=False,
+            domain=True,
+            domainColor="#64748b",
+            tickColor="#64748b",
+        )
+
+    SHARED_PADDING = {"left": 40, "right": 40, "top": 10, "bottom": 30}
+
+    # ------------------------------------------------------------------
+    # 1. STORM SIGNATURE: TOTAL DEPTH + HOURLY NEW SNOW
+    # ------------------------------------------------------------------
+    base_snow = alt.Chart(df).encode(
+        x=alt.X("time:T", axis=x_axis)
+    )
+
+    # Depth area + line (subtle shading)
+    depth_area = base_snow.mark_area(
+        color="#0f172a",  # subtle dark shade, matches app background
+        opacity=0.55,
+        line={"color": "#e5e7eb", "strokeWidth": 2.8},
     ).encode(
-        y=alt.Y('hourly_snow:Q', 
-            title="Hourly (in)",
+        y=alt.Y(
+            "total_depth:Q",
+            title="Total Depth (in)",
+            scale=alt.Scale(zero=False, nice=True),
             axis=alt.Axis(
-                titleColor='#38bdf8', 
-                grid=False,
-                domain=True, 
-                domainColor="#cbd5e1"
-            )
+                labelColor="#e5e7eb",
+                titleColor="#e5e7eb",
+                grid=True,
+                gridOpacity=0.15,
+                gridColor="#334155",
+                domain=True,
+                domainColor="#64748b",
+            ),
         ),
         tooltip=[
-            alt.Tooltip('time', format='%a %-I:%M %p', title="Time"), 
-            alt.Tooltip('hourly_snow', title="Hourly Snow (in)"),
-            alt.Tooltip('total_depth', title="Total Depth (in)")
-        ]
+            alt.Tooltip("time:T", title="Time", format="%a %-I:%M %p"),
+            alt.Tooltip("total_depth:Q", title="Total Depth (in)", format=".1f"),
+        ],
     )
 
-    # Line Chart (Total Depth)
-    line = base.mark_line(
-        color='white', 
-        strokeWidth=2,
-        interpolate='monotone' 
-    ).encode(
-        y=alt.Y('total_depth:Q', 
-            title="Total Depth (in)",
-            scale=alt.Scale(zero=False, padding=5),
-            axis=alt.Axis(
-                titleColor='white', 
-                labelColor='white',
-                grid=True, 
-                gridOpacity=0.1, 
-                gridDash=[4,4],
-                domain=True,       
-                domainColor="white"
+    # Bars for hourly new snow; only positive values
+    bars = (
+        base_snow.transform_filter("datum.hourly_snow > 0.005")
+        .mark_bar(
+            width=8,
+            opacity=0.9,
+            cornerRadiusTopLeft=3,
+            cornerRadiusTopRight=3,
+            color="#38bdf8",
+        )
+        .encode(
+            y=alt.Y(
+                "hourly_snow:Q",
+                title="Hourly New Snow (in)",
+                axis=alt.Axis(
+                    labelColor="#38bdf8",
+                    titleColor="#38bdf8",
+                    grid=False,
+                    domain=True,
+                    domainColor="#38bdf8",
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("time:T", title="Time", format="%a %-I:%M %p"),
+                alt.Tooltip("hourly_snow:Q", title="Hourly New Snow (in)", format=".2f"),
+                alt.Tooltip("total_depth:Q", title="Total Depth (in)", format=".1f"),
+            ],
+        )
+    )
+
+    storm_title = "48-Hour Storm Profile"
+
+    snow_chart = (
+        alt.layer(depth_area, bars)
+        .resolve_scale(y="independent")
+        .properties(
+            height=260,
+            padding=SHARED_PADDING,
+            title=alt.TitleParams(
+                storm_title,
+                color="#e5e7eb",
+                fontSize=15,
+                anchor="start",
+            ),
+            background="transparent",
+        )
+    )
+
+    st.altair_chart(snow_chart, use_container_width=True)
+
+    # ------------------------------------------------------------------
+    # 2. TEMPERATURE TREND: LINE + POWDER BAND + FREEZE LINE
+    # ------------------------------------------------------------------
+    if has_temp:
+        temp_df = df.dropna(subset=["temp"])
+        if temp_df.empty:
+            return
+
+        t_min_val = float(temp_df["temp"].min())
+        t_max_val = float(temp_df["temp"].max())
+        y_min = math.floor(t_min_val - 3)
+        y_max = math.ceil(t_max_val + 3)
+
+        base_temp = alt.Chart(temp_df).encode(
+            x=alt.X("time:T", axis=x_axis)
+        )
+
+        # Powder band (approx 10–25°F)
+        band_df = pd.DataFrame(
+            {
+                "x1": [temp_df["time"].min()],
+                "x2": [temp_df["time"].max()],
+                "y1": [10],
+                "y2": [25],
+            }
+        )
+        powder_band = (
+            alt.Chart(band_df)
+            .mark_rect(color="#22c55e", opacity=0.10)
+            .encode(
+                x="x1:T",
+                x2="x2:T",
+                y="y1:Q",
+                y2="y2:Q",
             )
         )
-    )
 
-    snow_chart = alt.layer(bars, line).resolve_scale(
-        y='independent'
-    ).properties(
-        height=300, 
-        padding=SHARED_PADDING, # <--- SYNCED PADDING
-        title=alt.TitleParams("SNOTEL Snow Profile (48h)", color='white', fontSize=16, anchor='start')
-    )
-    
-    st.altair_chart(snow_chart, width="stretch")
-
-    # 2. SNOTEL TEMPERATURE TREND
-    if history_df['temp'].notna().any():
-        min_t = history_df['temp'].min()
-        max_t = history_df['temp'].max()
-        y_dom = [min_t - 5, max_t + 5] if pd.notna(min_t) else [0, 40]
-
-        temp_base = alt.Chart(history_df).encode(
-            x=alt.X('time:T', axis=x_axis_config)
-        )
-        
-        temp_line = temp_base.mark_line(
+        temp_line = base_temp.mark_line(
             strokeWidth=3,
-            interpolate='monotone'
+            interpolate="monotone",
         ).encode(
-            y=alt.Y('temp:Q', 
-                title="Temp (°F)", 
-                scale=alt.Scale(domain=y_dom),
+            y=alt.Y(
+                "temp:Q",
+                title="Temperature (°F)",
+                scale=alt.Scale(domain=[y_min, y_max]),
                 axis=alt.Axis(
-                    labelColor="#cbd5e1", 
-                    titleColor="#cbd5e1", 
-                    grid=True, 
-                    gridOpacity=0.1,
-                    domain=True, 
-                    domainColor="#cbd5e1"
-                )
+                    labelColor="#cbd5e1",
+                    titleColor="#cbd5e1",
+                    grid=True,
+                    gridOpacity=0.15,
+                    gridColor="#334155",
+                    domain=True,
+                    domainColor="#64748b",
+                ),
             ),
             color=alt.condition(
                 alt.datum.temp <= 32,
-                alt.value("#60a5fa"),  # Blue if freezing
-                alt.value("#f472b6")   # Pink if warm
+                alt.value("#60a5fa"),  # blue if freezing or below
+                alt.value("#f97316"),  # orange if above freezing
             ),
             tooltip=[
-                alt.Tooltip('time', format='%a %-I:%M %p', title="Time"), 
-                alt.Tooltip('temp', title="Temp (°F)")
-            ]
-        )
-        
-        # Freeze line at 32
-        freeze_rule = alt.Chart(pd.DataFrame({'y': [32]})).mark_rule(
-            color='#94a3b8', strokeDash=[2, 2], strokeWidth=1
-        ).encode(y='y')
-        
-        # Label for 32F - Pushed to the right into the padding area
-        freeze_text = alt.Chart(pd.DataFrame({
-            'y': [32], 
-            'x': [history_df['time'].iloc[-1]] # Attach to last time point
-        })).mark_text(
-            align='left',      # Align text to start at the point
-            baseline='middle', 
-            dx=6,              # Push it 6px to the right (into the padding)
-            text='32°F', 
-            color='#94a3b8', 
-            fontSize=11,
-            fontWeight='bold'
-        ).encode(x='x', y='y')
-
-        temp_chart = (temp_line + freeze_rule + freeze_text).properties(
-            height=200,
-            padding=SHARED_PADDING, # <--- SYNCED PADDING
-            title=alt.TitleParams("SNOTEL Temperature Trend", color='#cbd5e1', fontSize=14, anchor='start')
+                alt.Tooltip("time:T", title="Time", format="%a %-I:%M %p"),
+                alt.Tooltip("temp:Q", title="Temp (°F)", format=".1f"),
+            ],
         )
 
-        st.altair_chart(temp_chart, width="stretch")
+        # Freeze line at 32°F
+        freeze_line_df = pd.DataFrame({"y": [32]})
+        freeze_line = (
+            alt.Chart(freeze_line_df)
+            .mark_rule(color="#94a3b8", strokeDash=[3, 3], strokeWidth=1)
+            .encode(y="y:Q")
+        )
+
+        freeze_label = (
+            alt.Chart(
+                pd.DataFrame(
+                    {
+                        "y": [32],
+                        "x": [temp_df["time"].max()],
+                        "label": ["32°F"],
+                    }
+                )
+            )
+            .mark_text(
+                align="left",
+                baseline="middle",
+                dx=6,
+                color="#94a3b8",
+                fontSize=11,
+                fontWeight="bold",
+            )
+            .encode(
+                x="x:T",
+                y="y:Q",
+                text="label:N",
+            )
+        )
+
+        temp_chart = (
+            alt.layer(powder_band, temp_line, freeze_line, freeze_label)
+            .properties(
+                height=200,
+                padding=SHARED_PADDING,
+                title=alt.TitleParams(
+                    "SNOTEL Temperature Trend",
+                    color="#cbd5e1",
+                    fontSize=14,
+                    anchor="start",
+                ),
+                background="transparent",
+            )
+        )
+
+        st.altair_chart(temp_chart, use_container_width=True)
+    else:
+        st.caption("No temperature data available for this station.")
+
+
 
 
 # ──────────────────────────────────────────────────────────────
