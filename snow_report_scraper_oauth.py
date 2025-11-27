@@ -8,6 +8,7 @@ Features:
 - CSV backup storage
 - SNOTEL backcountry data integration (Density & Category)
 - Powder alert notifications (configurable threshold)
+- UNIVERSAL STALE DATA DETECTION (Zombie Check)
 
 Environment Variables Required:
 - GMAIL_ADDRESS: Your Gmail address for sending reports
@@ -28,12 +29,9 @@ from math import ceil
 import sys
 import warnings  # to suppress Pandas warnings in output
 from nws_storm_outlook_v3 import NWSStormOutlook
-#from googleapiclient.errors import HttpError
-#from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from zoneinfo import ZoneInfo
-
-
-
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # =============================================================================
 # CONFIGURATION
@@ -41,7 +39,6 @@ from zoneinfo import ZoneInfo
 
 # Powder Alert Threshold (inches of snow in 24 hours)
 POWDER_ALERT_THRESHOLD = 6
-# Resort coordinates for NWS forecasts
 # Resort coordinates for NWS forecasts
 RESORT_COORDS = {
     # Existing
@@ -91,78 +88,33 @@ def normalize_text(s: str) -> str:
     
     return s
 
-
-
 # =============================================================================
-# BASE SCRAPER CLASS
+# BASE SCRAPER CLASS (WITH UNIVERSAL STALENESS CHECK)
 # =============================================================================
 class BaseSnowReportScraper(ABC):
     """
     Abstract base class for ski resort snow report scrapers.
-    All resort-specific scrapers inherit from this class.
+    Includes Universal 'Zombie Data' Detection.
     """
 
     STANDARD_COLUMNS = [
-        # Core metadata
-        'resort',               # Resort name
-        'date',                 # Date data were accessed (YYYY-MM-DD)
-        'timestamp',            # Time data were accessed (YYYY-MM-DD HH:MM:SS)
-        'last_updated',         # Resort's reported last update time
-
-        # Snowfall measurements
-        'snow_overnight',
-        'snow_24h_base',
-        'snow_24h_summit',
-        'snow_48h_base',
-        'snow_48h_summit',
-        'snow_7day',
-
-        # Snow depth
-        'base_depth',
-        'summit_depth',
-
-        # Temperatures
-        'temp_base',
-        'temp_summit',
-
-        # Wind
-        'wind_speed',
-
-        # Conditions
-        'conditions_surface',
-        'weather_current',
-
-        # Operations
-        'lifts_open',
-        'runs_open',
-
-        # Notes
-        'comments',
-
-        # --- DATA QUALITY FLAG ---
-        # "api_ok", "api_offseason", "html_fallback"
-        'data_source',
-
-        # --- DASHBOARD EXTRA FIELDS ---
-        'nws_forecast',
-        'snotel_data',
-
-        # Old NWS legacy fields (kept for backward compatibility)
-        'forecast_base_temp_high',
-        'forecast_base_temp_low',
-        'forecast_summit_temp_high',
-        'forecast_summit_temp_low',
-        'forecast_precipitation',
-        'forecast_snow',
+        'resort', 'date', 'timestamp', 'last_updated',
+        'snow_overnight', 'snow_24h_base', 'snow_24h_summit',
+        'snow_48h_base', 'snow_48h_summit', 'snow_7day',
+        'base_depth', 'summit_depth',
+        'temp_base', 'temp_summit', 'wind_speed',
+        'conditions_surface', 'weather_current',
+        'lifts_open', 'runs_open',
+        'comments', 'data_source',
+        'nws_forecast', 'snotel_data',
+        'forecast_base_temp_high', 'forecast_base_temp_low',
+        'forecast_summit_temp_high', 'forecast_summit_temp_low',
+        'forecast_precipitation', 'forecast_snow',
     ]
 
-    # ----------------------------------------------------------------------
-    #  INITIALIZER
-    # ----------------------------------------------------------------------
     def __init__(self, resort_name: str):
         self.resort_name = resort_name
         self.csv_filename = os.path.join(DATA_DIR, f"{resort_name}_snow_report.csv")
-
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -170,87 +122,134 @@ class BaseSnowReportScraper(ABC):
             'Connection': 'keep-alive',
         }
 
-    # ----------------------------------------------------------------------
-    #  NUMERIC CLEANER
-    # ----------------------------------------------------------------------
     @staticmethod
     def clean_numeric(value):
-        """
-        Clean numeric values consistently across all scrapers.
-        Removes quotes, units, whitespace. Returns 0 for invalid values.
-        """
         if value is None or value == '' or value == 'N/A':
             return 0.0
-
         value_str = str(value).strip()
-
-        # Handle slash notation (like 0/5")
-        if '/' in value_str:
-            value_str = value_str.split('/')[0]
-
-        # Strip common units
+        if '/' in value_str: value_str = value_str.split('/')[0]
         for bad in ['"', '°', 'F', 'C', 'mph', 'in', '%']:
             value_str = value_str.replace(bad, '')
-
         cleaned = ''.join(c for c in value_str if c.isdigit() or c in ['.', '-'])
-
         try:
             return float(cleaned) if cleaned else 0.0
         except ValueError:
             return 0.0
 
-    # ----------------------------------------------------------------------
-    #  REQUIRED ABSTRACT METHODS
-    # ----------------------------------------------------------------------
+    @staticmethod
+    def now_string() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def blank_record(self) -> Dict:
+        return {col: None for col in self.STANDARD_COLUMNS}
+
+    def _fetch_last_report_from_firebase(self):
+        """
+        Universal helper to get the previous report for THIS resort from Firebase.
+        Used for fingerprinting/staleness checks.
+        """
+        try:
+            # Ensure we can access firestore (it should be initialized in main)
+            if not firebase_admin._apps:
+                return None
+                
+            db = firestore.client()
+            docs = (db.collection('snow_reports')
+                    .where(filter=firestore.FieldFilter('resort', '==', self.resort_name))
+                    .order_by('date', direction=firestore.Query.DESCENDING)
+                    .limit(1)
+                    .stream())
+            
+            last_doc = next(docs, None)
+            if not last_doc:
+                return None
+            return last_doc.to_dict()
+        except Exception as e:
+            # Silent fail is okay here, we just won't be able to check staleness
+            return None
+
+    def _check_and_fix_staleness(self, data: Dict):
+        """
+        Logic: If 'last_updated' is missing, compare the data 'fingerprint' 
+        to the last database entry.
+        """
+        # If the scraper found a valid date string already, we usually trust it.
+        # This logic kicks in if the date is missing/empty.
+        if data.get('last_updated'):
+            return data
+
+        last_report = self._fetch_last_report_from_firebase()
+        fallback_date = datetime.now().strftime('%Y-%m-%d %I:%M %p')
+        
+        if not last_report:
+            data['last_updated'] = fallback_date
+            return data
+
+        # Define the warning flag
+        STALE_FLAG = " [⚠️ Report Stale]"
+
+        # --- PREPARE OLD COMMENTS FOR COMPARISON ---
+        # We must strip the stale flag from the old report to ensure fair comparison
+        old_comments = str(last_report.get('comments', ''))
+        if STALE_FLAG in old_comments:
+            old_comments = old_comments.replace(STALE_FLAG, "")
+
+        # CREATE FINGERPRINTS
+        current_fingerprint = (
+            self.clean_numeric(data.get('snow_overnight')),
+            self.clean_numeric(data.get('snow_24h_base')),
+            self.clean_numeric(data.get('snow_24h_summit')),
+            self.clean_numeric(data.get('snow_7day')),
+            self.clean_numeric(data.get('base_depth')),
+            self.clean_numeric(data.get('summit_depth')),
+            len(str(data.get('comments', '')))
+        )
+        
+        old_fingerprint = (
+            self.clean_numeric(last_report.get('snow_overnight')),
+            self.clean_numeric(last_report.get('snow_24h_base')),
+            self.clean_numeric(last_report.get('snow_24h_summit')),
+            self.clean_numeric(last_report.get('snow_7day')),
+            self.clean_numeric(last_report.get('base_depth')),
+            self.clean_numeric(last_report.get('summit_depth')),
+            len(old_comments) # <--- Use the cleaned length
+        )
+
+        if current_fingerprint == old_fingerprint:
+            # STALE DETECTED
+            print(f"[{self.resort_name}] Stale data detected (Fingerprint match). Reusing old date.")
+            data['last_updated'] = last_report.get('last_updated')
+            
+            # Add warning flag (Avoid duplicates)
+            current_comments = data.get('comments') or ""
+            if STALE_FLAG not in current_comments:
+                data['comments'] = current_comments + STALE_FLAG
+        else:
+            # FRESH DATA
+            print(f"[{self.resort_name}] Fresh data detected (Fingerprint changed). Assigning NOW.")
+            data['last_updated'] = fallback_date
+            
+        return data
+
     @abstractmethod
     def get_url(self) -> str:
-        """Return the URL to scrape for this resort."""
         pass
 
     @abstractmethod
     def process_data(self, response) -> Dict:
-        """
-        Process the HTTP response and return standardized data.
-
-        Must return a dictionary with ALL keys from STANDARD_COLUMNS.
-        Missing data should be None.
-        """
         pass
 
-    # ----------------------------------------------------------------------
-    #  BLANK RECORD HELPER  ← REQUIRED BY SILVER SCRAPER
-    # ----------------------------------------------------------------------
-    def blank_record(self) -> Dict:
-        """
-        Return a fully-populated "empty" record with all STANDARD_COLUMNS = None.
-        Subclasses (like SilverMountainScraper) can safely start from this.
-        """
-        return {col: None for col in self.STANDARD_COLUMNS}
-
-    # ----------------------------------------------------------------------
-    #  TIMESTAMP HELPER  ← REQUIRED BY SILVER SCRAPER
-    # ----------------------------------------------------------------------
-    @staticmethod
-    def now_string() -> str:
-        """
-        Consistent timestamp helper used by scrapers.
-        """
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # ----------------------------------------------------------------------
-    #  BASE FETCH METHOD (SilverMountain overrides this)
-    # ----------------------------------------------------------------------
     def get_snow_report(self) -> Optional[Dict]:
-        """
-        Fetch and process snow report data from the resort website.
-        Silver Mountain *overrides* this method completely.
-        """
         try:
-            response = requests.get(self.get_url(), headers=self.headers, timeout=10)
+            response = requests.get(self.get_url(), headers=self.headers, timeout=20)
             response.raise_for_status()
             data = self.process_data(response)
 
             if data:
+                # 1. Run the Universal Staleness Check
+                data = self._check_and_fix_staleness(data)
+                
+                # 2. Add Standard Metadata
                 data.update({
                     'resort': self.resort_name,
                     'date': datetime.now().strftime('%Y-%m-%d'),
@@ -259,13 +258,14 @@ class BaseSnowReportScraper(ABC):
             return data
 
         except requests.exceptions.SSLError:
-            # Retry without SSL verification
+            # Retry without SSL
             try:
-                response = requests.get(self.get_url(), headers=self.headers, timeout=10, verify=False)
+                response = requests.get(self.get_url(), headers=self.headers, timeout=20, verify=False)
                 response.raise_for_status()
                 data = self.process_data(response)
 
                 if data:
+                    data = self._check_and_fix_staleness(data)
                     data.update({
                         'resort': self.resort_name,
                         'date': datetime.now().strftime('%Y-%m-%d'),
@@ -280,20 +280,11 @@ class BaseSnowReportScraper(ABC):
             print(f"Error fetching snow report for {self.resort_name}: {e}")
             return None
 
-    # ----------------------------------------------------------------------
-    #  SAFE CSV SAVE METHOD (SILENTLY SKIPS None DATA)
-    # ----------------------------------------------------------------------
     def save_to_csv(self, data: Dict):
-        """
-        Save snow report data to CSV with dedupe (keep latest timestamp per date).
-        Skips None instead of crashing.
-        """
         try:
             if data is None:
-                print(f"save_to_csv: No data for {self.resort_name}, skipping CSV write.")
                 return
 
-            # Standardize full row
             row = {col: None for col in self.STANDARD_COLUMNS}
             row.update({
                 k: normalize_text(v) if isinstance(v, str) else v
@@ -303,20 +294,17 @@ class BaseSnowReportScraper(ABC):
 
             df_new = pd.DataFrame([row], columns=self.STANDARD_COLUMNS)
 
-            # Load existing CSV
             if os.path.exists(self.csv_filename):
                 df_old = pd.read_csv(self.csv_filename, dtype=str, keep_default_na=False)
-
                 # Ensure schema consistency
                 for col in self.STANDARD_COLUMNS:
                     if col not in df_old.columns:
                         df_old[col] = None
-
                 df_all = pd.concat([df_old, df_new], ignore_index=True)
             else:
                 df_all = df_new
 
-            # Sort + dedupe latest by date
+            # Sort + dedupe
             df_all = df_all.sort_values(['date', 'timestamp'], ascending=True)
             df_all = df_all.drop_duplicates(subset='date', keep='last')
 
@@ -324,9 +312,7 @@ class BaseSnowReportScraper(ABC):
 
         except Exception as e:
             print(f"Error saving to CSV: {e}")
-            import traceback
-            traceback.print_exc()
-      
+
 # =============================================================================
 # RESORT-SPECIFIC SCRAPERS
 # =============================================================================
@@ -342,7 +328,7 @@ class SnowbowlScraper(BaseSnowReportScraper):
             
             try:
                 # Parse polling data from HTML comments
-                comment_pattern = r'(.*?)'
+                comment_pattern = r''
                 polling_data = re.search(comment_pattern, response.text, re.DOTALL)
                 
 
@@ -589,114 +575,98 @@ class BigMountainScraper(BaseSnowReportScraper):
     def get_url(self):
         return "https://skiwhitefish.com/snowreport/"
 
-    def _get_weather_data(self):
+    def _get_weather_data(self, soup):
+        weather_data = {
+            'temp_summit': None,
+            'wind_speed': None
+        }
         try:
-            weather_url = "https://skiwhitefish.com/weather/"
-            response = requests.get(weather_url, headers=self.headers, timeout=10)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            weather_data = {
-                'temp_summit': None,
-                'wind_speed': None
-            }
-            
+            # 1. Try standard columns first
             temp_cols = soup.find_all('div', class_='wp-block-column')
             for col in temp_cols:
-                em = col.find('em')
-                if em and 'Temperature' in em.text:
-                    if br := col.find('br'):
-                        temp_text = br.next_sibling.strip() if br.next_sibling else None
-                        if temp_text:
-                            temp_match = re.search(r'(-?\d+)', temp_text)
-                            if temp_match:
-                                weather_data['temp_summit'] = temp_match.group(1)
-                
-                elif em and 'Winds' in em.text:
-                    if br := col.find('br'):
-                        wind_text = br.next_sibling.strip() if br.next_sibling else None
-                        if wind_text:
-                            speed_match = re.search(r'@\s*(\d+(?:\.\d+)?)', wind_text)
-                            if speed_match:
-                                weather_data['wind_speed'] = self.clean_numeric(speed_match.group(1))
+                text = col.get_text(strip=True)
+                if 'Temperature' in text:
+                    match = re.search(r'(-?\d+)', text)
+                    if match: weather_data['temp_summit'] = match.group(1)
+                elif 'Wind' in text:
+                    match = re.search(r'@\s*(\d+(?:\.\d+)?)', text)
+                    if match: weather_data['wind_speed'] = self.clean_numeric(match.group(1))
             
-            return weather_data
+            # 2. Fallback: Search all H5/H4 tags for temps
+            if not weather_data['temp_summit']:
+                for tag in soup.find_all(['h4', 'h5', 'p']):
+                    text = tag.get_text(strip=True)
+                    if 'Temp' in text or 'degrees' in text:
+                        match = re.search(r'(-?\d+)\s*degrees', text, re.I)
+                        if match: 
+                            weather_data['temp_summit'] = match.group(1)
+                            break
+
         except Exception as e:
             print(f"Error getting weather data: {e}")
-            return None
+            
+        return weather_data
 
     def process_data(self, response):
         soup = BeautifulSoup(response.text, 'html.parser')
-        
         data = {col: None for col in self.STANDARD_COLUMNS}
         
-        # --- DATE PARSING FIX ---
-        # Try to find the date, but default to NOW if we find data but miss the date
-        date_found = False
+        # --- 1. DATE PARSING ---
         for p_tag in soup.find_all('p'):
             strong_tag = p_tag.find('strong')
             if strong_tag:
                 text = strong_tag.text
                 if re.search(r'\w+,\s+\w+\.?\s+\d{1,2},\s+\d{4}', text):
-                    date_found = True
                     try:
                         clean_date = text.replace('.', '').replace('  ', ' ').strip().rstrip(':')
-                        # Add default time if missing
-                        if 'm' not in clean_date.lower(): 
-                            clean_date += " 6:00 AM"
-                        
-                        # Normalize format
+                        if 'm' not in clean_date.lower(): clean_date += " 6:00 AM"
                         clean_date = re.sub(r'(\d)(am|pm)', r'\1 \2', clean_date, flags=re.I)
-                        
                         parsed_date = datetime.strptime(clean_date, '%A, %b %d, %Y %I:%M %p')
                         data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
                         break
                     except:
                         data['last_updated'] = text
-        
-        # --- FALLBACK: If we didn't find a date text, use current time ---
-        if not data['last_updated']:
-            data['last_updated'] = datetime.now().strftime('%Y-%m-%d %I:%M %p')
-        
-        # --- WEATHER ---
-        weather_data = self._get_weather_data()
-        if weather_data:
-            data.update(weather_data)
-        
-        # --- SNOW TOTALS ---
+
+        # --- 2. EXTRACT DATA ---
         summit_cols = soup.find_all('div', class_='wp-block-column')
         for col in summit_cols:
             h5 = col.find('h5')
             p = col.find('p')
-            if h5 and p:
-                value = h5.text.strip().replace('"', '')
-                label = p.text.strip()
-                
-                if 'Overnight Fresh' in label:
-                    data['snow_overnight'] = value
-                elif 'Past 24 Hours' in label and not data['snow_24h_summit']:
-                    data['snow_24h_summit'] = self.clean_numeric(value)
-                elif 'Settled Base' in label and not data['summit_depth']:
-                    data['summit_depth'] = value
-        
-        base_area = False
-        for col in summit_cols:
-            h4 = col.find('h4')
-            if h4 and 'Base Area' in h4.text:
-                base_area = True
-                continue
             
-            if base_area:
-                h5 = col.find('h5')
-                p = col.find('p')
-                if h5 and p:
-                    value = h5.text.strip().replace('"', '')
-                    label = p.text.strip()
-                    
-                    if 'Past 24 Hours' in label:
-                        data['snow_24h_base'] = self.clean_numeric(value)
-                    elif 'Settled Base' in label:
-                        data['base_depth'] = value
+            if not h5 or not p:
+                text = col.get_text(separator='|', strip=True)
+                parts = text.split('|')
+                if len(parts) >= 2:
+                    val_candidate = parts[0]
+                    label_candidate = parts[1]
+                else:
+                    continue
+            else:
+                val_candidate = h5.get_text(strip=True)
+                label_candidate = p.get_text(strip=True)
+
+            val_clean = val_candidate.replace('"', '').replace('”', '').strip()
+            
+            if 'Overnight Fresh' in label_candidate:
+                data['snow_overnight'] = val_clean
+            elif 'Past 24 Hours' in label_candidate:
+                data['snow_24h_summit'] = self.clean_numeric(val_clean)
+                data['snow_24h_base'] = self.clean_numeric(val_clean)
+            elif 'Past 7 Days' in label_candidate:
+                data['snow_7day'] = val_clean
+            elif 'Settled Base' in label_candidate:
+                data['base_depth'] = val_clean
+                data['summit_depth'] = val_clean
+            elif 'Season to Date' in label_candidate:
+                if data['comments']:
+                    data['comments'] += f" | Season Total: {val_clean}\""
+                else:
+                    data['comments'] = f"Season Total: {val_clean}\""
+
+        # --- 3. WEATHER ---
+        weather_data = self._get_weather_data(soup)
+        if weather_data:
+            data.update(weather_data)
         
         return data
 
@@ -1155,6 +1125,9 @@ class SchweitzerScraper(BaseSnowReportScraper):
             data = self.process_data(response)
             
             if data:
+                # Run the Universal Staleness Check
+                data = self._check_and_fix_staleness(data)
+                
                 data.update({
                     'resort': self.resort_name,
                     'date': datetime.now().strftime('%Y-%m-%d'),
@@ -1226,7 +1199,7 @@ class SchweitzerScraper(BaseSnowReportScraper):
             
             # Clean numeric values
             for key in ['snow_overnight', 'snow_24h_base', 'snow_48h_base', 
-                       'snow_24h_summit', 'snow_48h_summit', 'base_depth', 'summit_depth']:
+                        'snow_24h_summit', 'snow_48h_summit', 'base_depth', 'summit_depth']:
                 if data[key] is not None:
                     data[key] = self.clean_numeric(data[key])
             
@@ -1299,6 +1272,9 @@ class BridgerBowlScraper(BaseSnowReportScraper):
             
             # Add core metadata (resort, date, timestamp, data_source)
             if data:
+                # Run the Universal Staleness Check
+                data = self._check_and_fix_staleness(data)
+                
                 data.update({
                     'resort': self.resort_name,
                     'date': datetime.now().strftime('%Y-%m-%d'),
@@ -1596,9 +1572,9 @@ class RedLodgeScraper(BaseSnowReportScraper):
              # Find the closest parent element that contains the whole paragraph of text
              announcement_p = comment_start_text.find_parent('p')
              if announcement_p:
-                  # Capture all the text inside the main announcement paragraph
-                  full_bulletin = announcement_p.get_text(strip=True)
-                  data['comments'] = normalize_text(f"RESCHEDULE NOTICE: {full_bulletin}")
+                 # Capture all the text inside the main announcement paragraph
+                 full_bulletin = announcement_p.get_text(strip=True)
+                 data['comments'] = normalize_text(f"RESCHEDULE NOTICE: {full_bulletin}")
              else:
                  # Fallback if the parent paragraph is not found
                  data['comments'] = "Rescheduling announcement found, but extraction failed. See original page."
@@ -1735,177 +1711,177 @@ class SNOTELDataFetcher:
         return self._create_empty_report(error_reason="Use batch fetch")
 
     def get_all_snowfall_reports(self) -> Dict[str, Dict]:
-                """
-                Fetches HOURLY SNOTEL data for all stations.
-                Collects history (SNWD, WTEQ, TOBS) and calculates 24h deltas.
-                """
-                self._log.info("Starting batch SNOTEL API fetch (HOURLY)...")
-                triplet_to_resort = {v['triplet']: k for k, v in self.STATION_INFO.items()}
-                all_triplets = ",".join(triplet_to_resort.keys())
+            """
+            Fetches HOURLY SNOTEL data for all stations.
+            Collects history (SNWD, WTEQ, TOBS) and calculates 24h deltas.
+            """
+            self._log.info("Starting batch SNOTEL API fetch (HOURLY)...")
+            triplet_to_resort = {v['triplet']: k for k, v in self.STATION_INFO.items()}
+            all_triplets = ",".join(triplet_to_resort.keys())
+            
+            # --- FIX: Calculate explicit date instead of using relative "-2" ---
+            # This forces the API to respect our window regardless of server time
+            from datetime import datetime, timedelta
+            start_dt = datetime.now() - timedelta(days=2)
+            begin_date_str = start_dt.strftime("%Y-%m-%d")
+            
+            url = (
+                "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
+                f"?stationTriplets={all_triplets}"
+                "&elements=WTEQ,SNWD,TOBS"
+                "&duration=HOURLY"
+                f"&beginDate={begin_date_str}"  # Explicit start date
+                "&endDate=9999-12-31"           # Explicit end date (force to current)
+            )
+            
+            final_reports = {}
+            try:
+                resp = self.session.get(url, timeout=self._timeout)
+                resp.raise_for_status()
+                api_data_list = resp.json()
                 
-                # --- FIX: Calculate explicit date instead of using relative "-2" ---
-                # This forces the API to respect our window regardless of server time
-                from datetime import datetime, timedelta
-                start_dt = datetime.now() - timedelta(days=2)
-                begin_date_str = start_dt.strftime("%Y-%m-%d")
+                if not api_data_list:
+                    raise ValueError("API response was empty.")
                 
-                url = (
-                    "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
-                    f"?stationTriplets={all_triplets}"
-                    "&elements=WTEQ,SNWD,TOBS"
-                    "&duration=HOURLY"
-                    f"&beginDate={begin_date_str}"  # Explicit start date
-                    "&endDate=9999-12-31"           # Explicit end date (force to current)
-                )
-                
-                final_reports = {}
-                try:
-                    resp = self.session.get(url, timeout=self._timeout)
-                    resp.raise_for_status()
-                    api_data_list = resp.json()
+                for station_data in api_data_list:
+                    triplet = station_data.get('stationTriplet')
+                    resort_name = triplet_to_resort.get(triplet)
                     
-                    if not api_data_list:
-                        raise ValueError("API response was empty.")
+                    if not resort_name:
+                        continue
                     
-                    for station_data in api_data_list:
-                        triplet = station_data.get('stationTriplet')
-                        resort_name = triplet_to_resort.get(triplet)
+                    station_name = self.STATION_INFO[resort_name]['name']
+                    station_elev = self.STATION_INFO[resort_name]['elevation']
+                    
+                    # Store series by timestamp to merge them
+                    history_map = {}
+                    
+                    def get_or_create(ts):
+                        if ts not in history_map:
+                            history_map[ts] = {"timestamp": ts, "snow_depth": None, "swe": None, "temp": None}
+                        return history_map[ts]
+
+                    for element_data in station_data.get('data', []):
+                        element_code = element_data['stationElement']['elementCode'].lower()
+                        values = element_data.get('values', [])
                         
-                        if not resort_name:
-                            continue
-                        
-                        station_name = self.STATION_INFO[resort_name]['name']
-                        station_elev = self.STATION_INFO[resort_name]['elevation']
-                        
-                        # Store series by timestamp to merge them
-                        history_map = {}
-                        
-                        def get_or_create(ts):
-                            if ts not in history_map:
-                                history_map[ts] = {"timestamp": ts, "snow_depth": None, "swe": None, "temp": None}
-                            return history_map[ts]
-    
-                        for element_data in station_data.get('data', []):
-                            element_code = element_data['stationElement']['elementCode'].lower()
-                            values = element_data.get('values', [])
+                        for v in values:
+                            date_str = v.get('date')
+                            val = v.get('value')
+                            if not date_str: continue
                             
-                            for v in values:
-                                date_str = v.get('date')
-                                val = v.get('value')
-                                if not date_str: continue
-                                
-                                entry = get_or_create(date_str)
-                                
-                                if element_code == 'snwd':
-                                    entry['snow_depth'] = val
-                                elif element_code == 'wteq':
-                                    entry['swe'] = val
-                                elif element_code == 'tobs':
-                                    entry['temp'] = val
-    
-                        # Convert map to sorted list
-                        full_history = sorted(history_map.values(), key=lambda x: x['timestamp'])
-                        
-                        # Ensure we don't upload too much if the query returns tons of data
-                        # (Last 48 entries is roughly 2 days of hourly data)
-                        recent_history = full_history[-48:] if len(full_history) > 48 else full_history
-    
-                        # --- CALCULATE 24H SUMMARY METRICS ---
-                        obs_time = "N/A"
-                        total_depth = None
-                        total_swe = None
-                        snow_change = None
-                        swe_change = None
-                        
-                        if recent_history:
-                            latest = recent_history[-1]
-                            obs_time = latest['timestamp']
-                            total_depth = latest['snow_depth']
-                            total_swe = latest['swe']
+                            entry = get_or_create(date_str)
                             
-                            # Find 24h ago
-                            try:
-                                # Parse formatting
-                                fmt_opts = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M']
-                                latest_dt = None
-                                for f in fmt_opts:
+                            if element_code == 'snwd':
+                                entry['snow_depth'] = val
+                            elif element_code == 'wteq':
+                                entry['swe'] = val
+                            elif element_code == 'tobs':
+                                entry['temp'] = val
+
+                    # Convert map to sorted list
+                    full_history = sorted(history_map.values(), key=lambda x: x['timestamp'])
+                    
+                    # Ensure we don't upload too much if the query returns tons of data
+                    # (Last 48 entries is roughly 2 days of hourly data)
+                    recent_history = full_history[-48:] if len(full_history) > 48 else full_history
+
+                    # --- CALCULATE 24H SUMMARY METRICS ---
+                    obs_time = "N/A"
+                    total_depth = None
+                    total_swe = None
+                    snow_change = None
+                    swe_change = None
+                    
+                    if recent_history:
+                        latest = recent_history[-1]
+                        obs_time = latest['timestamp']
+                        total_depth = latest['snow_depth']
+                        total_swe = latest['swe']
+                        
+                        # Find 24h ago
+                        try:
+                            # Parse formatting
+                            fmt_opts = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M']
+                            latest_dt = None
+                            for f in fmt_opts:
+                                try:
+                                    latest_dt = datetime.strptime(latest['timestamp'], f)
+                                    break
+                                except: pass
+                            
+                            if latest_dt:
+                                target_dt = latest_dt - timedelta(hours=24)
+                                prev_depth = None
+                                prev_swe = None
+                                min_diff = 5400 # 1.5 hours in seconds
+                                
+                                for h in recent_history:
                                     try:
-                                        latest_dt = datetime.strptime(latest['timestamp'], f)
-                                        break
-                                    except: pass
+                                        h_dt = None
+                                        for f in fmt_opts:
+                                            try:
+                                                h_dt = datetime.strptime(h['timestamp'], f)
+                                                break
+                                            except: pass
+                                        
+                                        if h_dt:
+                                            diff = abs((h_dt - target_dt).total_seconds())
+                                            if diff < min_diff:
+                                                min_diff = diff
+                                                prev_depth = h['snow_depth']
+                                                prev_swe = h['swe']
+                                    except: continue
                                 
-                                if latest_dt:
-                                    target_dt = latest_dt - timedelta(hours=24)
-                                    prev_depth = None
-                                    prev_swe = None
-                                    min_diff = 5400 # 1.5 hours in seconds
-                                    
-                                    for h in recent_history:
-                                        try:
-                                            h_dt = None
-                                            for f in fmt_opts:
-                                                try:
-                                                    h_dt = datetime.strptime(h['timestamp'], f)
-                                                    break
-                                                except: pass
-                                            
-                                            if h_dt:
-                                                diff = abs((h_dt - target_dt).total_seconds())
-                                                if diff < min_diff:
-                                                    min_diff = diff
-                                                    prev_depth = h['snow_depth']
-                                                    prev_swe = h['swe']
-                                        except: continue
-                                    
-                                    if total_depth is not None and prev_depth is not None:
-                                        snow_change = round(total_depth - prev_depth, 1)
-                                    
-                                    if total_swe is not None and prev_swe is not None:
-                                        swe_change = round(total_swe - prev_swe, 2)
-                            except Exception as e:
-                                self._log.warning(f"Error calculating summary delta for {resort_name}: {e}")
+                                if total_depth is not None and prev_depth is not None:
+                                    snow_change = round(total_depth - prev_depth, 1)
+                                
+                                if total_swe is not None and prev_swe is not None:
+                                    swe_change = round(total_swe - prev_swe, 2)
+                        except Exception as e:
+                            self._log.warning(f"Error calculating summary delta for {resort_name}: {e}")
+
+                    # Calculate Density
+                    density = None
+                    if snow_change is not None and swe_change is not None and snow_change > 0.5 and swe_change > 0.01:
+                        density = round((swe_change / snow_change) * 100, 1)
+                    
+                    percent_of_median = "N/A" 
+                    is_new_snow = (density is not None)
     
-                        # Calculate Density
-                        density = None
-                        if snow_change is not None and swe_change is not None and snow_change > 0.5 and swe_change > 0.01:
-                            density = round((swe_change / snow_change) * 100, 1)
-                        
-                        percent_of_median = "N/A" 
-                        is_new_snow = (density is not None)
-        
-                        report = {
-                            'station_name': station_name,
-                            'triplet': triplet,
-                            'elevation': station_elev,
-                            'snow_depth': snow_change if snow_change is not None else 0,
-                            'swe': swe_change if swe_change is not None else 0,
-                            'snotel_total_depth': total_depth if total_depth is not None else 0, 
-                            'snotel_total_swe': total_swe if total_swe is not None else 0,
-                            'density': density if is_new_snow else 'N/A',
-                            'percent_of_median': percent_of_median,
-                            'snow_category': self._snow_category(density) if is_new_snow else 'N/A',
-                            'latest_observation': obs_time,
-                            'history': recent_history,
-                            'unavailable': False,
-                            'error_reason': None if is_new_snow else "No new snow"
-                        }
-                        
-                        final_reports[resort_name] = report
-        
-                except Exception as e:
-                    self._log.error(f"SNOTEL batch API fetch error: {e}", exc_info=True)
-                
-                # Fill missing resorts
-                for resort_name in self.STATION_INFO.keys():
-                    if resort_name not in final_reports:
-                        final_reports[resort_name] = self._create_empty_report(
-                            station_name=self.STATION_INFO[resort_name]['name'], 
-                            error_reason='batch_api_fail', 
-                            triplet=self.STATION_INFO[resort_name]['triplet'],
-                            elevation=self.STATION_INFO[resort_name]['elevation']
-                        )
-                        
-                return final_reports
+                    report = {
+                        'station_name': station_name,
+                        'triplet': triplet,
+                        'elevation': station_elev,
+                        'snow_depth': snow_change if snow_change is not None else 0,
+                        'swe': swe_change if swe_change is not None else 0,
+                        'snotel_total_depth': total_depth if total_depth is not None else 0, 
+                        'snotel_total_swe': total_swe if total_swe is not None else 0,
+                        'density': density if is_new_snow else 'N/A',
+                        'percent_of_median': percent_of_median,
+                        'snow_category': self._snow_category(density) if is_new_snow else 'N/A',
+                        'latest_observation': obs_time,
+                        'history': recent_history,
+                        'unavailable': False,
+                        'error_reason': None if is_new_snow else "No new snow"
+                    }
+                    
+                    final_reports[resort_name] = report
+    
+            except Exception as e:
+                self._log.error(f"SNOTEL batch API fetch error: {e}", exc_info=True)
+            
+            # Fill missing resorts
+            for resort_name in self.STATION_INFO.keys():
+                if resort_name not in final_reports:
+                    final_reports[resort_name] = self._create_empty_report(
+                        station_name=self.STATION_INFO[resort_name]['name'], 
+                        error_reason='batch_api_fail', 
+                        triplet=self.STATION_INFO[resort_name]['triplet'],
+                        elevation=self.STATION_INFO[resort_name]['elevation']
+                    )
+                    
+            return final_reports
 
 # =============================================================================
 # MAIN EXECUTION
@@ -1927,6 +1903,15 @@ def main():
     
     try:
         logging.info("Starting snow report script")
+        
+        # --- INIT FIREBASE EARLY ---
+        if not firebase_admin._apps:
+            cred_path = os.getenv('FIREBASE_SERVICE_ACCOUNT') 
+            if cred_path:
+                cred = credentials.Certificate(cred_path)
+                firebase_admin.initialize_app(cred)
+            else:
+                logging.warning("No Firebase credentials found. Change detection will fail.")
         
         snotel_fetcher = SNOTELDataFetcher()
         nws_fetcher = NWSStormOutlook()
