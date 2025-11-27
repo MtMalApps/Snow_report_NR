@@ -472,9 +472,9 @@ def render_snotel_charts(history_df):
         tick_values = None
     else:
         # Floor to the previous full hour, ceil to the next full hour
-        start_floor = t_min.floor("H")
-        stop_ceil = t_max.ceil("H")
-        tick_range = pd.date_range(start=start_floor, end=stop_ceil, freq="2H")
+        start_floor = t_min.floor("h")  # Lowercase h
+        stop_ceil = t_max.ceil("h")     # Lowercase h
+        tick_range = pd.date_range(start=start_floor, end=stop_ceil, freq="2h") # Lowercase h
         tick_values = tick_range.to_pydatetime().tolist()
 
     if tick_values:
@@ -713,7 +713,17 @@ def render_snotel_charts(history_df):
 # ──────────────────────────────────────────────────────────────
 @st.dialog("Resort Details", width="large")
 def show_resort_modal(row):
-    # TIGHT HEADER LAYOUT
+    # --- STALE DATA CHECK ---
+    raw_comments = str(row.get('comments', ''))
+    is_stale = "[⚠️ Report Stale]" in raw_comments
+    
+    # Clean the comments for display (remove the technical tag)
+    display_comments = raw_comments.replace(" [⚠️ Report Stale]", "")
+    
+    # 1. HEADER & WARNING
+    if is_stale:
+        st.warning("⚠️ **Report Might Be Stale:** This resort has not updated their website. Showing last valid data.")
+        
     st.markdown(f"""
         <div style="line-height: 1.1; margin-bottom: 40px;">
             <div style="font-size: 2.2rem; font-weight: 900; color: white; line-height: 1.0;">{row['display_name']}</div>
@@ -752,112 +762,112 @@ def show_resort_modal(row):
         else:
             st.caption("No operational details reported.")
         
-        if row.get('comments'):
-            st.info(f"📝 {row['comments']}")
+        if display_comments:
+            st.info(f"📝 {display_comments}")
 
     with tab2:
-            s_name = snotel.get('station_name', 'Station N/A')
-            if "snotel" not in s_name.lower(): s_name += " SNOTEL"
-            
-            elev = snotel.get('elevation', '')
-            if elev: s_name += f" ({elev} ft)"
-            
-            val_obs_raw = snotel.get('latest_observation', 'N/A')
-            val_obs_display = val_obs_raw
-            try:
-                if len(val_obs_raw) > 10:
-                    dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d %H:%M")
-                    val_obs_display = dt_obs.strftime("%b %d, %I:%M %p")
-                else:
-                    dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d")
-                    val_obs_display = dt_obs.strftime("%b %d, %Y")
-            except: pass
-                
-            st.markdown(f"""
-            <div style="line-height: 1.2; margin-bottom: 15px;">
-                <div style="font-size: 1.5rem; font-weight: 700; color: white; line-height: 1.0;">{s_name}</div>
-                <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 4px;">Observed: {val_obs_display}</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            if snotel.get('unavailable') is True:
-                st.error(f"Data Unavailable: {snotel.get('error_reason', 'Unknown error')}")
-            
-            val_snow = snotel.get('snow_depth', 'N/A')
-            if isinstance(val_snow, (int, float)): val_snow = f"{val_snow}\""
-                
-            val_swe = snotel.get('swe', 'N/A')
-            if isinstance(val_swe, (int, float)): val_swe = f"{val_swe}\""
-    
-            # Use new total fields if available, otherwise fallback
-            val_total_depth = snotel.get('snotel_total_depth', 'N/A')
-            if isinstance(val_total_depth, (int, float)): val_total_depth = f"{val_total_depth}\""
-            
-            val_total_swe = snotel.get('snotel_total_swe', 'N/A')
-            if isinstance(val_total_swe, (int, float)): val_total_swe = f"{val_total_swe}\""
-    
-            val_density = snotel.get('density', 'N/A')
-            val_qual = snotel.get('snow_category', 'N/A')
-            
-            pct_raw = snotel.get('percent_of_median', 'N/A')
-            val_pct = f"{pct_raw}%" if (str(pct_raw) != "N/A" and pct_raw is not None) else "N/A"
-            
-            density_display = "N/A" if val_density == "N/A" else f"{val_density}<div class='data-sub'>{val_qual}</div>"
-    
-            # --- 1. METRICS GRID (TOP) ---
-            st.markdown(f"""
-            <div class="data-grid">
-                <div class="data-item">
-                    <div class="data-label">24h Snow</div>
-                    <div class="data-value">{val_snow}</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Total Depth</div>
-                    <div class="data-value">{val_total_depth}</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">24h SWE</div>
-                    <div class="data-value">{val_swe}</div>
-                </div>
-                 <div class="data-item">
-                    <div class="data-label">Total SWE</div>
-                    <div class="data-value">{val_total_swe}</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Density</div>
-                    <div class="data-value">{density_display}</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Median %</div>
-                    <div class="data-value">{val_pct}</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            st.markdown("---")
-    
-            # --- 2. NEW CHARTS (MIDDLE) ---
-            history_list = snotel.get('history', [])
-            if history_list:
-                hist_df = parse_snotel_history(history_list)
-                render_snotel_charts(hist_df)
-                st.markdown("---")
-    
-            # --- 3. IFRAME CHART (BOTTOM) ---
-            triplet = snotel.get("triplet")
-            station_name = snotel.get("station_name")
-            
-            if triplet and station_name:
-                col_input, col_label = st.columns([1, 2])
-                with col_input:
-                    compare_year = st.text_input("Compare Year:", placeholder="e.g. 2011", key=f"year_{row['display_name']}")
-                with col_label:
-                    st.write("") 
-    
-                html = get_snotel_iframe_html(triplet, station_name, compare_year)
-                components.html(html, height=440, scrolling=False)
+        s_name = snotel.get('station_name', 'Station N/A')
+        if "snotel" not in s_name.lower(): s_name += " SNOTEL"
+        
+        elev = snotel.get('elevation', '')
+        if elev: s_name += f" ({elev} ft)"
+        
+        val_obs_raw = snotel.get('latest_observation', 'N/A')
+        val_obs_display = val_obs_raw
+        try:
+            if len(val_obs_raw) > 10:
+                dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d %H:%M")
+                val_obs_display = dt_obs.strftime("%b %d, %I:%M %p")
             else:
-                st.info("Chart unavailable (Missing triplet ID)")
+                dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d")
+                val_obs_display = dt_obs.strftime("%b %d, %Y")
+        except: pass
+            
+        st.markdown(f"""
+        <div style="line-height: 1.2; margin-bottom: 15px;">
+            <div style="font-size: 1.5rem; font-weight: 700; color: white; line-height: 1.0;">{s_name}</div>
+            <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 4px;">Observed: {val_obs_display}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if snotel.get('unavailable') is True:
+            st.error(f"Data Unavailable: {snotel.get('error_reason', 'Unknown error')}")
+        
+        val_snow = snotel.get('snow_depth', 'N/A')
+        if isinstance(val_snow, (int, float)): val_snow = f"{val_snow}\""
+            
+        val_swe = snotel.get('swe', 'N/A')
+        if isinstance(val_swe, (int, float)): val_swe = f"{val_swe}\""
+
+        # Use new total fields if available, otherwise fallback
+        val_total_depth = snotel.get('snotel_total_depth', 'N/A')
+        if isinstance(val_total_depth, (int, float)): val_total_depth = f"{val_total_depth}\""
+        
+        val_total_swe = snotel.get('snotel_total_swe', 'N/A')
+        if isinstance(val_total_swe, (int, float)): val_total_swe = f"{val_total_swe}\""
+
+        val_density = snotel.get('density', 'N/A')
+        val_qual = snotel.get('snow_category', 'N/A')
+        
+        pct_raw = snotel.get('percent_of_median', 'N/A')
+        val_pct = f"{pct_raw}%" if (str(pct_raw) != "N/A" and pct_raw is not None) else "N/A"
+        
+        density_display = "N/A" if val_density == "N/A" else f"{val_density}<div class='data-sub'>{val_qual}</div>"
+
+        # --- 1. METRICS GRID (TOP) ---
+        st.markdown(f"""
+        <div class="data-grid">
+            <div class="data-item">
+                <div class="data-label">24h Snow</div>
+                <div class="data-value">{val_snow}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">Total Depth</div>
+                <div class="data-value">{val_total_depth}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">24h SWE</div>
+                <div class="data-value">{val_swe}</div>
+            </div>
+             <div class="data-item">
+                <div class="data-label">Total SWE</div>
+                <div class="data-value">{val_total_swe}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">Density</div>
+                <div class="data-value">{density_display}</div>
+            </div>
+            <div class="data-item">
+                <div class="data-label">Median %</div>
+                <div class="data-value">{val_pct}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+
+        # --- 2. NEW CHARTS (MIDDLE) ---
+        history_list = snotel.get('history', [])
+        if history_list:
+            hist_df = parse_snotel_history(history_list)
+            render_snotel_charts(hist_df)
+            st.markdown("---")
+
+        # --- 3. IFRAME CHART (BOTTOM) ---
+        triplet = snotel.get("triplet")
+        station_name = snotel.get("station_name")
+        
+        if triplet and station_name:
+            col_input, col_label = st.columns([1, 2])
+            with col_input:
+                compare_year = st.text_input("Compare Year:", placeholder="e.g. 2011", key=f"year_{row['display_name']}")
+            with col_label:
+                st.write("") 
+
+            html = get_snotel_iframe_html(triplet, station_name, compare_year)
+            components.html(html, height=440, scrolling=False)
+        else:
+            st.info("Chart unavailable (Missing triplet ID)")
 
     with tab3:
         st.markdown("### 48-Hour Weather Outlook")
@@ -895,7 +905,6 @@ def show_resort_modal(row):
             </div>
         </div>
         """, unsafe_allow_html=True)
-
 
 # ──────────────────────────────────────────────────────────────
 # DATA HELPERS
@@ -1213,7 +1222,7 @@ if powder_count > 0:
             with cols[idx]:
                 st.metric(label=resort['display_name'], value=f"{resort['snow_24h_display']:.0f}\"", delta="POWDER")
 
-# 2. Leaderboard
+# 2. Leaderboard# 2. Leaderboard
 st.markdown("<div class='section-header'>📊 Today's Snow Leaderboard</div>", unsafe_allow_html=True)
 cols_map = {
     "display_name": "Resort",
@@ -1223,7 +1232,8 @@ cols_map = {
     "lifts_open": "Lifts",
     "runs_open": "Runs",
     "conditions_surface": "Surface",
-    "last_updated": "Last Updated"
+    "last_updated": "Last Updated",
+    "comments": "comments" # Need this for stale checking
 }
 df_ld = df[[k for k in cols_map.keys() if k in df.columns]].rename(columns=cols_map) 
 
@@ -1233,10 +1243,26 @@ for c in ["24h Snow", "Base Depth", "Summit Depth"]:
             lambda x: f'{x:.0f}"' if (isinstance(x, (int, float)) and x != 0)
             else "0\"" if isinstance(x, (int, float)) else "-"
         )
-    
-df_ld['Last Updated'] = df_ld['Last Updated'].apply(lambda x: x if x != 'N/A' else 'No Report')
+
+# Logic to add warning icon to 'Last Updated' if comments indicate stale data
+def format_last_updated(row):
+    val = row['Last Updated']
+    comments = str(row.get('comments', ''))
+    if val == 'N/A':
+        return 'No Report'
+    if "[⚠️ Report Stale]" in comments:
+        return f"⚠️ {val}"
+    return val
+
+df_ld['Last Updated'] = df_ld.apply(format_last_updated, axis=1)
+
+# Drop comments column so it doesn't show in table
+df_ld = df_ld.drop(columns=['comments'])
 
 st.markdown(df_ld.to_html(classes="styled-table", index=False, border=0), unsafe_allow_html=True)
+
+
+
 
 # 3. Chart
 st.markdown("<div class='section-header'>📈 5-Day Snowfall Trends</div>", unsafe_allow_html=True)
