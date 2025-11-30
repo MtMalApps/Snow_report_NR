@@ -1019,9 +1019,12 @@ class EmailSnowReportMessenger:
         
         STORM_SNOW_THRESHOLD = 4.0
         STORM_RAIN_THRESHOLD = 0.5
+        STORM_WIND_GUST_THRESHOLD = 40.0
+        STORM_WIND_SPEED_THRESHOLD = 30.0
         
         heavy_snow = []
         heavy_rain = []
+        heavy_wind = []
         
         for outlook in nws_outlooks:
             if not outlook.get('outlook'):
@@ -1030,17 +1033,59 @@ class EmailSnowReportMessenger:
             ol = outlook['outlook']
             resort_name = self._get_display_name(outlook['resort_name'])
             
-            snow_amount = ol.get('total_snow_inches', 0)
-            precip_amount = ol.get('total_precip_inches', 0)
+            snow_amount = ol.get('total_snow_inches', 0) or 0
+            precip_amount = ol.get('total_precip_inches', 0) or 0
             
+            # Snow
             if snow_amount >= STORM_SNOW_THRESHOLD:
                 heavy_snow.append(f"{resort_name}: {snow_amount:.1f}\" snow")
             
+            # Heavy rain (only when not really a snow event)
             if precip_amount >= STORM_RAIN_THRESHOLD and snow_amount < 1.0:
-                prob = ol.get('precip_probability_max', 0)
+                prob = ol.get('precip_probability_max', 0) or 0
                 heavy_rain.append(f"{resort_name}: {precip_amount:.2f}\" ({prob}% chance)")
 
-        if not heavy_snow and not heavy_rain:
+            # ---------- NEW: Strong wind logic ----------
+            wind = ol.get("wind") or {}
+            ambient_max = wind.get("ambient_max_mph")
+            gust_max = wind.get("gust_max_mph")
+            ambient_min = wind.get("ambient_min_mph")
+
+            # Decide if winds are notable
+            max_speed = 0.0
+            if isinstance(ambient_max, (int, float)):
+                max_speed = max(max_speed, float(ambient_max))
+            if isinstance(gust_max, (int, float)):
+                max_speed = max(max_speed, float(gust_max))
+
+            is_strong_wind = (
+                (isinstance(gust_max, (int, float)) and gust_max >= STORM_WIND_GUST_THRESHOLD) or
+                (isinstance(ambient_max, (int, float)) and ambient_max >= STORM_WIND_SPEED_THRESHOLD)
+            )
+
+            if is_strong_wind and max_speed > 0:
+                parts = []
+
+                # Range if both min and max exist
+                if isinstance(ambient_min, (int, float)) and isinstance(ambient_max, (int, float)) and (ambient_min or ambient_max):
+                    s_min = int(round(ambient_min))
+                    s_max = int(round(ambient_max))
+                    if s_min == s_max:
+                        parts.append(f"{s_max} mph")
+                    else:
+                        parts.append(f"{s_min}–{s_max} mph")
+                elif isinstance(ambient_max, (int, float)) and ambient_max:
+                    parts.append(f"up to {int(round(ambient_max))} mph")
+
+                # Gusts
+                if isinstance(gust_max, (int, float)) and gust_max:
+                    parts.append(f"gusts to {int(round(gust_max))} mph")
+
+                if parts:
+                    heavy_wind.append(f"{resort_name}: " + ", ".join(parts))
+
+        # If nothing noteworthy at all, no banner
+        if not heavy_snow and not heavy_rain and not heavy_wind:
             return ""
         
         snow_text = ""
@@ -1056,6 +1101,13 @@ class EmailSnowReportMessenger:
             <b style="color: {EmailTheme.ACCENT_BLUE};">🌧️ Heavy Rain Forecast (48hr):</b><br>
             {' · '.join(heavy_rain[:2])}
         """
+
+        wind_text = ""
+        if heavy_wind:
+            wind_text = f"""
+            <b style="color: {EmailTheme.ACCENT_BLUE};">Strong Wind (48hr):</b><br>
+            {' · '.join(heavy_wind[:4])}
+        """
             
         return f"""
       <tr>
@@ -1069,9 +1121,10 @@ class EmailSnowReportMessenger:
                 <td style="font-family: Arial, Helvetica, sans-serif; color: {EmailTheme.TEXT_PRIMARY}; padding-left: 12px;">
                   <div style="font-size: 16px; font-weight: 700; color: {EmailTheme.STORM_TEXT};">STORM WATCH</div>
                   <div style="font-size: 13px; color: {EmailTheme.TEXT_SECONDARY}; line-height: 1.5; margin-top: 8px;">
-                    Heavy precipitation forecast - see detailed reports below.
+                    Heavy precipitation and/or strong winds forecast - see detailed reports below.
                     <div style="margin-top: 8px;">{snow_text}</div>
                     <div style="margin-top: 8px;">{rain_text}</div>
+                    <div style="margin-top: 8px;">{wind_text}</div>
                   </div>
                 </td>
               </tr>
@@ -1080,6 +1133,7 @@ class EmailSnowReportMessenger:
         </td>
       </tr>
     """
+
     
     # -------------------------------------------------------------------------
     # HTML GENERATION - DETAILED RESORT SECTIONS
@@ -1232,14 +1286,59 @@ class EmailSnowReportMessenger:
         temps = f"High {temp_high}°F, Low {temp_low}°F"
         
         snow_level = ol.get('snow_level_feet', 'N/A')
-        snow_level_str = f"{snow_level} ft" if snow_level != 'N/A' and snow_level is not None else "N/A"
+        snow_level_str = f"{snow_level} ft" if snow_level not in ('N/A', None) else "N/A"
         
         conditions_list = ol.get('conditions')
         if isinstance(conditions_list, list):
             conditions = ", ".join(conditions_list)
         else:
             conditions = ol.get('conditions', 'N/A')
-        
+
+        # ---------- NEW: Wind summary ----------
+        wind = ol.get("wind") or {}
+        ambient_min = wind.get("ambient_min_mph")
+        ambient_max = wind.get("ambient_max_mph")
+        gust_max = wind.get("gust_max_mph")
+        category = wind.get("category")
+
+        wind_parts: List[str] = []
+
+        # Category (e.g., "moderate")
+        if isinstance(category, str) and category.strip():
+            wind_parts.append(category.strip().capitalize())
+
+        # Speed range
+        range_str = ""
+        if isinstance(ambient_min, (int, float)) and isinstance(ambient_max, (int, float)):
+            if ambient_min or ambient_max:
+                s_min = int(round(ambient_min))
+                s_max = int(round(ambient_max))
+                if s_min == s_max:
+                    range_str = f"{s_max} mph"
+                else:
+                    range_str = f"{s_min}–{s_max} mph"
+        elif isinstance(ambient_max, (int, float)) and ambient_max:
+            s_max = int(round(ambient_max))
+            range_str = f"up to {s_max} mph"
+        elif isinstance(ambient_min, (int, float)) and ambient_min:
+            s_min = int(round(ambient_min))
+            range_str = f"{s_min} mph"
+
+        if range_str:
+            wind_parts.append(range_str)
+
+        # Gusts
+        if isinstance(gust_max, (int, float)) and gust_max:
+            g = int(round(gust_max))
+            wind_parts.append(f"gusts to {g} mph")
+
+        wind_summary = "; ".join(wind_parts)
+        # Only render a row if we have something meaningful
+        if wind_summary:
+            wind_row = f"""<tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Wind (48 hr)</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{wind_summary}</td></tr>"""
+        else:
+            wind_row = ""
+
         return f"""
                   <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%; background:{EmailTheme.BG_CARD}; border:1px solid {EmailTheme.BORDER_MEDIUM}; border-radius:12px;">
                     <tr>
@@ -1250,6 +1349,7 @@ class EmailSnowReportMessenger:
                           <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Precipitation</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; text-align:right;">{precip}</td></tr>
                           <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Snow</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; text-align:right;">{snow}</td></tr>
                           <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Temps</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{temps}</td></tr>
+                          {wind_row}
                           <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Snow Level</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{snow_level_str}</td></tr>
                           <tr><td style="padding:8px 10px; border-bottom:0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%; vertical-align: top;">Conditions</td><td style="padding:8px 10px; border-bottom:0; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{conditions}</td></tr>
                         </table>
@@ -1257,6 +1357,7 @@ class EmailSnowReportMessenger:
                     </tr>
                   </table>
     """
+
 
     def _generate_snotel_box(self, snotel_data: Dict, station_info: Optional[Dict], resort_name: str) -> str:
         """Generate SNOTEL backcountry data box."""

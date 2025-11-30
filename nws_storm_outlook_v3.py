@@ -128,7 +128,7 @@ class NWSStormOutlook:
                 num_periods
             )
 
-            # WINDS (new)
+            # WINDS
             wind = self._extract_wind(
                 props.get('windSpeed', {}).get('values', []),
                 props.get('windGust', {}).get('values', []),
@@ -146,7 +146,7 @@ class NWSStormOutlook:
                 'temp_low_f': temps['low'],
                 'conditions': conditions,
                 'timing': timing,
-                'wind': wind,  # <-- NEW structured wind info
+                'wind': wind,
                 'has_snow': snow_total > 0,
                 'has_precip': precip_total > 0.1,
                 'is_significant': snow_total >= 6 or precip_total >= 1.0
@@ -241,32 +241,50 @@ class NWSStormOutlook:
             return {}
 
     # ──────────────────────────────────────────────────────────────
-    # HELPERS — NEW WIND EXTRACTION
+    # HELPERS — NEW WIND EXTRACTION (FIXED FOR km/h)
     # ──────────────────────────────────────────────────────────────
     def _extract_wind(self, wind_values: list, gust_values: list, num_periods: int) -> Dict:
-        """Extract ambient wind min/max and gust max, convert to mph, categorize."""
+        """
+        Extract ambient wind min/max and gust max, convert to mph, categorize.
+
+        NWS gridpoint windSpeed and windGust are provided in km/h
+        (uom: 'wmoUnit:km_h-1'), so we convert using:
+
+            mph = km/h * 0.621371
+        """
 
         def to_mph(raw):
             if raw is None:
                 return None
-            # NWS grid is almost always in m/s or knots.
-            # We detect typical ranges:
-            if raw < 60:  # assume m/s
-                return raw * 2.23694
-            else:  # knots (unlikely for grid, but safe)
-                return raw * 1.15078
+            # Convert km/h → mph
+            return raw * 0.621371
 
         # Ambient winds
-        ambient = [to_mph(v.get('value')) for v in wind_values[:num_periods] if v.get('value') is not None]
-        ambient_min = int(min(ambient)) if ambient else None
-        ambient_max = int(max(ambient)) if ambient else None
+        ambient_vals = []
+        for v in wind_values[:num_periods]:
+            raw = v.get('value')
+            if raw is not None:
+                mph = to_mph(raw)
+                if mph is not None:
+                    ambient_vals.append(mph)
+
+        ambient_min = int(min(ambient_vals)) if ambient_vals else None
+        ambient_max = int(max(ambient_vals)) if ambient_vals else None
 
         # Gusts
-        gusts = [to_mph(v.get('value')) for v in gust_values[:num_periods] if v.get('value') is not None]
-        gust_max = int(max(gusts)) if gusts else None
+        gust_vals = []
+        for v in gust_values[:num_periods]:
+            raw = v.get('value')
+            if raw is not None:
+                mph = to_mph(raw)
+                if mph is not None:
+                    gust_vals.append(mph)
 
-        # Category (using strongest value)
-        strongest = max([x for x in [ambient_max, gust_max] if x is not None], default=None)
+        gust_max = int(max(gust_vals)) if gust_vals else None
+
+        # Category (using strongest value in mph)
+        candidates = [x for x in (ambient_max, gust_max) if x is not None]
+        strongest = max(candidates) if candidates else None
 
         if strongest is None:
             category = "unknown"
@@ -287,6 +305,7 @@ class NWSStormOutlook:
             "gust_max_mph": gust_max,
             "category": category
         }
+
 
 # Test with all resorts
 def test_all_resorts_with_banner():
@@ -344,4 +363,3 @@ def test_all_resorts_with_banner():
 
 if __name__ == "__main__":
     test_all_resorts_with_banner()
-
