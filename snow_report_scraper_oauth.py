@@ -1970,6 +1970,12 @@ def main():
                 if coords:
                     try:
                         snow_data['nws_forecast'] = nws_fetcher.get_outlook(coords["lat"], coords["lon"])
+                        #debug
+                        if resort_name == "BigMountain":
+                            logging.info(f"NWS DEBUG BigMountain: {snow_data['nws_forecast']}")
+
+                        
+                        #debug
                         time.sleep(0.3) 
                     except Exception as e:
                         logging.warning(f"NWS fetch failed for {resort_name}: {e}")

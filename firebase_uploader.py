@@ -14,6 +14,7 @@ Environment Variables Required:
 import os
 import json
 import sys
+import ast
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -61,6 +62,45 @@ def initialize_firebase() -> Optional[firestore.Client]:
         return None
 
 
+def _parse_object_field(value, field_name: str):
+    """
+    Safely convert a CSV cell back into a Python object.
+
+    Handles:
+      - already-a-dict/list → returned as-is
+      - JSON strings        → json.loads
+      - Python-literal dict → ast.literal_eval
+      - bad/empty strings   → None
+    """
+    # Already in structured form
+    if isinstance(value, (dict, list)):
+        return value
+
+    # Nothing to parse
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text or text.lower() in ("nan", "none", "null"):
+        return None
+
+    # Try JSON first
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Fallback to literal_eval (handles Python dict strings)
+    try:
+        return ast.literal_eval(text)
+    except Exception:
+        print(f"⚠️  Could not parse {field_name} = {repr(value)}, setting to null.")
+        return None
+
+
 def save_resort_data_to_firestore(resort_data: Dict) -> bool:
     """
     Save a single resort's data to Firestore.
@@ -79,29 +119,28 @@ def save_resort_data_to_firestore(resort_data: Dict) -> bool:
             print(f"⚠️  Missing required fields (resort or date)")
             return False
         
-        # --- NEW LOGIC TO CONVERT STRING DATA TO OBJECTS ---
-        # Pandas reads the object columns as strings, we need to convert them back
+        # --- CONVERT STRING DATA BACK TO OBJECTS (nws_forecast, snotel_data) ---
         for key in ['nws_forecast', 'snotel_data']:
-            if isinstance(resort_data.get(key), str):
-                try:
-                    # Convert the string '{"key": "value"}' into a real object
-                    # We use eval() here because it handles Python dicts (like {'key': None})
-                    # which json.loads would fail on.
-                    resort_data[key] = eval(resort_data[key])
-                except Exception:
-                    # If it's a bad string (like "nan"), just set it to None
-                    print(f"⚠️  Could not parse {key} string, setting to null.")
-                    resort_data[key] = None
-        # --- END NEW LOGIC ---
+            resort_data[key] = _parse_object_field(resort_data.get(key), key)
 
-        # Collection: snow_reports (Your original, correct collection)
+        # Collection: snow_reports
         collection_ref = db.collection('snow_reports')
         
-        # Document ID: resort_YYYY-MM-DD_HH-MM-SS (Your original, correct ID)
-        doc_id = f"{resort_name}_{timestamp_str.replace(' ', '_').replace(':', '-')}"
+        # Document ID: resort_YYYY-MM-DD_HH-MM-SS  (keeps your original pattern)
+        if not timestamp_str:
+            # Fallback to just date if timestamp missing
+            doc_id = f"{resort_name}_{date_str}"
+        else:
+            doc_id = f"{resort_name}_{timestamp_str.replace(' ', '_').replace(':', '-')}"
         
         # Check for existing entries on the same date (prevent duplicates)
-        existing_query = collection_ref.where('resort', '==', resort_name).where('date', '==', date_str).limit(5).stream()
+        existing_query = (
+            collection_ref
+            .where('resort', '==', resort_name)
+            .where('date', '==', date_str)
+            .limit(5)
+            .stream()
+        )
         
         deleted_count = 0
         for doc in existing_query:
@@ -111,7 +150,7 @@ def save_resort_data_to_firestore(resort_data: Dict) -> bool:
         if deleted_count > 0:
             print(f"🗑️  Deleted {deleted_count} existing Firestore entry(ies) for {resort_name} on {date_str}")
         
-        # Add new document
+        # Add new document (includes nested nws_forecast with 'wind', if present)
         collection_ref.document(doc_id).set(resort_data)
         print(f"✅ Saved to Firestore: {resort_name} ({date_str})")
         return True
@@ -150,8 +189,10 @@ def upload_all_resorts(resort_data_list: List[Dict]) -> Dict[str, int]:
     
     print(f"\n📊 Upload Summary: {success_count} succeeded, {failed_count} failed")
     
-    return {'success': 0, 'failed': 0} # This was a bug, fixed to success_count, failed_count
-    
+    # FIXED: return real counts, not zeros
+    return {'success': success_count, 'failed': failed_count}
+
+
 def get_historical_data(resort_name: str, days: int = 5) -> List[Dict]:
     """
     (This function is not used by the uploader, but is safe to keep for testing)
@@ -162,11 +203,15 @@ def get_historical_data(resort_name: str, days: int = 5) -> List[Dict]:
             return []
     
     try:
-        # (Rest of this function is unchanged)
         today = datetime.now().date()
         start_date = today - timedelta(days=days)
         collection_ref = db.collection('snow_reports')
-        query = collection_ref.where('resort', '==', resort_name).where('date', '>=', start_date.strftime('%Y-%m-%d')).order_by('date', direction=firestore.Query.DESCENDING)
+        query = (
+            collection_ref
+            .where('resort', '==', resort_name)
+            .where('date', '>=', start_date.strftime('%Y-%m-%d'))
+            .order_by('date', direction=firestore.Query.DESCENDING)
+        )
         docs = query.stream()
         results = []
         for doc in docs:
@@ -177,9 +222,6 @@ def get_historical_data(resort_name: str, days: int = 5) -> List[Dict]:
     except Exception as e:
         print(f"❌ Error retrieving historical data for {resort_name}: {e}")
         return []
-
-# (The get_chart_data_from_firestore function is also not used by the uploader)
-# (It's safe to keep, but we'll skip it here for brevity)
 
 
 if __name__ == "__main__":
@@ -196,13 +238,17 @@ if __name__ == "__main__":
     # 1. Initialize Firebase
     if initialize_firebase() is None:
         print("❌ Firebase connection failed. Exiting.")
-        sys.exit(1) # Exit the script with an error
+        sys.exit(1)  # Exit the script with an error
     
     # 2. Find all the CSV files in the data directory
     try:
         all_files = os.listdir(DATA_DIR)
         # Find only the CSV files that are *not* in a sub-directory
-        csv_files = [f for f in all_files if f.endswith('_snow_report.csv') and os.path.isfile(os.path.join(DATA_DIR, f))]
+        csv_files = [
+            f for f in all_files
+            if f.endswith('_snow_report.csv')
+            and os.path.isfile(os.path.join(DATA_DIR, f))
+        ]
         
         if not csv_files:
             print(f"⚠️  No CSV files found in {DATA_DIR}")
@@ -216,7 +262,7 @@ if __name__ == "__main__":
             try:
                 csv_path = os.path.join(DATA_DIR, csv_file)
                 # Use na_filter=False to prevent "nan" strings for null values
-                df = pd.read_csv(csv_path, na_filter=False) 
+                df = pd.read_csv(csv_path, na_filter=False)
                 
                 # Get the most recent row (which is the last row)
                 latest_data = df.iloc[-1].to_dict()
