@@ -679,8 +679,10 @@ class EmailSnowReportMessenger:
   </div>
   <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:{EmailTheme.BG_OUTER};">
     <tr>
-      <td align="center" style="padding:24px;">
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="700" class="container" style="width:700px; max-width:100%; background:{EmailTheme.BG_CONTAINER}; border-radius:16px; overflow:hidden; box-shadow:0 8px 24px {EmailTheme.SHADOW};">
+      <!-- reduced padding so the card comes closer to the edges of the reading pane -->
+      <td align="center" style="padding:8px;">
+        <!-- changed width from 700 to 100%, and style width:700px to 100% -->
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" class="container" style="width:100%; max-width:100%; background:{EmailTheme.BG_CONTAINER}; border-radius:16px; overflow:hidden; box-shadow:0 8px 24px {EmailTheme.SHADOW};">
           <tr>
             <td style="padding:24px 24px 16px 24px; background:linear-gradient(135deg,{EmailTheme.GRADIENT_START},{EmailTheme.GRADIENT_END});">
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
@@ -706,6 +708,7 @@ class EmailSnowReportMessenger:
             </td>
           </tr>
 """
+
 
     # -------------------------------------------------------------------------
     # HTML GENERATION - Powder Alert
@@ -819,6 +822,7 @@ class EmailSnowReportMessenger:
             display_name = self._get_display_name(resort_name)
             snow_24hr = int(round(self.get_24hr_snow(resort_data)))
             
+            # find this resort's chart entry
             resort_chart = next((c for c in chart_data if c['resort'] == resort_name), None)
             
             last_updated_str = resort_data.get('last_updated', '')
@@ -845,8 +849,19 @@ class EmailSnowReportMessenger:
             
             last_updated_display = last_updated_str.replace(' ', ' ') if last_updated_str else "N/A"
             
+            # mini-chart HTML (unchanged)
             chart_html = self._generate_mini_chart(resort_chart['values'] if resort_chart else [0,0,0,0,0])
-            
+
+            # NEW: 5-day total, from chart_data['total']
+            total_5day = 0
+            if resort_chart is not None:
+                try:
+                    total_5day = float(resort_chart.get('total', 0.0))
+                except (TypeError, ValueError):
+                    total_5day = 0.0
+            total_5day_int = int(round(total_5day))
+
+            # build row
             html.append(f"""
                   <tr class="stack-row">
                     <td class="stack-row-col stack-row-col-first" style="padding:10px 12px; background:{EmailTheme.BG_CARD}; border-radius:10px 0 0 10px; border:1px solid {EmailTheme.BORDER_SUBTLE};">
@@ -861,6 +876,10 @@ class EmailSnowReportMessenger:
                     </td>
                     <td class="stack-row-col stack-row-col-last" style="padding:10px 12px; background:{EmailTheme.BG_CARD}; border-radius:0 10px 10px 0; border:1px solid {EmailTheme.BORDER_SUBTLE};">
                       {chart_html}
+                      <!-- NEW: 5-day total below/right of the chart -->
+                      <div style="font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:11px; text-align:right; margin-top:4px;">
+                        5-day total: <span style="color:{EmailTheme.TEXT_PRIMARY}; font-weight:700;">{total_5day_int}"</span>
+                      </div>
                       <div class="hide-lg" style="display:none; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_SECONDARY}; font-size:12px; text-align:left; margin-top:4px;">5-Day Trend</div>
                     </td>
                   </tr>
@@ -899,31 +918,95 @@ class EmailSnowReportMessenger:
         
         return ''.join(html)
 
+
     def _generate_mini_chart(self, values: List[float]) -> str:
-        """Generate mini bar chart HTML."""
+        """Generate mini 5-day bar chart with true per-row proportional widths.
+
+        - Each resort uses its own max value for scaling.
+        - All 5 days are always rendered as 5 <td> cells.
+        - Non-zero segments get proportional widths; zero-days get a small fixed width.
+        """
+        # Oldest on the left, newest on the right in the final chart
         values_reversed = list(reversed(values))
-        max_val = max(max(values_reversed), 10)
-        
-        if all(v == 0 for v in values_reversed):
+
+        # If everything is zero, render a simple empty bar
+        if all((v or 0) == 0 for v in values_reversed):
             return f"""
     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-radius:6px; overflow:hidden;">
       <tr><td style="height:14px; background:{EmailTheme.BG_OUTER};"></td></tr>
     </table>
 """
-        
-        html = ['<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-radius:6px; overflow:hidden;"><tr>']
-        
-        for i, (val, color) in enumerate(zip(values_reversed, EmailTheme.CHART_COLORS)):
-            if val > 0:
-                width_pct = (val / max_val) * 100
-                text_color = EmailTheme.BG_CONTAINER if color == EmailTheme.CHART_COLORS[0] else EmailTheme.TEXT_WHITE
-                html.append(f'<td style="width:{width_pct:.1f}%; height:14px; background:{color}; color:{text_color}; font-size:11px; text-align:center;">{int(round(val))}"</td>')
+
+        # Clean and clamp to non-negative
+        vals = []
+        for v in values_reversed:
+            try:
+                vv = float(v or 0)
+            except (TypeError, ValueError):
+                vv = 0.0
+            vals.append(max(vv, 0.0))
+
+        max_val = max(vals)
+        if max_val <= 0:
+            # Defensive fallback
+            return f"""
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-radius:6px; overflow:hidden;">
+      <tr><td style="height:14px; background:{EmailTheme.BG_OUTER};"></td></tr>
+    </table>
+"""
+
+        # Fractions relative to this resort's max
+        fractions = [v / max_val if v > 0 else 0.0 for v in vals]
+        sum_frac = sum(fractions)
+
+        # How much width do we reserve for zeros?
+        zero_count = sum(1 for v in vals if v == 0)
+        zero_width_each = 2.0 if zero_count > 0 else 0.0
+        zeros_total = zero_width_each * zero_count
+
+        # Remaining width available for non-zero bars
+        pos_total_pct = max(0.0, 100.0 - zeros_total)
+
+        # Compute final widths for each day
+        widths: List[float] = []
+        for v, frac in zip(vals, fractions):
+            if v == 0:
+                widths.append(zero_width_each)
             else:
-                if i == 0 or values_reversed[i-1] == 0:
-                    html.append(f'<td style="height:14px; background:{EmailTheme.BG_CARD};"></td>')
-        
+                # Normalize among non-zero days
+                if sum_frac > 0:
+                    widths.append((frac / sum_frac) * pos_total_pct)
+                else:
+                    widths.append(0.0)
+
+        # Build HTML – *every* cell gets an explicit width
+        html = [
+            '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+            'width="100%" style="border-radius:6px; overflow:hidden;"><tr>'
+        ]
+
+        for v, w, color in zip(vals, widths, EmailTheme.CHART_COLORS):
+            if v > 0:
+                label = f'{int(round(v))}"'
+                text_color = (
+                    EmailTheme.BG_CONTAINER
+                    if color == EmailTheme.CHART_COLORS[0]
+                    else EmailTheme.TEXT_WHITE
+                )
+                html.append(
+                    f'<td style="width:{w:.1f}%; height:14px; background:{color}; '
+                    f'color:{text_color}; font-size:11px; text-align:center; '
+                    f'white-space:nowrap;">{label}</td>'
+                )
+            else:
+                # Zero day: small spacer segment with no label
+                html.append(
+                    f'<td style="width:{w:.1f}%; height:14px; background:{EmailTheme.BG_CARD};"></td>'
+                )
+
         html.append('</tr></table>')
         return ''.join(html)
+
     
     # -------------------------------------------------------------------------
     # HTML GENERATION - NWS STORM BANNER
@@ -1261,7 +1344,11 @@ class EmailSnowReportMessenger:
                 </tr>
                 <tr>
                     <td style="padding:6px 12px 12px 12px;">
-                        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+                        <table role="presentation" cellpadding="0" cellspacing="0" border="0"
+                           width="100%" class="container"
+                           style="width:100%; max-width:100%; background:{EmailTheme.BG_CONTAINER};
+                                  border-radius:16px; overflow:hidden; box-shadow:0 8px 24px {EmailTheme.SHADOW};">
+
                             <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">24-hr Snow Δ</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:700; text-align:right;">{snow_depth_display}</td></tr>
                             <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">24-hr SWE Δ</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{swe_display}</td></tr>
                             <tr><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_MUTED}; font-size:13px; width:52%;">Density</td><td style="padding:8px 10px; border-bottom:1px solid {EmailTheme.BORDER_MICRO}; font-family:Arial, Helvetica, sans-serif; color:{EmailTheme.TEXT_PRIMARY}; font-size:13px; font-weight:400; text-align:right;">{density_display}</td></tr>
