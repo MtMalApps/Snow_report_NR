@@ -711,6 +711,9 @@ def render_snotel_charts(history_df):
 # ──────────────────────────────────────────────────────────────
 # MODAL (DIALOG) LOGIC
 # ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# MODAL (DIALOG) LOGIC
+# ──────────────────────────────────────────────────────────────
 @st.dialog("Resort Details", width="large")
 def show_resort_modal(row):
     # --- STALE DATA CHECK ---
@@ -736,12 +739,16 @@ def show_resort_modal(row):
 
     tab1, tab2, tab3 = st.tabs(["🎿 CONDITIONS", "🏔️ SNOTEL", "🌦️ FORECAST"])
 
+    # ──────────────────────────────────────────────────────────
+    # TAB 1 — CONDITIONS
+    # ──────────────────────────────────────────────────────────
     with tab1:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Base Depth", f"{row['base_depth']:.0f}\"")
         c2.metric("Summit", f"{row['summit_depth']:.0f}\"")
         c3.metric("Overnight", f"{row['snow_overnight']:.0f}\"")
         
+        # Resort-reported surface wind (if present)
         f_wind = f"{row.get('wind_speed', 0):.0f} mph" if pd.notna(row.get('wind_speed')) else "N/A"
         c4.metric("Wind", f_wind)
         
@@ -749,28 +756,38 @@ def show_resort_modal(row):
         
         details_to_show = []
         def is_valid(val):
-            if val is None: return False
+            if val is None:
+                return False
             s = str(val).strip().lower()
             return s not in ["", "n/a", "none", "0", "null"]
 
-        if is_valid(row.get('lifts_open')): details_to_show.append(f"**Lifts Open:** {row['lifts_open']}")
-        if is_valid(row.get('runs_open')): details_to_show.append(f"**Runs Open:** {row['runs_open']}")
-        if is_valid(row.get('conditions_surface')): details_to_show.append(f"**Surface:** {row['conditions_surface']}")
+        if is_valid(row.get('lifts_open')):
+            details_to_show.append(f"**Lifts Open:** {row['lifts_open']}")
+        if is_valid(row.get('runs_open')):
+            details_to_show.append(f"**Runs Open:** {row['runs_open']}")
+        if is_valid(row.get('conditions_surface')):
+            details_to_show.append(f"**Surface:** {row['conditions_surface']}")
             
         if details_to_show:
-            for det in details_to_show: st.markdown(det)
+            for det in details_to_show:
+                st.markdown(det)
         else:
             st.caption("No operational details reported.")
         
         if display_comments:
             st.info(f"📝 {display_comments}")
 
+    # ──────────────────────────────────────────────────────────
+    # TAB 2 — SNOTEL
+    # ──────────────────────────────────────────────────────────
     with tab2:
         s_name = snotel.get('station_name', 'Station N/A')
-        if "snotel" not in s_name.lower(): s_name += " SNOTEL"
+        if "snotel" not in s_name.lower():
+            s_name += " SNOTEL"
         
         elev = snotel.get('elevation', '')
-        if elev: s_name += f" ({elev} ft)"
+        if elev:
+            s_name += f" ({elev} ft)"
         
         val_obs_raw = snotel.get('latest_observation', 'N/A')
         val_obs_display = val_obs_raw
@@ -781,7 +798,8 @@ def show_resort_modal(row):
             else:
                 dt_obs = datetime.strptime(val_obs_raw, "%Y-%m-%d")
                 val_obs_display = dt_obs.strftime("%b %d, %Y")
-        except: pass
+        except:
+            pass
             
         st.markdown(f"""
         <div style="line-height: 1.2; margin-bottom: 15px;">
@@ -794,17 +812,21 @@ def show_resort_modal(row):
             st.error(f"Data Unavailable: {snotel.get('error_reason', 'Unknown error')}")
         
         val_snow = snotel.get('snow_depth', 'N/A')
-        if isinstance(val_snow, (int, float)): val_snow = f"{val_snow}\""
+        if isinstance(val_snow, (int, float)):
+            val_snow = f"{val_snow}\""
             
         val_swe = snotel.get('swe', 'N/A')
-        if isinstance(val_swe, (int, float)): val_swe = f"{val_swe}\""
+        if isinstance(val_swe, (int, float)):
+            val_swe = f"{val_swe}\""
 
         # Use new total fields if available, otherwise fallback
         val_total_depth = snotel.get('snotel_total_depth', 'N/A')
-        if isinstance(val_total_depth, (int, float)): val_total_depth = f"{val_total_depth}\""
+        if isinstance(val_total_depth, (int, float)):
+            val_total_depth = f"{val_total_depth}\""
         
         val_total_swe = snotel.get('snotel_total_swe', 'N/A')
-        if isinstance(val_total_swe, (int, float)): val_total_swe = f"{val_total_swe}\""
+        if isinstance(val_total_swe, (int, float)):
+            val_total_swe = f"{val_total_swe}\""
 
         val_density = snotel.get('density', 'N/A')
         val_qual = snotel.get('snow_category', 'N/A')
@@ -869,6 +891,9 @@ def show_resort_modal(row):
         else:
             st.info("Chart unavailable (Missing triplet ID)")
 
+    # ──────────────────────────────────────────────────────────
+    # TAB 3 — NWS 48-HOUR FORECAST (NOW WITH WIND)
+    # ──────────────────────────────────────────────────────────
     with tab3:
         st.markdown("### 48-Hour Weather Outlook")
         
@@ -879,6 +904,25 @@ def show_resort_modal(row):
         f_high = f"{nws.get('temp_high_f', 'N/A')}°F"
         f_low = f"{nws.get('temp_low_f', 'N/A')}°F"
         f_cond = nws.get('conditions', 'N/A')
+
+        # ---- NEW: WIND FROM NWS GRIDPOINT ----
+        wind = nws.get("wind", {}) if isinstance(nws, dict) else {}
+        amb_min = wind.get("ambient_min_mph")
+        amb_max = wind.get("ambient_max_mph")
+        gust_max = wind.get("gust_max_mph")
+        category = wind.get("category", "N/A")
+
+        if amb_min is not None and amb_max is not None:
+            f_wind_range = f"{amb_min:.0f}–{amb_max:.0f} mph"
+        elif amb_max is not None:
+            f_wind_range = f"Up to {amb_max:.0f} mph"
+        elif amb_min is not None:
+            f_wind_range = f"{amb_min:.0f} mph"
+        else:
+            f_wind_range = "N/A"
+
+        f_gust = f"{gust_max:.0f} mph" if gust_max is not None else "N/A"
+        f_wind_cat = category.title() if isinstance(category, str) else "N/A"
         
         st.markdown(f"""
         <div class="data-grid">
@@ -899,12 +943,18 @@ def show_resort_modal(row):
                 <div class="data-label">Total Precip</div>
                 <div class="data-value">{f_precip}</div>
             </div>
+            <div class="data-item">
+                <div class="data-label">Winds (NWS)</div>
+                <div class="data-value">{f_wind_range}</div>
+                <div class="data-sub">Gusts: {f_gust} · {f_wind_cat}</div>
+            </div>
             <div class="data-item full-width">
                 <div class="data-label">Short Forecast</div>
                 <div class="data-value" style="font-size: 1rem;">{f_cond}</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
+
 
 # ──────────────────────────────────────────────────────────────
 # DATA HELPERS
