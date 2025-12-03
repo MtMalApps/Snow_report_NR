@@ -42,35 +42,113 @@ from nws_storm_outlook_v3 import NWSStormOutlook
 # =============================================================================
 
 # Dashboard URL
-DASHBOARD_URL = "https://northern-rockries-snow.streamlit.app/"
 DASHBOARD_URL = "https://northern-rockies-snow.streamlit.app/"
 
 # Powder Alert Threshold (inches of snow in 24 hours)
 POWDER_ALERT_THRESHOLD = 6
 
-# Resort coordinates for distance calculations
+
+# ──────────────────────────────────────────────────────────────
+# MASTER RESORT LIST + COORDS (MATCH DASHBOARD)
+# ──────────────────────────────────────────────────────────────
+
+MASTER_RESORTS = [
+    "Snowbowl",
+    "Discovery",
+    "LookoutPass",
+    "BigMountain",
+    "LostTrail",
+    "TetonPass",
+    "Showdown",
+    "Blacktail",
+    "BridgerBowl",
+    "BigSky",
+    "RedLodge",  # or "RedLodge" depending on what Firestore uses
+    "Maverick",
+    "GreatDivide",
+    "BearPaw",
+    "SilverMountain",
+    "TurnerMountain",
+    "Schweitzer",
+]
+
+
+def get_display_name(resort_name: str) -> str:
+    name_map = {
+        "LookoutPass": "Lookout Pass",
+        "BigMountain": "Big Mountain",
+        "LostTrail": "Lost Trail",
+        "TetonPass": "Teton Pass",
+        "Blacktail": "Blacktail",
+        "Snowbowl": "Snowbowl",
+        "Discovery": "Discovery",
+        "Showdown": "Showdown",
+        "BridgerBowl": "Bridger Bowl",
+        "BigSky": "Big Sky",
+        "RedLodge": "Red Lodge Mountain",
+        "RedLodgeMountain": "Red Lodge Mountain",
+        "GreatDivide": "Great Divide",
+        "BearPaw": "Bear Paw",
+        "SilverMountain": "Silver Mountain",
+        "Schweitzer": "Schweitzer",
+        "TurnerMountain": "Turner Mountain",
+        "Maverick": "Maverick",
+    }
+    return name_map.get(resort_name, resort_name)
+
+
+
+
+
+# Used for SNOTEL distance calculations in the email (similar to RESORTS_DATA in the dashboard)
 RESORT_COORDS = {
-    "Snowbowl": {"lat": 46.9137, "lon": -113.9525},
-    "Discovery": {"lat": 46.3861, "lon": -113.2144},
-    "LookoutPass": {"lat": 47.4536, "lon": -115.7414},
-    "BigMountain": {"lat": 48.4853, "lon": -114.3572},
-    "LostTrail": {"lat": 45.7019, "lon": -113.9219},
-    "TetonPass": {"lat": 47.9299, "lon": -112.8109},
-    "Showdown": {"lat": 46.9939, "lon": -110.6647},
-    "Blacktail": {"lat": 48.0067, "lon": -114.3589}
+    "Snowbowl":        {"lat": 47.032417,  "lon": -113.9915282},
+    "Discovery":       {"lat": 46.262206,  "lon": -113.246187},
+    "LookoutPass":     {"lat": 47.4531005, "lon": -115.706537},
+    "BigMountain":     {"lat": 48.502127,  "lon": -114.341252},
+    "LostTrail":       {"lat": 45.695247,  "lon": -113.965263},
+    "TetonPass":       {"lat": 47.929804,  "lon": -112.816723},
+    "Showdown":        {"lat": 46.837747,  "lon": -110.715599},
+    "Blacktail":       {"lat": 48.011676,  "lon": -114.365251},
+    "BridgerBowl":     {"lat": 45.813919,  "lon": -110.921873},
+    "BigSky":          {"lat": 45.280943,  "lon": -111.440644},
+    "RedLodge": {"lat": 45.181125, "lon": -109.354325},
+    "Maverick":        {"lat": 45.438286,  "lon": -113.142233},
+    "GreatDivide":     {"lat": 46.748900,  "lon": -112.328513},
+    "BearPaw":         {"lat": 48.162084,  "lon": -109.679937},
+    "SilverMountain":  {"lat": 47.499070,  "lon": -116.119163},
+    "TurnerMountain":  {"lat": 48.609788,  "lon": -115.648756},
+    "Schweitzer":      {"lat": 48.377785,  "lon": -116.633436},
 }
+
+
+
+
 
 # SNOTEL Station Info (needed for distance/elevation display)
 SNOTEL_STATION_INFO = {
-    "Showdown":    {"triplet": "437:MT:SNTL",  "name": "Deadman Creek",   "lat": 46.79, "lon": -110.68, "elevation": 6440},
-    "TetonPass":   {"triplet": "649:MT:SNTL",  "name": "Mount Lockhart",  "lat": 47.92, "lon": -112.82, "elevation": 6430},
-    "Discovery":   {"triplet": "850:MT:SNTL",  "name": "Warm Springs",    "lat": 46.27, "lon": -113.16, "elevation": 7840},
-    "LostTrail":   {"triplet": "727:MT:SNTL",  "name": "Saddle Mountain", "lat": 45.69, "lon": -113.97, "elevation": 7890},
-    "Snowbowl":    {"triplet": "901:MT:SNTL",  "name": "Stuart Mountain", "lat": 47.00, "lon": -113.93, "elevation": 7270},
-    "LookoutPass": {"triplet": "594:ID:SNTL",  "name": "Lookout",         "lat": 47.46, "lon": -115.70, "elevation": 5180},
-    "Blacktail":   {"triplet": "1144:MT:SNTL", "name": "Blacktail Mtn",   "lat": 47.98, "lon": -114.35, "elevation": 5660},
-    "BigMountain": {"triplet": "469:MT:SNTL",  "name": "Emery Creek",     "lat": 48.43, "lon": -113.94, "elevation": 4340},
+    # Existing
+    "Showdown":     {"triplet": "437:MT:SNTL",  "name": "Deadman Creek",   "lat": 46.79, "lon": -110.68, "elevation": 6440},
+    "TetonPass":    {"triplet": "649:MT:SNTL",  "name": "Mount Lockhart",  "lat": 47.92, "lon": -112.82, "elevation": 6430},
+    "Discovery":    {"triplet": "850:MT:SNTL",  "name": "Warm Springs",    "lat": 46.27, "lon": -113.16, "elevation": 7840},
+    "LostTrail":    {"triplet": "727:MT:SNTL",  "name": "Saddle Mountain", "lat": 45.69, "lon": -113.97, "elevation": 7890},
+    "Snowbowl":     {"triplet": "901:MT:SNTL",  "name": "Stuart Mountain", "lat": 47.00, "lon": -113.93, "elevation": 7270},
+    "LookoutPass":  {"triplet": "594:ID:SNTL",  "name": "Lookout",         "lat": 47.46, "lon": -115.70, "elevation": 5180},
+    "Blacktail":    {"triplet": "1144:MT:SNTL", "name": "Blacktail Mtn",   "lat": 47.98, "lon": -114.35, "elevation": 5660},
+    "BigMountain":  {"triplet": "469:MT:SNTL",  "name": "Emery Creek",     "lat": 48.43, "lon": -113.94, "elevation": 4340},
+    
+    # New Additions
+    "SilverMountain": {"triplet": "803:ID:SNTL", "name": "Sunset",            "lat": 47.56, "lon": -115.82, "elevation": 5580},
+    "TurnerMountain": {"triplet": "311:MT:SNTL", "name": "Banfield Mountain", "lat": 48.57, "lon": -115.45, "elevation": 5580},
+    "BearPaw":        {"triplet": "917:MT:SNTL", "name": "Rocky Boy",         "lat": 48.17, "lon": -109.65, "elevation": 4730},
+    "GreatDivide":    {"triplet": "903:MT:SNTL", "name": "Nevada Ridge",      "lat": 46.84, "lon": -112.51, "elevation": 7030},
+    "Schweitzer":     {"triplet": "738:ID:SNTL", "name": "Schweitzer Basin",  "lat": 48.37, "lon": -116.64, "elevation": 6090},
+    "Maverick":       {"triplet": "656:MT:SNTL", "name": "Mule Creek",        "lat": 45.41, "lon": -112.96, "elevation": 8300},
+    "BigSky":         {"triplet": "590:MT:SNTL", "name": "Lone Mountain",     "lat": 45.27, "lon": -111.43, "elevation": 8810},
+    "BridgerBowl":    {"triplet": "365:MT:SNTL", "name": "Brackett Creek",    "lat": 45.89, "lon": -110.94, "elevation": 7370},
+    "RedLodge":       {"triplet": "407:MT:SNTL", "name": "Cole Creek",        "lat": 45.19, "lon": -109.35, "elevation": 7910},
 }
+
 
 # Data directory (for CSV chart data)
 DATA_DIR = os.path.expanduser("~/snow_reports/data")
@@ -144,53 +222,136 @@ def initialize_firebase() -> Optional[firestore.Client]:
         traceback.print_exc()
         return None
 
-def get_latest_resort_data_from_firebase(db: firestore.Client) -> List[Dict]:
+def get_latest_resort_data_from_firebase(db) -> list[dict]:
     """
-    Retrieve the latest data for all resorts from Firebase.
-    Returns a list of resort data dictionaries.
+    Return a list of resort dicts, one for EACH entry in MASTER_RESORTS,
+    in that order, with Firestore data merged in when available.
+
+    This guarantees:
+      - All resorts appear in the email every day.
+      - SNOTEL + NWS dicts are present (possibly empty).
     """
-    try:
-        collection_ref = db.collection('snow_reports')
-        
-        # Get all documents
-        all_docs = collection_ref.stream()
-        
-        # Group by resort and get the latest for each
-        resort_map = {}
-        
-        for doc in all_docs:
-            data = doc.to_dict()
-            resort_name = data.get('resort')
-            timestamp_str = data.get('timestamp')
-            
-            if not resort_name or not timestamp_str:
-                continue
-            
-            # Parse timestamp
+    if db is None:
+        # No DB → just return default stubs for every resort
+        resort_list = []
+        for r in MASTER_RESORTS:
+            resort_list.append({
+                "resort": r,
+                "display_name": get_display_name(r),
+                "date": None,
+                "last_updated": "No Report",
+                "last_updated_dt": None,
+                "snow_overnight": 0.0,
+                "snow_24h_summit": 0.0,
+                "snow_24h_base": 0.0,
+                "base_depth": 0.0,
+                "summit_depth": 0.0,
+                "temp_base": None,
+                "temp_summit": None,
+                "wind_speed": None,
+                "lifts_open": "N/A",
+                "runs_open": "N/A",
+                "conditions_surface": "N/A",
+                "comments": "",
+                "nws_forecast": {},
+                "snotel_data": {},
+            })
+        return resort_list
+
+    # 1) Get most recent report date
+    latest_q = (
+        db.collection("snow_reports")
+        .order_by("date", direction=firestore.Query.DESCENDING)
+        .limit(1)
+        .stream()
+    )
+    latest_docs = [d.to_dict() for d in latest_q]
+    if not latest_docs:
+        # No reports at all → just stubs for all resorts
+        return get_latest_resort_data_from_firebase(None)
+
+    latest_date = latest_docs[0]["date"]
+
+    # 2) Grab all docs for that date
+    docs = (
+        db.collection("snow_reports")
+        .where(filter=firestore.FieldFilter("date", "==", latest_date))
+        .stream()
+    )
+    raw_rows = [d.to_dict() for d in docs]
+
+    # 3) Index by resort key
+    by_resort: dict[str, dict] = {}
+    for row in raw_rows:
+        r_key = row.get("resort")
+        if not r_key:
+            continue
+        by_resort[r_key] = row
+
+    # 4) Build full master list in fixed order
+    resort_list: list[dict] = []
+    for r in MASTER_RESORTS:
+        base = by_resort.get(r, {})
+
+        # Numeric helpers
+        def num(field, default=0.0):
             try:
-                timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
-            except ValueError:
-                continue
-            
-            # Keep only the latest entry for each resort
-            if resort_name not in resort_map:
-                resort_map[resort_name] = (timestamp, data)
-            else:
-                existing_timestamp = resort_map[resort_name][0]
-                if timestamp > existing_timestamp:
-                    resort_map[resort_name] = (timestamp, data)
-        
-        # Extract just the data (not timestamps)
-        resort_data_list = [data for timestamp, data in resort_map.values()]
-        
-        print(f"📊 Retrieved data for {len(resort_data_list)} resorts from Firebase")
-        return resort_data_list
-        
-    except Exception as e:
-        print(f"❌ Error retrieving data from Firebase: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
+                return float(base.get(field, default) or default)
+            except (TypeError, ValueError):
+                return default
+
+        # String helpers
+        def text(field, default="N/A"):
+            val = base.get(field, default)
+            if val is None:
+                return default
+            return str(val)
+
+        # Dict helpers
+        nws = base.get("nws_forecast")
+        if not isinstance(nws, dict):
+            nws = {}
+        snotel = base.get("snotel_data")
+        if not isinstance(snotel, dict):
+            snotel = {}
+
+        # last_updated parsing
+        last_updated_str = base.get("last_updated")
+        last_updated_dt = None
+        if last_updated_str:
+            try:
+                dt = datetime.strptime(last_updated_str, "%Y-%m-%d %H:%M")
+                last_updated_dt = dt.replace(tzinfo=LOCAL_TZ)
+            except Exception:
+                last_updated_dt = None
+
+        resort_list.append({
+            "resort": r,
+            "display_name": get_display_name(r),
+            "date": base.get("date", latest_date),
+            "last_updated": last_updated_str or "No Report",
+            "last_updated_dt": last_updated_dt,
+
+            "snow_overnight": num("snow_overnight", 0.0),
+            "snow_24h_summit": num("snow_24h_summit", 0.0),
+            "snow_24h_base": num("snow_24h_base", 0.0),
+            "base_depth": num("base_depth", 0.0),
+            "summit_depth": num("summit_depth", 0.0),
+            "temp_base": base.get("temp_base"),
+            "temp_summit": base.get("temp_summit"),
+            "wind_speed": base.get("wind_speed"),
+
+            "lifts_open": text("lifts_open"),
+            "runs_open": text("runs_open"),
+            "conditions_surface": text("conditions_surface"),
+            "comments": text("comments", ""),
+
+            "nws_forecast": nws,
+            "snotel_data": snotel,
+        })
+
+    return resort_list
+
 
 # =============================================================================
 # STALE DATA LOGIC (mirrors dashboard-style behavior)
@@ -423,7 +584,7 @@ class EmailSnowReportMessenger:
             - Then by display name.
             """
             resort_name = resort_data.get('resort', '')
-            display_name = self._get_display_name(resort_name)
+            display_name = get_display_name(resort_name)
     
             last_updated_str = resort_data.get('last_updated', '') or ''
             has_report = bool(last_updated_str and last_updated_str != 'N/A')
@@ -458,18 +619,9 @@ class EmailSnowReportMessenger:
             )
 
     def _get_display_name(self, resort_name: str) -> str:
-        """Get display-friendly resort name."""
-        name_map = {
-            "LookoutPass": "Lookout Pass",
-            "BigMountain": "Big Mountain",
-            "LostTrail": "Lost Trail",
-            "TetonPass": "Teton Pass",
-            "Blacktail": "Blacktail Mountain",
-            "Snowbowl": "Snowbowl",
-            "Discovery": "Discovery",
-            "Showdown": "Showdown"
-        }
-        return name_map.get(resort_name, resort_name)
+        return get_display_name(resort_name)
+
+
 
     def _check_powder_alert(self, resort_data_list: List[Dict]) -> bool:
         """Check if any resort has powder alert worthy snow."""
@@ -738,7 +890,7 @@ class EmailSnowReportMessenger:
                 snow_amount = self.get_24hr_snow(resort_data)
                 if snow_amount >= POWDER_ALERT_THRESHOLD:
                     powder_resorts.append({
-                        'name': self._get_display_name(resort_data['resort']),
+                        'name': get_display_name(resort_data['resort']),
                         'snow': int(round(snow_amount))
                     })
 
@@ -819,7 +971,7 @@ class EmailSnowReportMessenger:
         
         for resort_data in sorted_resorts:
             resort_name = resort_data['resort']
-            display_name = self._get_display_name(resort_name)
+            display_name = get_display_name(resort_name)
             snow_24hr = int(round(self.get_24hr_snow(resort_data)))
             
             # find this resort's chart entry
@@ -1031,7 +1183,7 @@ class EmailSnowReportMessenger:
                 continue
             
             ol = outlook['outlook']
-            resort_name = self._get_display_name(outlook['resort_name'])
+            resort_name = get_display_name(outlook['resort_name'])
             
             snow_amount = ol.get('total_snow_inches', 0) or 0
             precip_amount = ol.get('total_precip_inches', 0) or 0
@@ -1142,7 +1294,7 @@ class EmailSnowReportMessenger:
     def _generate_detailed_section(self, resort_data: Dict, snotel_data: Optional[Dict], nws_outlook: Optional[Dict], station_info: Optional[Dict]) -> str:
         """Generate detailed resort section with hero stats, data table, NWS, and SNOTEL."""
         resort_name = resort_data['resort']
-        display_name = self._get_display_name(resort_name)
+        display_name = get_display_name(resort_name)
         last_updated = resort_data.get('last_updated', 'N/A')
         
         snow_24hr = int(round(self.get_24hr_snow(resort_data)))
