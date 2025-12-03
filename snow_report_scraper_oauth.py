@@ -33,6 +33,8 @@ from zoneinfo import ZoneInfo
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -68,6 +70,8 @@ LOG_DIR = os.path.expanduser("~/snow_reports/logs")
 # Ensure directories exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
+
+LOCAL_TZ = ZoneInfo("America/Denver")
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -503,70 +507,190 @@ class LookoutPassScraper(BaseSnowReportScraper):
         super().__init__("LookoutPass")
 
     def get_url(self):
+        # Either /snow-report or /Snow-Report/ works; they redirect.
         return "https://skilookout.com/snow-report"
 
-    def _parse_snow_value(self, value_text):
-        if not value_text or '|' not in value_text:
-            return None, None
-        try:
-            summit_part, base_part = value_text.split('|')
-            summit = re.search(r'(\d+\.?\d*)', summit_part)
-            base = re.search(r'(\d+\.?\d*)', base_part)
-            return (summit.group(1) if summit else None,
-                    base.group(1) if base else None)
-        except:
-            return None, None
+    def _parse_snow_section(self, section_div):
+        """
+        Given a <div class="snow-report-section">, extract numeric values from
+        its <div class="snow-data"> rows and return a dict like:
+        {
+            "24h": 8.0,
+            "48h": 0.0,
+            "72h": 0.0,
+            "depth": 16.0,
+            "temp": 21.0
+        }
+        """
+        out = {}
+        for row in section_div.select("div.snow-data div.data-row"):
+            label_el = row.find("span", class_="label")
+            value_el = row.find("span", class_="value")
+            if not label_el or not value_el:
+                continue
 
-    def process_data(self, response):
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        data = {col: None for col in self.STANDARD_COLUMNS}
-        
-        last_updated_elem = soup.find('span', class_='sr_inner_txt_sml')
-        if last_updated_elem:
-            try:
-                date_str = last_updated_elem.text.strip()
-                date_str = re.sub(r'\s+(?:PST|PDT)$', '', date_str)
-                parsed_date = datetime.strptime(date_str, '%b %d %Y, %I:%M %p')
-                data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
-            except ValueError as e:
-                print(f"Error parsing last_updated date: {e}")
-        
-        snowfall_rows = soup.find_all('div', class_=['light_row', 'dark_row'])
-        for row in snowfall_rows:
-            left = row.find('div', class_='left')
-            right = row.find('div', class_='right')
-            
-            if left and right:
-                label = left.find('p')
-                value = right.find('p')
-                
-                if label and value:
-                    label_text = label.text.strip()
-                    value_text = value.text.strip()
-                    
-                    if '24-HR:' in label_text:
-                        summit, base = self._parse_snow_value(value_text)
-                        data['snow_24h_summit'] = self.clean_numeric(summit)
-                        data['snow_24h_base'] = self.clean_numeric(base)
-                    elif '48-HR:' in label_text:
-                        summit, base = self._parse_snow_value(value_text)
-                        data['snow_48h_summit'] = summit
-                        data['snow_48h_base'] = base
-                    elif 'Base:' in label_text:
-                        data['base_depth'] = value_text.replace('"', '')
-                    elif 'Summit:' in label_text:
-                        data['summit_depth'] = value_text.replace('"', '')
-                    elif 'Base Temp:' in label_text:
-                        data['temp_base'] = value_text.replace('°', '')
-                    elif 'Summit Temp:' in label_text:
-                        data['temp_summit'] = value_text.replace('°', '')
-                    elif 'Open:' in label_text:
-                        data['runs_open'] = value_text
-                    elif 'Conditions:' in label_text:
-                        data['conditions_surface'] = value_text
-        
+            label = label_el.get_text(strip=True)
+            value = value_el.get_text(strip=True)
+
+            if label.startswith("24h Snow"):
+                out["24h"] = self.clean_numeric(value)
+            elif label.startswith("48h Snow"):
+                out["48h"] = self.clean_numeric(value)
+            elif label.startswith("72h Snow"):
+                out["72h"] = self.clean_numeric(value)
+            elif label.startswith("Depth"):
+                out["depth"] = self.clean_numeric(value)
+            elif label.startswith("Temperature"):
+                out["temp"] = self.clean_numeric(value)
+
+        return out
+
+    def _extract_section_text(self, header_string: str, soup: BeautifulSoup) -> str:
+        """
+        Generic helper:
+        Find the heading whose text == header_string, then collect text from its
+        following siblings until the next heading of same or higher level.
+        Used mainly for 'Snow & Weather Notes' and 'Comments' further down page.
+        """
+        header = soup.find(
+            lambda tag: (
+                tag.name in ["h2", "h3", "h4", "h5", "h6"]
+                and tag.get_text(strip=True).lower() == header_string.lower()
+            )
+        )
+        if not header:
+            return ""
+
+        texts = []
+        for sib in header.find_next_siblings():
+            # Stop at next heading
+            if sib.name in ["h2", "h3", "h4", "h5", "h6"]:
+                break
+            txt = sib.get_text(" ", strip=True)
+            if txt:
+                texts.append(txt)
+        return "\n".join(texts)
+
+    def process_data(self, response) -> Dict:
+        soup = BeautifulSoup(response.text, "html.parser")
+        data = self.blank_record()
+
+        # ---------------------------------------------------------
+        # 1. Last updated ("Last updated: December 2, 2025 at 5:59 PM")
+        # ---------------------------------------------------------
+        ts_div = soup.find("div", class_="powderwatch-timestamp")
+        if ts_div:
+            text = ts_div.get_text(strip=True)
+            m = re.search(r"Last updated:\s*(.+)", text)
+            if m:
+                raw = m.group(1).strip()  # "December 2, 2025 at 5:59 PM"
+                try:
+                    raw_for_parse = raw.replace(" at ", " ")
+                    parsed = datetime.strptime(raw_for_parse, "%B %d, %Y %I:%M %p")
+                    data["last_updated"] = parsed.strftime("%Y-%m-%d %I:%M %p")
+                except Exception:
+                    # Fallback to raw string if parsing fails
+                    data["last_updated"] = raw
+
+        # ---------------------------------------------------------
+        # 2. Summit + Base snow sections
+        # ---------------------------------------------------------
+        for section in soup.select("div.snow-report-section"):
+            title_el = section.find("h4")
+            if not title_el:
+                continue
+            title = title_el.get_text(strip=True).lower()
+            metrics = self._parse_snow_section(section)
+
+            if "summit" in title:
+                if "24h" in metrics:
+                    data["snow_24h_summit"] = metrics["24h"]
+                if "48h" in metrics:
+                    data["snow_48h_summit"] = metrics["48h"]
+                if "depth" in metrics:
+                    data["summit_depth"] = metrics["depth"]
+                if "temp" in metrics:
+                    data["temp_summit"] = metrics["temp"]
+
+            elif "base" in title:
+                if "24h" in metrics:
+                    data["snow_24h_base"] = metrics["24h"]
+                if "48h" in metrics:
+                    data["snow_48h_base"] = metrics["48h"]
+                if "depth" in metrics:
+                    data["base_depth"] = metrics["depth"]
+                if "temp" in metrics:
+                    data["temp_base"] = metrics["temp"]
+
+        # ---------------------------------------------------------
+        # 3. "New snow since 4pm: 6″"  -> snow_overnight
+        # ---------------------------------------------------------
+        ns_div = soup.find("div", class_="new-snow-since-4pm")
+        if ns_div:
+            text = ns_div.get_text(" ", strip=True)
+            m = re.search(r"New snow since 4pm:\s*([\d\.]+)", text, re.I)
+            if m:
+                data["snow_overnight"] = self.clean_numeric(m.group(1))
+
+        # ---------------------------------------------------------
+        # 4. Current Weather ("Current Weather" section)
+        # ---------------------------------------------------------
+        weather_section = soup.find("div", class_="weather-section")
+        if weather_section:
+            for row in weather_section.select("div.weather-data div.data-row"):
+                label_el = row.find("span", class_="label")
+                value_el = row.find("span", class_="value")
+                if not label_el or not value_el:
+                    continue
+                label = label_el.get_text(strip=True)
+                value = value_el.get_text(strip=True)
+                if label.startswith("Conditions"):
+                    data["weather_current"] = value
+
+        # ---------------------------------------------------------
+        # 5. Surface Conditions (Primary / Secondary) DOM-based
+        # ---------------------------------------------------------
+        surface_section = soup.find("div", class_="surface-section")
+        primary = None
+        secondary = None
+        if surface_section:
+            for row in surface_section.select("div.surface-data div.data-row"):
+                label_el = row.find("span", class_="label")
+                value_el = row.find("span", class_="value")
+                if not label_el or not value_el:
+                    continue
+                label = label_el.get_text(strip=True)
+                value = value_el.get_text(strip=True)
+                if label.startswith("Primary"):
+                    primary = value
+                elif label.startswith("Secondary"):
+                    secondary = value
+
+        if primary and secondary:
+            data["conditions_surface"] = f"{primary}, {secondary}"
+        elif primary:
+            data["conditions_surface"] = primary
+
+        # ---------------------------------------------------------
+        # 6. Snow & Weather Notes + Comments -> comments
+        # (These are further down the page under <h3>Snow & Weather Notes</h3>, <h3>Comments</h3>)
+        # ---------------------------------------------------------
+        notes_text = self._extract_section_text("Snow & Weather Notes", soup)
+        comments_text = self._extract_section_text("Comments", soup)
+
+        comment_parts = []
+        if notes_text:
+            comment_parts.append(normalize_text(notes_text))
+        if comments_text:
+            comment_parts.append(normalize_text(comments_text))
+
+        if comment_parts:
+            data["comments"] = "\n\n".join(comment_parts)
+
+        data["data_source"] = "html_static"
         return data
+
+
 
 class BigMountainScraper(BaseSnowReportScraper):
     def __init__(self):
@@ -1608,6 +1732,116 @@ class RedLodgeScraper(BaseSnowReportScraper):
 
 
 
+### BIG SKY Scrapter  ###
+
+class BigSkyScraper(BaseSnowReportScraper):
+    """
+    Big Sky scraper - uses Big Sky's ReportPal JSON API.
+    Normalized to STANDARD_COLUMNS and integrated with the
+    BaseSnowReportScraper staleness + CSV pipeline.
+    """
+
+    def __init__(self):
+        super().__init__("BigSky")
+        self.API_URL = "https://www.bigskyresort.com/api/reportpal?resortName=bs&useReportPal=true"
+
+    def get_url(self) -> str:
+        return self.API_URL
+
+    def process_data(self, response) -> Dict:
+        api = response.json()
+        data = self.blank_record()
+
+        now_local = datetime.now(tz=LOCAL_TZ)
+
+        # -----------------------------
+        # Last updated (API gives UTC)
+        # -----------------------------
+        updated_raw = api.get("updated")
+        if updated_raw:
+            # Example: "2025-12-03T17:07:32Z"
+            try:
+                dt_utc = datetime.strptime(updated_raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=ZoneInfo("UTC")
+                )
+                dt_local = dt_utc.astimezone(LOCAL_TZ)
+                data["last_updated"] = dt_local.strftime("%Y-%m-%d %I:%M %p")
+            except Exception:
+                # If parsing ever breaks, at least keep the raw string
+                data["last_updated"] = updated_raw
+
+        # -----------------------------
+        # Core snow + operations data
+        # -----------------------------
+        current_conditions = api.get("currentConditions") or {}
+        resortwide = current_conditions.get("resortwide") or {}
+        resort_locations = current_conditions.get("resortLocations") or {}
+        locations = resort_locations.get("location") or []
+        location = locations[0] if locations else {}
+
+        def _get_inches(branch: Optional[Dict], key: str) -> Optional[float]:
+            if not branch:
+                return None
+            node = branch.get(key) or {}
+            inches = node.get("inches")
+            return self.clean_numeric(inches)
+
+        # Snow amounts (all in inches)
+        data["snow_overnight"] = _get_inches(location, "snowOverNight")
+        data["snow_24h_base"] = _get_inches(location, "snow24Hours")
+        data["snow_48h_base"] = _get_inches(location, "snow48Hours")
+        data["snow_7day"] = _get_inches(location, "snow7Days")
+        data["base_depth"] = _get_inches(location, "base")
+        data["summit_depth"] = None  # API does not clearly separate summit depth
+
+        # Lifts / runs (store as "open / total" like other scrapers)
+        lifts_open = resortwide.get("numLiftsOpen")
+        lifts_total = resortwide.get("numLiftsTotal")
+        trails_open = resortwide.get("numTrailsOpen")
+        trails_total = resortwide.get("numTrailsTotal")
+
+        if lifts_open is not None and lifts_total is not None:
+            data["lifts_open"] = f"{lifts_open} / {lifts_total}"
+        if trails_open is not None and trails_total is not None:
+            data["runs_open"] = f"{trails_open} / {trails_total}"
+
+        # Status string → treat as current weather / operating status
+        operations = api.get("operations") or {}
+        resort_status = operations.get("resortStatus")
+        if resort_status:
+            data["weather_current"] = resort_status
+
+        # -----------------------------
+        # Comments (strip HTML from first comment block)
+        # -----------------------------
+        comments_block = api.get("comments") or {}
+        comments_list = comments_block.get("comment") or []
+        comment_html = ""
+        for c in comments_list:
+            text = (c or {}).get("text") or ""
+            if text.strip():
+                comment_html = text
+                break
+
+        if comment_html:
+            # Remove simple HTML tags and normalize whitespace
+            comment_clean = re.sub(r"<[^>]+>", " ", comment_html)
+            comment_clean = re.sub(r"\s+", " ", comment_clean).strip()
+            data["comments"] = comment_clean
+
+        data["data_source"] = "api_reportpal"
+        return data
+
+
+
+
+
+
+
+
+
+
+
 # =============================================================================
 # SNOTEL DATA INTEGRATION (HOURLY)
 # =============================================================================
@@ -1938,6 +2172,7 @@ def main():
             BridgerBowlScraper(),
             MaverickScraper(),
             RedLodgeScraper(),
+            BigSkyScraper(), 
             # GreatDivideScraper(),
         ]
         
