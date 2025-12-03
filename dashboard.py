@@ -743,13 +743,33 @@ def show_resort_modal(row):
     # TAB 1 — CONDITIONS
     # ──────────────────────────────────────────────────────────
     with tab1:
+        # helper so we can show N/A for missing summit
+        def fmt_depth(val, allow_zero: bool = True) -> str:
+            if val is None:
+                return "N/A"
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                return "N/A"
+            if not allow_zero and v <= 0:
+                return "N/A"
+            return f"{v:.0f}\""
+
+        base_display = fmt_depth(row.get("base_depth"), allow_zero=True)
+        summit_display = fmt_depth(row.get("summit_depth"), allow_zero=False)
+        overnight_display = fmt_depth(row.get("snow_overnight"), allow_zero=True)
+
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Base Depth", f"{row['base_depth']:.0f}\"")
-        c2.metric("Summit", f"{row['summit_depth']:.0f}\"")
-        c3.metric("Overnight", f"{row['snow_overnight']:.0f}\"")
+        c1.metric("Base Depth", base_display)
+        c2.metric("Summit", summit_display)
+        c3.metric("Overnight", overnight_display)
         
         # Resort-reported surface wind (if present)
-        f_wind = f"{row.get('wind_speed', 0):.0f} mph" if pd.notna(row.get('wind_speed')) else "N/A"
+        f_wind = (
+            f"{row.get('wind_speed', 0):.0f} mph"
+            if pd.notna(row.get('wind_speed'))
+            else "N/A"
+        )
         c4.metric("Wind", f_wind)
         
         st.divider()
