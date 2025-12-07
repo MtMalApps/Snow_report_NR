@@ -773,6 +773,8 @@ def show_resort_modal(row):
         c4.metric("Wind", f_wind)
         
         st.divider()
+
+
         
         details_to_show = []
         def is_valid(val):
@@ -1019,8 +1021,8 @@ def load_latest_data(_db):
     master_rows = [{"display_name": k, "lat": v["lat"], "lon": v["lon"]} for k, v in RESORTS_DATA.items()]
     df_master = pd.DataFrame(master_rows)
 
+    # ───── NO FIREBASE AVAILABLE ─────
     if _db is None:
-        # No DB available → return zeros but keep structure sane
         for col in ["snow_24h_summit", "snow_24h_base", "base_depth", "summit_depth",
                     "snow_overnight", "temp_base", "temp_summit", "wind_speed"]:
             df_master[col] = 0
@@ -1034,11 +1036,13 @@ def load_latest_data(_db):
         df_master["comments"] = "N/A"
 
         df_master["last_updated_dt"] = pd.NaT
-        df_master["snow_24h_display"] = 0
+        df_master["last_updated_date"] = pd.NaT
+        df_master["snow_24h_display"] = 0.0
         df_master["is_powder"] = False
         df_master["has_report"] = False
         return df_master
 
+    # ───── FIREBASE AVAILABLE ─────
     try:
         # Get most recent snapshot date from Firestore
         latest_q = (
@@ -1052,10 +1056,11 @@ def load_latest_data(_db):
         df_final = df_master.copy()
 
         if latest:
-            latest_date = latest[0]["date"]
+            latest_date_str = latest[0].get("date")
+
             docs = (
                 _db.collection("snow_reports")
-                .where(filter=firestore.FieldFilter("date", "==", latest_date))
+                .where(filter=firestore.FieldFilter("date", "==", latest_date_str))
                 .stream()
             )
             rows = [d.to_dict() for d in docs]
@@ -1100,29 +1105,18 @@ def load_latest_data(_db):
         ).apply(
             lambda x: x.replace(tzinfo=LOCAL_TZ) if pd.notna(x) and x.tzinfo is None else x
         )
-
-        # ─────────────────────────────────────────────
-        # FRESHNESS RULE FOR 24H SNOW (TODAY ONLY)
-        # ─────────────────────────────────────────────
-        now_dt = datetime.now(LOCAL_TZ)
-        today = now_dt.date()
-
-        # Any resort not updated today has its 24h snow zeroed out
-        mask_not_today = df_final["last_updated_dt"].dt.date != today
-        df_final.loc[mask_not_today, ["snow_24h_summit", "snow_overnight", "snow_24h_base"]] = 0
-
-        # Display 24h snow = max(summit, base)
-        df_final["snow_24h_display"] = df_final[["snow_24h_summit", "snow_24h_base"]].max(axis=1)
-
-        # Powder flag
-        df_final["is_powder"] = df_final["snow_24h_display"] >= 6
-
-        # Has any report text vs "No Report"
-        df_final["has_report"] = df_final["last_updated"] != "N/A"
-
-        # ── SORT: by report flag, then DATE (no time), then 24h snow ──
         df_final["last_updated_date"] = df_final["last_updated_dt"].dt.date
 
+        # 24h display = max(summit, base)  (no zeroing by today here)
+        df_final["snow_24h_display"] = df_final[["snow_24h_summit", "snow_24h_base"]].max(axis=1)
+
+        # General powder flag
+        df_final["is_powder"] = df_final["snow_24h_display"] >= 6
+
+        # Has any report text vs "N/A"
+        df_final["has_report"] = df_final["last_updated"] != "N/A"
+
+        # Sort: by report flag, then last_updated_date, then 24h snow
         df_final = df_final.sort_values(
             ["has_report", "last_updated_date", "snow_24h_display"],
             ascending=[False, False, False],
@@ -1132,12 +1126,14 @@ def load_latest_data(_db):
 
     except Exception as e:
         if "snow_24h_display" not in df_master.columns:
-            df_master["snow_24h_display"] = 0
-            df_master["is_powder"] = False
-            df_master["last_updated"] = "No Report"
-            df_master["has_report"] = False
+            df_master["snow_24h_display"] = 0.0
+        df_master["is_powder"] = False
+        df_master["last_updated_dt"] = pd.NaT
+        df_master["last_updated_date"] = pd.NaT
+        df_master["has_report"] = False
         st.error(f"Data error: {e}")
         return df_master
+
 
 
 
@@ -1177,68 +1173,143 @@ def load_historical_data(_db, days=5):
 def prepare_chart_data(df_hist, df_current):
     if df_hist.empty or df_current.empty:
         return pd.DataFrame()
-    resorts = df_current["display_name"].unique().tolist()
-    rows = []
-    today = datetime.now(LOCAL_TZ).date()
-    days = [(today - timedelta(days=i)) for i in range(4, -1, -1)]
 
+    df_hist = df_hist.copy()
+    # Normalize resort names from Firestore
     df_hist["temp_disp"] = df_hist["resort"].apply(get_display_name)
 
+    resorts = df_current["display_name"].unique().tolist()
+    today = datetime.now(LOCAL_TZ).date()
+    days = [(today - timedelta(days=i)) for i in range(4, -1, -1)]  # oldest → newest
+
+    rows = []
+
     for r_display in resorts:
-        subset = df_hist[df_hist["temp_disp"] == r_display]
+        resort_hist = df_hist[df_hist["temp_disp"] == r_display].copy()
+
+        # If we have no history at all, just add zeros for every day
+        if resort_hist.empty:
+            for d in days:
+                rows.append({"display_name": r_display, "date": d, "snow": 0.0})
+            continue
+
+        # Ensure last_updated_dt is parsed and localized
+        if "last_updated_dt" not in resort_hist.columns:
+            resort_hist["last_updated_dt"] = pd.to_datetime(
+                resort_hist["last_updated"], errors="coerce"
+            ).apply(
+                lambda x: x.replace(tzinfo=LOCAL_TZ) if pd.notna(x) and x.tzinfo is None else x
+            )
+
+        resort_hist["last_updated_date"] = resort_hist["last_updated_dt"].dt.date
+
         for d in days:
-            qd = pd.Timestamp(d, tz=LOCAL_TZ)
-            row = subset[subset["query_date"].dt.date == d]
+            # Rows where the *report* actually belongs to day d
+            day_rows = resort_hist[resort_hist["last_updated_date"] == d]
             snow = 0.0
-            if not row.empty:
-                raw_summit = float(row.iloc[0].get("snow_24h_summit", 0) or 0)
-                raw_base = float(row.iloc[0].get("snow_24h_base", 0) or 0)
+
+            if not day_rows.empty:
+                # If multiple snapshots for the same day exist, use the most recent by query_date
+                if "query_date" in day_rows.columns:
+                    day_rows = day_rows.sort_values("query_date", ascending=False)
+
+                row = day_rows.iloc[0]
+                raw_summit = float(row.get("snow_24h_summit", 0) or 0)
+                raw_base = float(row.get("snow_24h_base", 0) or 0)
                 raw = max(raw_summit, raw_base)
-                report_day = row.iloc[0]["last_updated_dt"].date()
-                if raw > 0 and report_day == d:
+
+                if raw > 0:
                     snow = raw
+
             rows.append({"display_name": r_display, "date": d, "snow": snow})
-    
+
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame()
-    totals = df.groupby("display_name", as_index=False)["snow"].sum().rename(columns={"snow": "total_snow"})
+
+    totals = (
+        df.groupby("display_name", as_index=False)["snow"]
+        .sum()
+        .rename(columns={"snow": "total_snow"})
+    )
     return df.merge(totals, on="display_name")
+
+
+
 
 # ──────────────────────────────────────────────────────────────
 # MAP FUNCTION
 # ──────────────────────────────────────────────────────────────
 def create_map(df):
+    today = datetime.now(LOCAL_TZ).date()
+
+    # Ensure last_updated_date exists (mirror leaderboard logic)
+    if "last_updated_date" not in df.columns:
+        df = df.copy()
+        df["last_updated_dt"] = pd.to_datetime(df["last_updated"], errors="coerce").apply(
+            lambda x: x.replace(tzinfo=LOCAL_TZ) if pd.notna(x) and x.tzinfo is None else x
+        )
+        df["last_updated_date"] = df["last_updated_dt"].dt.date
+    else:
+        # Work on a copy so we don't mutate the original df used elsewhere
+        df = df.copy()
+
     m = folium.Map(
-        location=[46.8, -113.5], zoom_start=7,
+        location=[46.8, -113.5],
+        zoom_start=7,
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
-        attr='Tiles &copy; Esri'
+        attr="Tiles &copy; Esri",
     )
     Fullscreen().add_to(m)
 
     for _, row in df.iterrows():
-        if pd.isna(row['lat']) or pd.isna(row['lon']):
+        if pd.isna(row["lat"]) or pd.isna(row["lon"]):
             continue
-        
-        snow_val = float(row['snow_24h_summit'])
-        has_data = row['last_updated'] != "N/A"
-        
-        if not has_data:
+
+        last_updated = row.get("last_updated", "N/A")
+        last_date = row.get("last_updated_date")
+        has_any_report = (last_updated != "N/A")
+        is_today = (last_date == today)
+
+        # --- TODAY'S 24H SNOW ONLY (map uses the same rule as leaderboard) ---
+        snow_today = 0.0
+        if is_today:
+            try:
+                snow_today = float(row.get("snow_24h_display", 0) or 0)
+            except (TypeError, ValueError):
+                snow_today = 0.0
+
+        # Decide visual styling
+        if not has_any_report:
+            # No data at all for this resort
             display_str = "n/a"
             bg_color = "rgba(100, 116, 139, 0.8)"
             text_color = "#e2e8f0"
             border = "2px solid #475569"
-            is_powder = False
+            is_powder_today = False
         else:
-            snow_val_display = float(row['snow_24h_display']) 
-            display_str = f"{int(snow_val_display)}\"" if snow_val_display.is_integer() else f"{snow_val_display:.1f}\""
-            if snow_val_display == 0:
+            # We have *some* report, but treat 24h snow as today's only
+            if snow_today <= 0:
                 display_str = "0\""
-            is_powder = row["is_powder"]
-            bg_color = "rgba(220, 38, 38, 0.9)" if is_powder else "rgba(255, 255, 255, 0.95)"
-            text_color = "white" if is_powder else "#1e293b"
-            border = "2px solid #b91c1c" if is_powder else "2px solid #3b82f6"
-        
+            else:
+                display_str = (
+                    f"{int(snow_today)}\""
+                    if float(snow_today).is_integer()
+                    else f"{snow_today:.1f}\""
+                )
+
+            # Powder only if it's *today's* snow and >= 6"
+            is_powder_today = is_today and (snow_today >= 6.0)
+
+            if is_powder_today:
+                bg_color = "rgba(220, 38, 38, 0.9)"      # red bubble
+                text_color = "white"
+                border = "2px solid #b91c1c"
+            else:
+                bg_color = "rgba(255, 255, 255, 0.95)"   # normal white bubble
+                text_color = "#1e293b"
+                border = "2px solid #3b82f6"
+
         html_icon = f"""
         <div style="position: absolute; transform: translate(-50%, -50%); display: flex; flex-direction: column; align-items: center; justify-content: center; width: 120px;">
             <div style="background: {bg_color}; color: {text_color}; border: {border}; border-radius: 50%; width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; font-family: sans-serif; font-weight: 900; font-size: 15px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); margin-bottom: 4px;">
@@ -1249,12 +1320,15 @@ def create_map(df):
             </div>
         </div>
         """
+
         folium.Marker(
-            location=[row['lat'], row['lon']],
+            location=[row["lat"], row["lon"]],
             icon=folium.DivIcon(html=html_icon),
-            tooltip=row['display_name']
+            tooltip=row["display_name"],
         ).add_to(m)
+
     return m
+
 
 # ──────────────────────────────────────────────────────────────
 # MAIN APP
@@ -1272,41 +1346,80 @@ st.markdown(f"""
     </div>
 """, unsafe_allow_html=True)
 
+
 # 1. Powder Alert
-powder_resorts = df[df['is_powder'] == True]
+today = datetime.now(LOCAL_TZ).date()
+
+# Make sure last_updated_date exists (from load_latest_data) – if not, compute it
+if "last_updated_date" not in df.columns:
+    df["last_updated_dt"] = pd.to_datetime(df["last_updated"], errors="coerce").apply(
+        lambda x: x.replace(tzinfo=LOCAL_TZ) if pd.notna(x) and x.tzinfo is None else x
+    )
+    df["last_updated_date"] = df["last_updated_dt"].dt.date
+
+powder_resorts = df[
+    (df["is_powder"] == True) &
+    (df["last_updated_date"] == today)
+]
 powder_count = len(powder_resorts)
+
 if powder_count > 0:
     st.markdown(f"""
         <div class='powder-alert'>
             <div class='powder-alert-title'>🔥 POWDER ALERT!</div>
             <div class='powder-alert-text'>
-                <strong>{powder_count}</strong> {'resort is' if powder_count == 1 else 'resorts are'} reporting 6" or more fresh snow!
+                <strong>{powder_count}</strong> {'resort is' if powder_count == 1 else 'resorts are'} reporting 6" or more fresh snow today!
             </div>
         </div>
     """, unsafe_allow_html=True)
+
     cols_per_row = 4
     for i in range(0, powder_count, cols_per_row):
         cols = st.columns(cols_per_row)
         batch = powder_resorts.iloc[i:i+cols_per_row]
         for idx, (_, resort) in enumerate(batch.iterrows()):
             with cols[idx]:
-                st.metric(label=resort['display_name'], value=f"{resort['snow_24h_display']:.0f}\"", delta="POWDER")
+                st.metric(
+                    label=resort['display_name'],
+                    value=f"{resort['snow_24h_display']:.0f}\"",
+                    delta="POWDER"
+                )
 
-# 2. Leaderboard# 2. Leaderboard
+
+
+# 2. Leaderboard
 st.markdown("<div class='section-header'>📊 Today's Snow Leaderboard</div>", unsafe_allow_html=True)
+
+today = datetime.now(LOCAL_TZ).date()
+
+# Make sure last_updated_date exists
+if "last_updated_date" not in df.columns:
+    df["last_updated_dt"] = pd.to_datetime(df["last_updated"], errors="coerce").apply(
+        lambda x: x.replace(tzinfo=LOCAL_TZ) if pd.notna(x) and x.tzinfo is None else x
+    )
+    df["last_updated_date"] = df["last_updated_dt"].dt.date
+
+# NEW: 24h snow *for today only* in the table
+df["snow_24h_today"] = df.apply(
+    lambda r: r["snow_24h_display"] if r["last_updated_date"] == today else 0.0,
+    axis=1,
+)
+
 cols_map = {
     "display_name": "Resort",
-    "snow_24h_display": "24h Snow",
+    "snow_24h_today": "24h Snow",      # ← use the TODAY-filtered value
     "base_depth": "Base Depth",
     "summit_depth": "Summit Depth",
     "lifts_open": "Lifts",
     "runs_open": "Runs",
     "conditions_surface": "Surface",
     "last_updated": "Last Updated",
-    "comments": "comments" # Need this for stale checking
+    "comments": "comments",            # keep for stale checking
 }
-df_ld = df[[k for k in cols_map.keys() if k in df.columns]].rename(columns=cols_map) 
 
+df_ld = df[[k for k in cols_map.keys() if k in df.columns]].rename(columns=cols_map)
+
+# Format numeric columns for display
 for c in ["24h Snow", "Base Depth", "Summit Depth"]:
     if c in df_ld.columns:
         df_ld[c] = df_ld[c].apply(
@@ -1316,21 +1429,20 @@ for c in ["24h Snow", "Base Depth", "Summit Depth"]:
 
 # Logic to add warning icon to 'Last Updated' if comments indicate stale data
 def format_last_updated(row):
-    val = row['Last Updated']
-    comments = str(row.get('comments', ''))
-    if val == 'N/A':
-        return 'No Report'
+    val = row["Last Updated"]
+    comments = str(row.get("comments", ""))
+    if val == "N/A":
+        return "No Report"
     if "[⚠️ Report Stale]" in comments:
         return f"⚠️ {val}"
     return val
 
-df_ld['Last Updated'] = df_ld.apply(format_last_updated, axis=1)
+df_ld["Last Updated"] = df_ld.apply(format_last_updated, axis=1)
 
 # Drop comments column so it doesn't show in table
-df_ld = df_ld.drop(columns=['comments'])
+df_ld = df_ld.drop(columns=["comments"])
 
 st.markdown(df_ld.to_html(classes="styled-table", index=False, border=0), unsafe_allow_html=True)
-
 
 
 
