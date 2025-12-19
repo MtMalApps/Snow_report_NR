@@ -50,8 +50,9 @@ def main():
     
     # 1. Initialize Firebase
     if firebase_uploader.initialize_firebase() is None:
-        print("❌ Firebase connection failed. Exiting.")
-        sys.exit(1) # Exit the script with an error
+        print("❌ Firebase connection failed. Skipping upload step.")
+        return
+
     
     # 2. Find all the CSV files in the data directory
     try:

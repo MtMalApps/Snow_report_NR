@@ -91,6 +91,100 @@ def normalize_text(s: str) -> str:
         s = s.replace(orig, repl)
     
     return s
+    
+    
+def validate_scrape_minimums(resort_name: str, data: Optional[Dict]) -> List[str]:
+    """
+    Conservative checks: only flag when parsing looks clearly broken.
+    Returns a list of problems (empty list means OK).
+    """
+    if not data:
+        return ["no_data_returned"]
+
+    problems: List[str] = []
+
+    # Basic "wrong page" / interstitial hint
+    blob = " ".join([
+        str(data.get("comments") or ""),
+        str(data.get("weather_current") or ""),
+        str(data.get("conditions_surface") or ""),
+    ]).lower()
+
+    if "enable javascript" in blob:
+        problems.append("javascript_gate_page")
+
+    # Fragile resort-specific sanity checks
+    if resort_name == "Maverick":
+        core = [
+            data.get("snow_overnight"),
+            data.get("snow_24h_base"),
+            data.get("base_depth"),
+            data.get("summit_depth"),
+        ]
+        if all(v is None for v in core):
+            problems.append("missing_core_fields")
+
+    if resort_name == "GreatDivide":
+        if data.get("runs_open") is None:
+            problems.append("missing_runs_open")
+        if data.get("lifts_open") is None:
+            problems.append("missing_lifts_open")
+        if data.get("base_depth") is None:
+            problems.append("missing_base_depth")
+
+    return problems
+
+
+
+def quarantine_bad_scrape(resort_name: str, data: Dict, problems: List[str]) -> Dict:
+    """
+    Lenient mode: keep pipeline running, but prevent bad parses from poisoning output.
+    - wipe key numeric + ops fields to None (NOT 0.0)
+    - last_updated=None so your existing staleness logic can handle it
+    - add a clean warning to comments
+    - mark data_source='quarantined'
+    """
+    wipe_keys = [
+        "snow_overnight", "snow_24h_base", "snow_24h_summit",
+        "snow_48h_base", "snow_48h_summit", "snow_7day",
+        "base_depth", "summit_depth",
+        "temp_base", "temp_summit", "wind_speed",
+        "lifts_open", "runs_open",
+        "conditions_surface", "weather_current",
+        "forecast_base_temp_high", "forecast_base_temp_low",
+        "forecast_summit_temp_high", "forecast_summit_temp_low",
+        "forecast_precipitation", "forecast_snow",
+    ]
+    for k in wipe_keys:
+        data[k] = None
+
+    data["last_updated"] = None
+
+    prev = (data.get("comments") or "").strip()
+    warn = f"SCRAPE_WARNING: {resort_name} quarantined ({', '.join(problems)})."
+    data["comments"] = warn if not prev else f"{prev} | {warn}"
+
+    data["data_source"] = "quarantined"
+    return data
+
+
+def apply_quarantine_if_needed(scraper_name: str, snow_data: Optional[Dict]) -> Optional[Dict]:
+    """
+    One-liner helper for main():
+      snow_data = apply_quarantine_if_needed(scraper.resort_name, snow_data)
+    """
+    if not snow_data:
+        return snow_data
+
+    problems = validate_scrape_minimums(scraper_name, snow_data)
+    if problems:
+        logging.warning(f"{scraper_name} scrape looks wrong; quarantining: {problems}")
+        snow_data = quarantine_bad_scrape(scraper_name, snow_data, problems)
+
+    return snow_data
+
+
+
 
 # =============================================================================
 # BASE SCRAPER CLASS (WITH UNIVERSAL STALENESS CHECK)
@@ -126,19 +220,40 @@ class BaseSnowReportScraper(ABC):
             'Connection': 'keep-alive',
         }
 
-    @staticmethod
-    def clean_numeric(value):
-        if value is None or value == '' or value == 'N/A':
-            return 0.0
-        value_str = str(value).strip()
-        if '/' in value_str: value_str = value_str.split('/')[0]
-        for bad in ['"', '°', 'F', 'C', 'mph', 'in', '%']:
-            value_str = value_str.replace(bad, '')
-        cleaned = ''.join(c for c in value_str if c.isdigit() or c in ['.', '-'])
+    #@staticmethod
+    def clean_numeric(self, val):
+        """
+        Convert a value to float safely.
+        Returns None if val is None/blank/non-numeric.
+        """
+        if val is None:
+            return None
+    
+        # Already numeric
+        if isinstance(val, (int, float)):
+            return float(val)
+    
+        s = str(val).strip()
+        if not s:
+            return None
+    
+        s_lower = s.lower()
+        if s_lower in {"na", "n/a", "none", "null", "nan", "--"}:
+            return None
+    
+        # Remove common junk: quotes, commas, inches, etc.
+        s = s.replace(",", "").replace('"', "").replace("in", "").strip()
+    
+        # Treat ranges like "4-5" as None (avoids false changes)
+        if "-" in s and any(ch.isdigit() for ch in s):
+            return None
+    
         try:
-            return float(cleaned) if cleaned else 0.0
-        except ValueError:
-            return 0.0
+            return float(s)
+        except Exception:
+            return None
+
+
 
     @staticmethod
     def now_string() -> str:
@@ -172,68 +287,83 @@ class BaseSnowReportScraper(ABC):
             # Silent fail is okay here, we just won't be able to check staleness
             return None
 
-    def _check_and_fix_staleness(self, data: Dict):
+    def _check_and_fix_staleness(self, data: Dict) -> Dict:
         """
-        Logic: If 'last_updated' is missing, compare the data 'fingerprint' 
-        to the last database entry.
+        If last_updated is missing, determine whether the report is stale by
+        comparing a fingerprint of key values to the most recent Firebase record.
+    
+        Behavior:
+          - If fingerprint matches last report -> reuse last_updated and mark stale
+          - If fingerprint differs -> set last_updated to now
+          - Uses ASCII-only stale flag
+          - Treats None as None (NOT 0.0) to avoid false mismatches
         """
-        # If the scraper found a valid date string already, we usually trust it.
-        # This logic kicks in if the date is missing/empty.
-        if data.get('last_updated'):
+    
+        # If scraper explicitly set last_updated, trust it
+        if data.get("last_updated"):
             return data
-
+    
         last_report = self._fetch_last_report_from_firebase()
-        fallback_date = datetime.now().strftime('%Y-%m-%d %I:%M %p')
-        
+        fallback_date = datetime.now().strftime("%Y-%m-%d %I:%M %p")
+    
         if not last_report:
-            data['last_updated'] = fallback_date
+            data["last_updated"] = fallback_date
             return data
-
-        # Define the warning flag
-        STALE_FLAG = " [⚠️ Report Stale]"
-
-        # --- PREPARE OLD COMMENTS FOR COMPARISON ---
-        # We must strip the stale flag from the old report to ensure fair comparison
-        old_comments = str(last_report.get('comments', ''))
+    
+        STALE_FLAG = " [STALE]"
+    
+        old_comments = str(last_report.get("comments", "") or "")
         if STALE_FLAG in old_comments:
-            old_comments = old_comments.replace(STALE_FLAG, "")
-
-        # CREATE FINGERPRINTS
+            old_comments = old_comments.replace(STALE_FLAG, "").strip()
+    
+        # ------------------------------------------------------------------
+        # Helper: normalize numeric fields
+        # IMPORTANT: None stays None (no forced 0.0)
+        # ------------------------------------------------------------------
+        def norm(x):
+            if x is None:
+                return None
+            return self.clean_numeric(x)
+    
+        # ------------------------------------------------------------------
+        # Build fingerprints
+        # ------------------------------------------------------------------
         current_fingerprint = (
-            self.clean_numeric(data.get('snow_overnight')),
-            self.clean_numeric(data.get('snow_24h_base')),
-            self.clean_numeric(data.get('snow_24h_summit')),
-            self.clean_numeric(data.get('snow_7day')),
-            self.clean_numeric(data.get('base_depth')),
-            self.clean_numeric(data.get('summit_depth')),
-            len(str(data.get('comments', '')))
+            norm(data.get("snow_overnight")),
+            norm(data.get("snow_24h_base")),
+            norm(data.get("snow_24h_summit")),
+            norm(data.get("snow_7day")),
+            norm(data.get("base_depth")),
+            norm(data.get("summit_depth")),
+            len("" if str(data.get("comments") or "").strip().lower() == "none" else str(data.get("comments") or "")),
         )
-        
+    
         old_fingerprint = (
-            self.clean_numeric(last_report.get('snow_overnight')),
-            self.clean_numeric(last_report.get('snow_24h_base')),
-            self.clean_numeric(last_report.get('snow_24h_summit')),
-            self.clean_numeric(last_report.get('snow_7day')),
-            self.clean_numeric(last_report.get('base_depth')),
-            self.clean_numeric(last_report.get('summit_depth')),
-            len(old_comments) # <--- Use the cleaned length
-        )
+            norm(last_report.get("snow_overnight")),
+            norm(last_report.get("snow_24h_base")),
+            norm(last_report.get("snow_24h_summit")),
+            norm(last_report.get("snow_7day")),
+            norm(last_report.get("base_depth")),
+            norm(last_report.get("summit_depth")),
+            len("" if old_comments.strip().lower() == "none" else old_comments),
 
+        )
+    
+        # ------------------------------------------------------------------
+        # Decide stale vs updated
+        # ------------------------------------------------------------------
         if current_fingerprint == old_fingerprint:
-            # STALE DETECTED
-            print(f"[{self.resort_name}] Stale data detected (Fingerprint match). Reusing old date.")
-            data['last_updated'] = last_report.get('last_updated')
-            
-            # Add warning flag (Avoid duplicates)
-            current_comments = data.get('comments') or ""
-            if STALE_FLAG not in current_comments:
-                data['comments'] = current_comments + STALE_FLAG
+            # No change → stale
+            data["last_updated"] = last_report.get("last_updated")
+            comments = data.get("comments") or ""
+            if STALE_FLAG not in comments:
+                data["comments"] = (comments + STALE_FLAG).strip()
         else:
-            # FRESH DATA
-            print(f"[{self.resort_name}] Fresh data detected (Fingerprint changed). Assigning NOW.")
-            data['last_updated'] = fallback_date
-            
+            # Change detected → new report
+            data["last_updated"] = fallback_date
+    
         return data
+
 
     @abstractmethod
     def get_url(self) -> str:
@@ -323,106 +453,216 @@ class BaseSnowReportScraper(ABC):
 class SnowbowlScraper(BaseSnowReportScraper):
     def __init__(self):
         super().__init__("Snowbowl")
-    
+
     def get_url(self):
         return "https://www.montanasnowbowl.com/report.php"
-    
-    def process_data(self, response):
-            data_dict = {}
-            
-            try:
-                # Parse polling data from HTML comments
-                comment_pattern = r''
-                polling_data = re.search(comment_pattern, response.text, re.DOTALL)
-                
 
-                if polling_data:
-                    data_string = polling_data.group(1)
-                    pairs = data_string.split('|~')
-                    
-                    for pair in pairs:
-                        if '|' in pair:
-                            key, value = pair.split('|')
-                            data_dict[key.strip()] = value.strip()
-            except Exception as e:
-                print(f"Warning: Could not parse polling data for Snowbowl: {e}")
-                
-            # Initialize with all standard columns
-            data = {col: None for col in self.STANDARD_COLUMNS}
-            
-            # Map resort data to standard columns
-            data['summit_depth'] = data_dict.get('surface_depth_summit', '')
-            data['base_depth'] = data_dict.get('surface_depth_base', '')
-            data['temp_base'] = data_dict.get('current_temp_base', '')
-            data['lifts_open'] = data_dict.get('operations_lifts', '')
-            data['runs_open'] = data_dict.get('operations_trails', '')
-            data['comments'] = data_dict.get('comments', '')
-            
-            # Format last_updated
-            if data_dict.get('lastupdated'):
-                try:
-                    date_str = data_dict['lastupdated']
-                    parsed_date = datetime.strptime(date_str, '%A %b %d, %Y %I:%M %p')
-                    data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
-                except ValueError:
-                    data['last_updated'] = data_dict.get('lastupdated', '')
-            
-            if not data['last_updated']:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                for row in soup.find_all('tr'):
-                    row_text = row.get_text(strip=True)
-                    if 'Updated:' in row_text:
-                        match = re.search(r'Updated:(\w+\s+\w+\s+\d+,\s+\d{4}\s+\d+:\d+\s+[AP]M)', row_text)
-                        if match:
-                            try:
-                                date_str = match.group(1).strip()
-                                parsed_date = datetime.strptime(date_str, '%A %b %d, %Y %I:%M %p')
-                                data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
-                                break
-                            except ValueError as e:
-                                print(f"Error parsing Snowbowl table date: {e}")
-                
-            # HTML table parsing
+    def process_data(self, response):
+        data = self.blank_record()
+        soup = BeautifulSoup(response.text, "html.parser")
+        text = response.text
+
+        # ---------------------------------------------------------
+        # 1) Parse the Snowbowl embedded POLLING block (authoritative)
+        #    <!-- BEGIN POLLING -- ... -- END POLLING -->
+        #    Entries are: key|value|~
+        # ---------------------------------------------------------
+        data_dict = {}
+        try:
+            m = re.search(
+                r"<!--\s*BEGIN\s+POLLING\s*--(.*?)--\s*END\s+POLLING\s*-->",
+                text,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if m:
+                body = m.group(1)
+
+                # Grab all key|value|~ pairs, allowing value to contain newlines
+                pairs = re.findall(r"\s*([A-Za-z0-9_]+)\|([\s\S]*?)\|\~", body)
+                for k, v in pairs:
+                    data_dict[k.strip().lower()] = v.strip()
+        except Exception as e:
+            logging.warning(f"Warning: Could not parse polling data for Snowbowl: {e}")
+
+        # Helper: avoid assigning non-numeric junk into numeric-ish fields
+        def _safe_num(val):
+            if val is None:
+                return None
             try:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                rows = soup.find_all('tr')
-                for row in rows:
-                    base_cell = row.find('td', {'bgcolor': '#ffffff'})
-                    summit_cell = row.find('td', {'bgcolor': '#e6242b'})
-                    
-                    if base_cell and 'Base' in base_cell.text:
-                        cells = row.find_all('td')
-                        if len(cells) >= 5:
-                            data['snow_24h_base'] = self.clean_numeric(cells[2].text.strip())
-                            if not data['temp_base']:
-                                data['temp_base'] = cells[3].text.strip()
-                    
-                    if summit_cell and 'Summit' in summit_cell.text:
-                        cells = row.find_all('td')
-                        if len(cells) >= 5:
-                            data['snow_24h_summit'] = self.clean_numeric(cells[2].text.strip())
-                            data['temp_summit'] = cells[3].text.strip()
-                            data['wind_speed'] = self.clean_numeric(cells[4].text.strip())
-                
-                # Get surface conditions
-                conditions = []
-                condition_rows = soup.find_all('tr')
-                for row in condition_rows:
-                    condition_cell = row.find('td', {'bgcolor': '#e6242b'}) or row.find('td', {'bgcolor': '#ffffff'})
-                    if condition_cell and any(cond in condition_cell.text for cond in ['Powder:', 'Packed Powder:', 'Packed:', 'Machine Groomed:', 'Firm Packed:', 'Spring Snow:']):
-                        check_cell = row.find('img', {'src': re.compile(r'check\.gif$')})
-                        if check_cell:
-                            condition_text = condition_cell.text.strip().rstrip(':')
-                            conditions.append(condition_text)
-                
-                if conditions:
-                    data['conditions_surface'] = ', '.join(conditions)
+                return self.clean_numeric(str(val))
+            except Exception:
+                return None
+
+        def _safe_text(val):
+            if val is None:
+                return None
+            s = str(val).strip()
+            return s if s != "" else None
+
+        # Apply polling keys if present
+        if data_dict:
+            # Depths
+            bd = _safe_num(data_dict.get("surface_depth_base"))
+            sd = _safe_num(data_dict.get("surface_depth_summit"))
+            if bd is not None:
+                data["base_depth"] = bd
+            if sd is not None:
+                data["summit_depth"] = sd
+
+            # New snow totals
+            # newstormtotal appears to be "New Snow" (overnight / storm)
+            ns = _safe_num(data_dict.get("newstormtotal"))
+            if ns is not None:
+                data["snow_overnight"] = ns
+
+            # 24h totals
+            s24 = _safe_num(data_dict.get("24hourtotal"))
+            if s24 is not None:
+                data["snow_24h_base"] = s24
+                data["snow_24h_summit"] = s24
+
+            # Current base temp (numeric only)
+            tbase = _safe_num(data_dict.get("current_temp_base"))
+            if tbase is not None:
+                data["temp_base"] = tbase
+
+            # Current weather type is sometimes "Closed"
+            wc = _safe_text(data_dict.get("current_weather_type"))
+            if wc is not None:
+                data["weather_current"] = wc
+
+            # Operations (often blank when closed)
+            lifts = _safe_num(data_dict.get("operations_lifts"))
+            runs = _safe_num(data_dict.get("operations_trails"))
+            if lifts is not None:
+                data["lifts_open"] = int(lifts)
+            if runs is not None:
+                data["runs_open"] = int(runs)
+
+            # Comments (can contain lots of newlines)
+            c = _safe_text(data_dict.get("comments"))
+            if c is not None:
+                c = re.sub(r"\n{3,}", "\n\n", c).strip()
+                data["comments"] = c
+
+            # lastupdated (if present)
+            raw_last = _safe_text(data_dict.get("lastupdated"))
+            if raw_last:
+                try:
+                    parsed_date = datetime.strptime(raw_last, "%A %b %d, %Y %I:%M %p")
+                    data["last_updated"] = parsed_date.strftime("%Y-%m-%d %I:%M %p")
+                except Exception:
+                    data["last_updated"] = raw_last
+
+            data["data_source"] = "html_polling"
+
+        # ---------------------------------------------------------
+        # 2) Parse "Updated:" date from visible HTML (fallback)
+        #    <center><b>Updated:</b> Monday Dec 15, 2025 04:56 AM</center>
+        # ---------------------------------------------------------
+        if not data.get("last_updated"):
+            try:
+                m = re.search(r"Updated:\s*</b>\s*([^<\r\n]+)", text, re.IGNORECASE)
+                if m:
+                    raw = m.group(1).strip()
+                    try:
+                        parsed_date = datetime.strptime(raw, "%A %b %d, %Y %I:%M %p")
+                        data["last_updated"] = parsed_date.strftime("%Y-%m-%d %I:%M %p")
+                    except Exception:
+                        data["last_updated"] = raw
             except Exception as e:
-                print(f"Error parsing Snowbowl HTML table data: {e}")
-            
-            return data
+                logging.warning(f"Snowbowl: error finding Updated: {e}")
+
+        # ---------------------------------------------------------
+        # 3) Parse the main Base/Summit table as fallback only
+        #    Your previous logic was brittle and could mis-assign labels.
+        #    We only fill fields that are still missing.
+        # ---------------------------------------------------------
+        try:
+            # Find the table that contains headers "Snow Depth / New Snow / Temp / Wind"
+            # then read rows where first cell is Base/Summit
+            main_table = None
+            for t in soup.find_all("table"):
+                if "Snow Depth" in t.get_text(" ", strip=True) and "New Snow" in t.get_text(" ", strip=True):
+                    main_table = t
+                    break
+
+            if main_table:
+                for row in main_table.find_all("tr"):
+                    cells = row.find_all("td")
+                    if len(cells) < 5:
+                        continue
+                    label = cells[0].get_text(" ", strip=True).lower()
+
+                    if "base" in label:
+                        # columns: [Base, SnowDepth, NewSnow, Temp, Wind]
+                        if data.get("base_depth") is None:
+                            data["base_depth"] = _safe_num(cells[1].get_text(strip=True))
+                        if data.get("snow_24h_base") in (None, "", 0, 0.0):
+                            # Snowbowl’s "New Snow" here is not necessarily 24h, but it matches the polling totals when present
+                            v = _safe_num(cells[2].get_text(strip=True))
+                            if v is not None:
+                                data["snow_24h_base"] = v
+                        if data.get("temp_base") is None:
+                            v = _safe_num(cells[3].get_text(strip=True))
+                            if v is not None:
+                                data["temp_base"] = v
+                        if data.get("wind_speed") is None:
+                            v = _safe_num(cells[4].get_text(strip=True))
+                            if v is not None:
+                                data["wind_speed"] = v
+
+                    if "summit" in label:
+                        if data.get("summit_depth") is None:
+                            data["summit_depth"] = _safe_num(cells[1].get_text(strip=True))
+                        if data.get("snow_24h_summit") in (None, "", 0, 0.0):
+                            v = _safe_num(cells[2].get_text(strip=True))
+                            if v is not None:
+                                data["snow_24h_summit"] = v
+                        if data.get("temp_summit") is None:
+                            v = _safe_num(cells[3].get_text(strip=True))
+                            if v is not None:
+                                data["temp_summit"] = v
+                        if data.get("wind_speed") is None:
+                            v = _safe_num(cells[4].get_text(strip=True))
+                            if v is not None:
+                                data["wind_speed"] = v
+
+            # Surface conditions via checkmarks (still optional; Snowbowl often blanks these)
+            if not data.get("conditions_surface"):
+                conditions = []
+                for row in soup.find_all("tr"):
+                    t = row.get_text(" ", strip=True)
+                    if not t:
+                        continue
+                    if any(
+                        cond in t
+                        for cond in [
+                            "Powder:",
+                            "Packed Powder:",
+                            "Packed:",
+                            "Machine Groomed:",
+                            "Firm Packed:",
+                            "Spring Snow:",
+                        ]
+                    ):
+                        check_cell = row.find("img", {"src": re.compile(r"check\.gif$", re.I)})
+                        if check_cell:
+                            # Use the left cell label text without trailing colon
+                            label = t.split(":")[0].strip()
+                            conditions.append(label)
+
+                if conditions:
+                    data["conditions_surface"] = ", ".join(conditions)
+
+        except Exception as e:
+            logging.warning(f"Snowbowl: Error parsing HTML table data: {e}")
+
+        # Final fallback for data_source
+        data["data_source"] = data.get("data_source") or "html_static"
+        return data
+
+
 
 class DiscoveryScraper(BaseSnowReportScraper):
     def __init__(self):
@@ -1464,131 +1704,6 @@ class BridgerBowlScraper(BaseSnowReportScraper):
         return data
 
 
-class MaverickScraper(BaseSnowReportScraper):
-    """
-    Maverick scraper - extracts raw snow report text content directly from the 
-    __BOOTSTRAP_STATE__ JSON object embedded in the HTML.
-    """
-    
-    def __init__(self):
-        super().__init__("Maverick")
-
-    def get_url(self) -> str:
-        """Returns the URL for the static snow report page."""
-        return "https://www.skimaverick.com/weather"
-
-    def _find_text_content(self, data: Any) -> Optional[str]:
-        """
-        Recursively searches for the raw text content inside the nested JSON.
-        The raw text is always under the key 'insert' and contains 'Overnight'.
-        """
-        if isinstance(data, dict):
-            if 'insert' in data and isinstance(data['insert'], str) and 'Overnight' in data['insert']:
-                return data['insert']
-            for value in data.values():
-                result = self._find_text_content(value)
-                if result:
-                    return result
-        elif isinstance(data, list):
-            for item in data:
-                result = self._find_text_content(item)
-                if result:
-                    return result
-        return None
-
-    def process_data(self, response) -> Dict:
-        """
-        1. Find the __BOOTSTRAP_STATE__ JSON string.
-        2. Clean the JSON string of control characters.
-        3. Use recursive search to extract and parse the raw snow report content.
-        """
-        data = self.blank_record()
-        
-        try:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Find the script tag containing the JSON object
-            script_tag = soup.find('script', string=re.compile(r'window\.__BOOTSTRAP_STATE__'))
-            
-            if not script_tag:
-                 data['comments'] = "Could not find __BOOTSTRAP_STATE__ JSON script tag."
-                 data['data_source'] = 'error_no_json'
-                 return data
-            
-            # 1. Extract the raw JSON string
-            json_text = script_tag.string.split('=', 1)[1].strip().rstrip(';')
-            
-            # 2. AGGRESSIVE CLEANING FIX: Remove all invalid control characters
-            json_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_text)
-            
-            # 3. Load the JSON
-            bootstrap_data = json.loads(json_text)
-
-            # 4. Use the recursive search to find the content block
-            raw_data_content = self._find_text_content(bootstrap_data)
-            
-            if not raw_data_content:
-                 data['comments'] = "Found bootstrap JSON but could not find the snow report data using recursive search."
-                 data['data_source'] = 'error_no_content'
-                 return data
-            
-            raw_text = normalize_text(raw_data_content)
-            
-            # --- Regex Parsing of the Raw Text Content ---
-            
-            # Extract and store explicit surface conditions if they exist
-            surface_condition_match = re.search(r'Primary Surface Conditions:\s*(.*?)\n', raw_text, re.IGNORECASE | re.DOTALL)
-            
-            condition_value = ""
-            if surface_condition_match:
-                condition_value = surface_condition_match.group(1).strip()
-            
-            # FINAL FIX: If value is blank OR if it contains only the SECONDARY label (which happens if Primary is blank)
-            if not condition_value or condition_value == "Secondary Surface Conditions:":
-                 data['conditions_surface'] = None
-            else:
-                 data['conditions_surface'] = normalize_text(condition_value)
-
-            patterns = {
-                'snow_overnight': r'Overnight:\s*(\d+)',
-                'snow_24h_base': r'Last 24 hours:\s*(\d+)',
-                'snow_48h_base': r'Last 48 hours:\s*(\d+)',
-                'snow_7day': r'Last 7 days:\s*(\d+)',
-                'base_depth': r'Snow Depth \(base\):\s*(\d+)',
-                'summit_depth': r'Snow Depth \(summit\):\s*(\d+)',
-                'seasonal_snowfall': r'Annual Snowfall:\s*(\d+)',
-            }
-            
-            for key, pattern in patterns.items():
-                match = re.search(pattern, raw_text, re.IGNORECASE | re.DOTALL) 
-                if match:
-                    data[key] = self.clean_numeric(match.group(1))
-
-            # Date extraction from the first line of raw text
-            date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', raw_text)
-            last_updated_date = None
-            if date_match:
-                try:
-                    parsed_date = datetime.strptime(date_match.group(1), '%m/%d/%Y')
-                    last_updated_date = parsed_date.strftime('%Y-%m-%d 06:00 AM')
-                except Exception:
-                    last_updated_date = date_match.group(1).strip()
-            
-            data['last_updated'] = last_updated_date
-            
-            # NEW COMMENT LOGIC: Clean, concise comment reflecting status.
-            if last_updated_date and '10/14' in last_updated_date:
-                 data['comments'] = "Resort status is static/pre-season. Data last updated on 10/14/2025."
-            else:
-                 data['comments'] = "Data extracted from static content on the website."
-            
-            data['data_source'] = 'json_extraction_api'
-
-        except Exception as e:
-            logging.error(f"Error parsing Maverick data from JSON: {e}", exc_info=True)
-            data['comments'] = f"Fatal error processing JSON data: {str(e)}"
-        
-        return data
 
 
 class RedLodgeScraper(BaseSnowReportScraper):
@@ -1835,7 +1950,257 @@ class BigSkyScraper(BaseSnowReportScraper):
 
 
 
+class GreatDivideScraper(BaseSnowReportScraper):
+    """
+    Great Divide scraper - parses the mostly-static HTML text on:
+    https://www.skigd.com/weather-and-conditions
 
+    Notes:
+      - The page includes a report date like "12-14-25" (no explicit time).
+        We normalize to "YYYY-MM-DD 06:00 AM" in America/Denver.
+      - "Season Total 26”" is *season snowfall*, not 7-day snowfall.
+        Your schema does not currently include seasonal snowfall (except in a couple scrapers),
+        so we store it in comments and (optionally) also in snow_7day ONLY if you want that behavior.
+    """
+
+    def __init__(self):
+        super().__init__("GreatDivide")
+
+    def get_url(self) -> str:
+        return "https://www.skigd.com/weather-and-conditions"
+
+    @staticmethod
+    def _first_match(pattern: str, text: str, flags=re.IGNORECASE):
+        m = re.search(pattern, text, flags)
+        return m.group(1).strip() if m else None
+
+    def process_data(self, response) -> Dict:
+        soup = BeautifulSoup(response.text, "html.parser")
+        data = self.blank_record()
+
+        # Work with normalized full-page text (very resilient for this site)
+        full_text = normalize_text(soup.get_text("\n", strip=True))
+        full_text = re.sub(r"\n{2,}", "\n", full_text).strip()
+
+        # -------------------------
+        # 1) last_updated (report date like "12-14-25")
+        # -------------------------
+        # The page includes a standalone MM-DD-YY line near the conditions block.
+        raw_date = self._first_match(r"\b(\d{1,2}-\d{1,2}-\d{2})\b", full_text)
+        if raw_date:
+            try:
+                dt = datetime.strptime(raw_date, "%m-%d-%y")
+                # Great Divide doesn’t publish a time in that block; choose a stable morning time.
+                data["last_updated"] = dt.strftime("%Y-%m-%d") + " 06:00 AM"
+            except Exception:
+                data["last_updated"] = raw_date
+
+        # -------------------------
+        # 2) Surface / weather summary lines
+        # -------------------------
+        # Examples on the page:
+        #   "Forecast Weather: Mostly Sunny"
+        #   "Forecast: Mostly Sunny"
+        #   "Snow Surface: Groomed"
+        forecast_weather = (
+            self._first_match(r"Forecast Weather:\s*([^\n]+)", full_text)
+            or self._first_match(r"Forecast:\s*([^\n]+)", full_text)
+        )
+        if forecast_weather:
+            data["weather_current"] = forecast_weather
+
+        snow_surface = self._first_match(r"Snow Surface:\s*([^\n]+)", full_text)
+        if snow_surface:
+            data["conditions_surface"] = snow_surface
+
+        # Forecast temps (store in forecast_* fields; leave temp_base/temp_summit empty unless you prefer otherwise)
+        base_temp = self._first_match(r"Forecast Base Temp:\s*([-\d\.]+)", full_text)
+        top_temp  = self._first_match(r"Forecast Top Temp:\s*([-\d\.]+)", full_text)
+        if base_temp is not None:
+            data["forecast_base_temp_high"] = self.clean_numeric(base_temp)
+        if top_temp is not None:
+            data["forecast_summit_temp_high"] = self.clean_numeric(top_temp)
+
+        # -------------------------
+        # 3) Depth / lifts / trails
+        # -------------------------
+        # "Avg Base Depth min/max 10 / 10"
+        depth_pair = re.search(r"Avg Base Depth.*?(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)", full_text, re.IGNORECASE)
+        if depth_pair:
+            # Use max as the "base_depth" (more intuitive)
+            data["base_depth"] = self.clean_numeric(depth_pair.group(2))
+        else:
+            # Fallback: any single "Avg Base Depth" number
+            one_depth = self._first_match(r"Avg Base Depth.*?(\d+(?:\.\d+)?)", full_text)
+            if one_depth is not None:
+                data["base_depth"] = self.clean_numeric(one_depth)
+
+        # "Open Downhill Trails 3 / 127 max"
+        trails_pair = re.search(r"Open Downhill Trails\s+(\d+)\s*/\s*(\d+)", full_text, re.IGNORECASE)
+        if trails_pair:
+            data["runs_open"] = f"{trails_pair.group(1)} / {trails_pair.group(2)}"
+
+        # "Open Lifts 2 / 6 max"
+        lifts_pair = re.search(r"Open Lifts\s+(\d+)\s*/\s*(\d+)", full_text, re.IGNORECASE)
+        if lifts_pair:
+            data["lifts_open"] = f"{lifts_pair.group(1)} / {lifts_pair.group(2)}"
+
+        # -------------------------
+        # 4) Snowfall block
+        # -------------------------
+        # The page shows:
+        #   "Season Total 26”"
+        # It often does NOT include Last 12hrs / Last 72hrs numeric values.
+        season_total = self._first_match(r"Season Total\s+(\d+(?:\.\d+)?)", full_text)
+        if season_total is not None:
+            # Keep this true meaning in comments so you don't confuse it with 7-day.
+            # If you *want* to also fill snow_7day, uncomment the next line.
+            # data["snow_7day"] = self.clean_numeric(season_total)
+            season_total_num = self.clean_numeric(season_total)
+        else:
+            season_total_num = None
+
+        # -------------------------
+        # 5) Comments / bulletin
+        # -------------------------
+        # Try to extract the "Good morning from Great Divide!" section through the next major header-ish block.
+        bulletin = None
+        bullet_start = full_text.lower().find("good morning from great divide")
+        if bullet_start != -1:
+            snippet = full_text[bullet_start:]
+            # Stop at "Weather & Snow Update:" if present (keeps bulletin readable)
+            stop_idx = snippet.lower().find("weather & snow update")
+            if stop_idx != -1:
+                bulletin = snippet[:stop_idx].strip()
+            else:
+                bulletin = snippet[:1200].strip()  # hard cap to avoid huge comments
+
+        comment_parts = []
+        if bulletin:
+            comment_parts.append(bulletin)
+        if season_total_num is not None:
+            comment_parts.append(f"Season total snowfall (site): {season_total_num}\"")
+
+        if comment_parts:
+            data["comments"] = normalize_text("\n\n".join(comment_parts))
+
+        data["data_source"] = "html_static"
+        return data
+
+
+
+class MaverickScraper(BaseSnowReportScraper):
+    """
+    Maverick scraper - parse the visible text content from the /weather page.
+
+    Why this is better:
+      - Avoids brittle __BOOTSTRAP_STATE__ JSON parsing and control-character issues.
+      - Uses the rendered page text, which currently includes:
+        Overnight, Last 24/48/7 days, Snow Depth (base/summit), Annual Snowfall.
+    """
+
+    def __init__(self):
+        super().__init__("Maverick")
+
+    def get_url(self) -> str:
+        return "https://www.skimaverick.com/weather"
+
+    @staticmethod
+    def _first_match(pattern: str, text: str, flags=re.IGNORECASE) -> Optional[str]:
+        m = re.search(pattern, text, flags)
+        return m.group(1).strip() if m else None
+
+    def process_data(self, response) -> Dict:
+        data = self.blank_record()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        raw_text = normalize_text(soup.get_text("\n", strip=True))
+        raw_text = re.sub(r"\n{2,}", "\n", raw_text).strip()
+
+        # -----------------------------
+        # Core snowfall/depth fields
+        # Examples currently present on page (as visible text):
+        # Overnight: 0"
+        # Last 24 hours: 0"
+        # Last 48 hours: 4"
+        # Last 7 days: 14"
+        # Snow Depth (base): 5"
+        # Snow Depth (summit): 20"
+        # Annual Snowfall: 26"
+        # -----------------------------
+        patterns = {
+            "snow_overnight":  r"\bOvernight:\s*([0-9]+(?:\.[0-9]+)?)",
+            "snow_24h_base":   r"\bLast\s*24\s*hours:\s*([0-9]+(?:\.[0-9]+)?)",
+            "snow_48h_base":   r"\bLast\s*48\s*hours:\s*([0-9]+(?:\.[0-9]+)?)",
+            "snow_7day":       r"\bLast\s*7\s*days:\s*([0-9]+(?:\.[0-9]+)?)",
+            "base_depth":      r"\bSnow\s*Depth\s*\(base\):\s*([0-9]+(?:\.[0-9]+)?)",
+            "summit_depth":    r"\bSnow\s*Depth\s*\(summit\):\s*([0-9]+(?:\.[0-9]+)?)",
+        }
+
+        for key, pat in patterns.items():
+            v = self._first_match(pat, raw_text)
+            if v is not None:
+                data[key] = self.clean_numeric(v)
+
+        # Annual snowfall doesn't have a dedicated STANDARD_COLUMNS field.
+        # Keep it in comments so you still capture it reliably.
+        annual = self._first_match(r"\bAnnual\s*Snowfall:\s*([0-9]+(?:\.[0-9]+)?)", raw_text)
+        annual_num = self.clean_numeric(annual) if annual is not None else None
+
+        # -----------------------------
+        # Optional: surface conditions, if present
+        # -----------------------------
+        primary = self._first_match(r"\bPrimary\s*Surface\s*Conditions:\s*([^\n]+)", raw_text)
+        secondary = self._first_match(r"\bSecondary\s*Surface\s*Conditions:\s*([^\n]+)", raw_text)
+
+        if primary and secondary:
+            # Guard against the weird case you saw where primary is blank and it "captures" the secondary label
+            if primary.strip().lower() != "secondary surface conditions:":
+                data["conditions_surface"] = normalize_text(f"{primary}, {secondary}")
+        elif primary:
+            if primary.strip().lower() != "secondary surface conditions:":
+                data["conditions_surface"] = normalize_text(primary)
+
+        # -----------------------------
+        # last_updated
+        # -----------------------------
+        # If the page includes an explicit date anywhere (e.g., 12/14/2025), capture it.
+        # Otherwise leave None so your universal staleness check can fingerprint.
+        date_str = self._first_match(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", raw_text)
+        if date_str:
+            try:
+                dt = datetime.strptime(date_str, "%m/%d/%Y")
+                data["last_updated"] = dt.strftime("%Y-%m-%d") + " 06:00 AM"
+            except Exception:
+                data["last_updated"] = date_str
+        else:
+            data["last_updated"] = None
+
+        # -----------------------------
+        # comments
+        # -----------------------------
+        comment_parts = []
+
+        # If you want to preserve a small snippet of the page context, keep it short:
+        # Pull the first line that contains "Overnight" as proof-of-source.
+        if "Overnight:" in raw_text:
+            # find the line that contains Overnight and keep a limited run-on
+            lines = raw_text.splitlines()
+            for ln in lines:
+                if "Overnight:" in ln:
+                    comment_parts.append(f"Parsed page metrics line: {ln[:180]}")
+                    break
+
+        if annual_num is not None:
+            comment_parts.append(f"Annual snowfall (site): {annual_num}\"")
+
+        if comment_parts:
+            data["comments"] = normalize_text(" | ".join(comment_parts))
+        else:
+            data["comments"] = "Data extracted from visible page text."
+
+        data["data_source"] = "html_text_parse"
+        return data
 
 
 
@@ -2173,13 +2538,16 @@ def main():
             MaverickScraper(),
             RedLodgeScraper(),
             BigSkyScraper(), 
-            # GreatDivideScraper(),
+            GreatDivideScraper(),
         ]
         
         resort_data_list = []
         for scraper in scrapers:
             logging.info(f"Fetching data for {scraper.resort_name}...")
             snow_data = scraper.get_snow_report()
+            
+            snow_data = apply_quarantine_if_needed(scraper.resort_name, snow_data)
+
             
             
             if snow_data:
