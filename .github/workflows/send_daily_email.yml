@@ -37,7 +37,7 @@ jobs:
       env:
         SUBSCRIBER_EMAILS: ${{ secrets.SUBSCRIBER_EMAILS }}
       run: |
-        echo "email,resorts" > ~/snow_reports/data/snow_report_subscribers.csv
+        echo "email" > ~/snow_reports/data/snow_report_subscribers.csv
         echo "$SUBSCRIBER_EMAILS" >> ~/snow_reports/data/snow_report_subscribers.csv
         
     - name: Set up Firebase credentials
