@@ -1630,4 +1630,4 @@ components.html(
     height=570
 )
 
-st.markdown("<br><div style='text-align: center; color: #94a3b8;'>Northern Rockies Snow Report • Built with 💙</div>", unsafe_allow_html=True)
+st.markdown("<br><div style='text-align: center; color: #94a3b8;'>Northern Rockies Snow Report</div>", unsafe_allow_html=True)
