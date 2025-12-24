@@ -747,50 +747,12 @@ class LookoutPassScraper(BaseSnowReportScraper):
         super().__init__("LookoutPass")
 
     def get_url(self):
-        # Either /snow-report or /Snow-Report/ works; they redirect.
         return "https://skilookout.com/snow-report"
-
-    def _parse_snow_section(self, section_div):
-        """
-        Given a <div class="snow-report-section">, extract numeric values from
-        its <div class="snow-data"> rows and return a dict like:
-        {
-            "24h": 8.0,
-            "48h": 0.0,
-            "72h": 0.0,
-            "depth": 16.0,
-            "temp": 21.0
-        }
-        """
-        out = {}
-        for row in section_div.select("div.snow-data div.data-row"):
-            label_el = row.find("span", class_="label")
-            value_el = row.find("span", class_="value")
-            if not label_el or not value_el:
-                continue
-
-            label = label_el.get_text(strip=True)
-            value = value_el.get_text(strip=True)
-
-            if label.startswith("24h Snow"):
-                out["24h"] = self.clean_numeric(value)
-            elif label.startswith("48h Snow"):
-                out["48h"] = self.clean_numeric(value)
-            elif label.startswith("72h Snow"):
-                out["72h"] = self.clean_numeric(value)
-            elif label.startswith("Depth"):
-                out["depth"] = self.clean_numeric(value)
-            elif label.startswith("Temperature"):
-                out["temp"] = self.clean_numeric(value)
-
-        return out
 
     def _extract_section_text(self, header_string: str, soup: BeautifulSoup) -> str:
         """
-        Generic helper:
         Find the heading whose text == header_string, then collect text from its
         following siblings until the next heading of same or higher level.
-        Used mainly for 'Snow & Weather Notes' and 'Comments' further down page.
         """
         header = soup.find(
             lambda tag: (
@@ -803,7 +765,6 @@ class LookoutPassScraper(BaseSnowReportScraper):
 
         texts = []
         for sib in header.find_next_siblings():
-            # Stop at next heading
             if sib.name in ["h2", "h3", "h4", "h5", "h6"]:
                 break
             txt = sib.get_text(" ", strip=True)
@@ -811,109 +772,166 @@ class LookoutPassScraper(BaseSnowReportScraper):
                 texts.append(txt)
         return "\n".join(texts)
 
+    def _clean_number_or_fraction(self, s: str):
+        """
+        Handles:
+          - "1", "1.5", "9 mph", "29°F", '1″'
+          - "1/2", "1/2″"
+          - "½", "¼", "¾"
+        Returns float or None.
+        """
+        if s is None:
+            return None
+        t = str(s).strip()
+
+        # normalize common unicode fractions
+        t = (
+            t.replace("½", "1/2")
+             .replace("¼", "1/4")
+             .replace("¾", "3/4")
+        )
+
+        # remove units we commonly see
+        t = t.replace("mph", "").replace("°F", "").replace("F", "")
+        t = t.replace("″", "").replace('"', "")
+        t = t.strip()
+
+        # fraction like 1/2
+        m = re.search(r"(-?\d+)\s*/\s*(\d+)", t)
+        if m:
+            num = float(m.group(1))
+            den = float(m.group(2))
+            if den != 0:
+                return num / den
+            return None
+
+        # fall back to existing numeric cleaner
+        return self.clean_numeric(t)
+
+    def _extract_block(self, full_text: str, start_pat: str, end_pat: str = None) -> str:
+        """
+        Extract substring after start_pat up to end_pat (or end of text).
+        start_pat/end_pat are regex patterns.
+        """
+        m = re.search(start_pat, full_text, flags=re.IGNORECASE)
+        if not m:
+            return ""
+        start = m.end()
+        if end_pat:
+            n = re.search(end_pat, full_text[start:], flags=re.IGNORECASE)
+            if n:
+                return full_text[start:start + n.start()].strip()
+        return full_text[start:].strip()
+
+    def _extract_value(self, text_block: str, label: str):
+        """
+        Extracts value from lines like:
+          '24h Snow: 1″'
+          'Depth: 15″'
+          'Wind Speed: 9 mph'
+        """
+        m = re.search(rf"{re.escape(label)}\s*:\s*([^\n]+)", text_block, flags=re.IGNORECASE)
+        if not m:
+            return None
+        return m.group(1).strip()
+
     def process_data(self, response) -> Dict:
         soup = BeautifulSoup(response.text, "html.parser")
         data = self.blank_record()
 
-        # ---------------------------------------------------------
-        # 1. Last updated ("Last updated: December 2, 2025 at 5:59 PM")
-        # ---------------------------------------------------------
-        ts_div = soup.find("div", class_="powderwatch-timestamp")
-        if ts_div:
-            text = ts_div.get_text(strip=True)
-            m = re.search(r"Last updated:\s*(.+)", text)
-            if m:
-                raw = m.group(1).strip()  # "December 2, 2025 at 5:59 PM"
-                try:
-                    raw_for_parse = raw.replace(" at ", " ")
-                    parsed = datetime.strptime(raw_for_parse, "%B %d, %Y %I:%M %p")
-                    data["last_updated"] = parsed.strftime("%Y-%m-%d %I:%M %p")
-                except Exception:
-                    # Fallback to raw string if parsing fails
-                    data["last_updated"] = raw
+        # Use normalized plain text for robust parsing
+        full_text = soup.get_text("\n", strip=True)
 
         # ---------------------------------------------------------
-        # 2. Summit + Base snow sections
+        # 1) Last updated: "Last updated: December 23, 2025 at 6:05 PM, PST"
         # ---------------------------------------------------------
-        for section in soup.select("div.snow-report-section"):
-            title_el = section.find("h4")
-            if not title_el:
-                continue
-            title = title_el.get_text(strip=True).lower()
-            metrics = self._parse_snow_section(section)
-
-            if "summit" in title:
-                if "24h" in metrics:
-                    data["snow_24h_summit"] = metrics["24h"]
-                if "48h" in metrics:
-                    data["snow_48h_summit"] = metrics["48h"]
-                if "depth" in metrics:
-                    data["summit_depth"] = metrics["depth"]
-                if "temp" in metrics:
-                    data["temp_summit"] = metrics["temp"]
-
-            elif "base" in title:
-                if "24h" in metrics:
-                    data["snow_24h_base"] = metrics["24h"]
-                if "48h" in metrics:
-                    data["snow_48h_base"] = metrics["48h"]
-                if "depth" in metrics:
-                    data["base_depth"] = metrics["depth"]
-                if "temp" in metrics:
-                    data["temp_base"] = metrics["temp"]
+        m = re.search(r"Last updated:\s*(.+)", full_text, flags=re.IGNORECASE)
+        if m:
+            raw = m.group(1).strip()
+            # keep timezone suffix if present (PST) but try a parse without it
+            raw_no_tz = re.sub(r",\s*(PST|PDT|MST|MDT|CST|CDT|EST|EDT)\s*$", "", raw, flags=re.I)
+            try:
+                raw_for_parse = raw_no_tz.replace(" at ", " ")
+                parsed = datetime.strptime(raw_for_parse, "%B %d, %Y %I:%M %p")
+                data["last_updated"] = parsed.strftime("%Y-%m-%d %I:%M %p")
+            except Exception:
+                data["last_updated"] = raw
 
         # ---------------------------------------------------------
-        # 3. "New snow since 4pm: 6″"  -> snow_overnight
+        # 2) Summit block (between "Summit" and "Base")
         # ---------------------------------------------------------
-        ns_div = soup.find("div", class_="new-snow-since-4pm")
-        if ns_div:
-            text = ns_div.get_text(" ", strip=True)
-            m = re.search(r"New snow since 4pm:\s*([\d\.]+)", text, re.I)
-            if m:
-                data["snow_overnight"] = self.clean_numeric(m.group(1))
+        summit_block = self._extract_block(
+            full_text,
+            start_pat=r"\bSummit\b",
+            end_pat=r"\bBase\b"
+        )
+
+        if summit_block:
+            v24 = self._extract_value(summit_block, "24h Snow")
+            v48 = self._extract_value(summit_block, "48h Snow")
+            vdepth = self._extract_value(summit_block, "Depth")
+            vtemp = self._extract_value(summit_block, "Temperature")
+
+            if v24 is not None:
+                data["snow_24h_summit"] = self._clean_number_or_fraction(v24)
+            if v48 is not None:
+                data["snow_48h_summit"] = self._clean_number_or_fraction(v48)
+            if vdepth is not None:
+                data["summit_depth"] = self._clean_number_or_fraction(vdepth)
+            if vtemp is not None:
+                data["temp_summit"] = self._clean_number_or_fraction(vtemp)
 
         # ---------------------------------------------------------
-        # 4. Current Weather ("Current Weather" section)
+        # 3) Base block (between "Base" and "Weather & Conditions" or "Weather")
         # ---------------------------------------------------------
-        weather_section = soup.find("div", class_="weather-section")
-        if weather_section:
-            for row in weather_section.select("div.weather-data div.data-row"):
-                label_el = row.find("span", class_="label")
-                value_el = row.find("span", class_="value")
-                if not label_el or not value_el:
-                    continue
-                label = label_el.get_text(strip=True)
-                value = value_el.get_text(strip=True)
-                if label.startswith("Conditions"):
-                    data["weather_current"] = value
+        base_block = self._extract_block(
+            full_text,
+            start_pat=r"\bBase\b",
+            end_pat=r"\bWeather\s*&\s*Conditions\b|\bWeather\b"
+        )
+
+        if base_block:
+            v24 = self._extract_value(base_block, "24h Snow")
+            v48 = self._extract_value(base_block, "48h Snow")
+            vdepth = self._extract_value(base_block, "Depth")
+            vtemp = self._extract_value(base_block, "Temperature")
+
+            if v24 is not None:
+                data["snow_24h_base"] = self._clean_number_or_fraction(v24)
+            if v48 is not None:
+                data["snow_48h_base"] = self._clean_number_or_fraction(v48)
+            if vdepth is not None:
+                data["base_depth"] = self._clean_number_or_fraction(vdepth)
+            if vtemp is not None:
+                data["temp_base"] = self._clean_number_or_fraction(vtemp)
 
         # ---------------------------------------------------------
-        # 5. Surface Conditions (Primary / Secondary) DOM-based
+        # 4) Weather & Conditions (Conditions + Wind)
         # ---------------------------------------------------------
-        surface_section = soup.find("div", class_="surface-section")
-        primary = None
-        secondary = None
-        if surface_section:
-            for row in surface_section.select("div.surface-data div.data-row"):
-                label_el = row.find("span", class_="label")
-                value_el = row.find("span", class_="value")
-                if not label_el or not value_el:
-                    continue
-                label = label_el.get_text(strip=True)
-                value = value_el.get_text(strip=True)
-                if label.startswith("Primary"):
-                    primary = value
-                elif label.startswith("Secondary"):
-                    secondary = value
+        wc_block = self._extract_block(
+            full_text,
+            start_pat=r"\bWeather\s*&\s*Conditions\b",
+            end_pat=r"\bLift\s*&\s*Slope\s*Status\b|\bLift\b"
+        )
 
-        if primary and secondary:
-            data["conditions_surface"] = f"{primary}, {secondary}"
-        elif primary:
-            data["conditions_surface"] = primary
+        if wc_block:
+            vcond = self._extract_value(wc_block, "Conditions")
+            if vcond:
+                data["weather_current"] = vcond
+
+            vwind = self._extract_value(wc_block, "Wind Speed")
+            if vwind is not None:
+                data["wind_speed"] = self._clean_number_or_fraction(vwind)
+
+            vprim = self._extract_value(wc_block, "Primary")
+            vsec = self._extract_value(wc_block, "Secondary")
+            if vprim and vsec:
+                data["conditions_surface"] = f"{vprim}, {vsec}"
+            elif vprim:
+                data["conditions_surface"] = vprim
 
         # ---------------------------------------------------------
-        # 6. Snow & Weather Notes + Comments -> comments
-        # (These are further down the page under <h3>Snow & Weather Notes</h3>, <h3>Comments</h3>)
+        # 5) Notes + Comments (keep your existing logic)
         # ---------------------------------------------------------
         notes_text = self._extract_section_text("Snow & Weather Notes", soup)
         comments_text = self._extract_section_text("Comments", soup)
@@ -923,9 +941,16 @@ class LookoutPassScraper(BaseSnowReportScraper):
             comment_parts.append(normalize_text(notes_text))
         if comments_text:
             comment_parts.append(normalize_text(comments_text))
-
         if comment_parts:
             data["comments"] = "\n\n".join(comment_parts)
+
+        # ---------------------------------------------------------
+        # 6) snow_overnight (try to parse from notes: "1/2″ snow overnight")
+        # ---------------------------------------------------------
+        notes_for_overnight = (notes_text or "") + "\n" + (comments_text or "")
+        m = re.search(r"([\d¼½¾\.]+(?:\s*/\s*\d+)?)\s*(?:\"|″)?\s*snow\s*overnight", notes_for_overnight, flags=re.I)
+        if m:
+            data["snow_overnight"] = self._clean_number_or_fraction(m.group(1))
 
         data["data_source"] = "html_static"
         return data
