@@ -34,6 +34,8 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+
+
 # Import the NWS outlook class (we need it for the banner logic)
 from nws_storm_outlook_v3 import NWSStormOutlook
 
@@ -227,12 +229,11 @@ def get_latest_resort_data_from_firebase(db) -> list[dict]:
     Return a list of resort dicts, one for EACH entry in MASTER_RESORTS,
     in that order, with Firestore data merged in when available.
 
-    This guarantees:
+    Guarantees:
       - All resorts appear in the email every day.
       - SNOTEL + NWS dicts are present (possibly empty).
     """
     if db is None:
-        # No DB → just return default stubs for every resort
         resort_list = []
         for r in MASTER_RESORTS:
             resort_list.append({
@@ -240,10 +241,16 @@ def get_latest_resort_data_from_firebase(db) -> list[dict]:
                 "display_name": get_display_name(r),
                 "date": None,
                 "last_updated": "No Report",
+
+                # Do NOT parse here; stale logic will compute these robustly
                 "last_updated_dt": None,
+                "last_updated_date": None,
+
                 "snow_overnight": 0.0,
                 "snow_24h_summit": 0.0,
                 "snow_24h_base": 0.0,
+                "snow_24h_display": 0.0,
+
                 "base_depth": 0.0,
                 "summit_depth": 0.0,
                 "temp_base": None,
@@ -266,8 +273,7 @@ def get_latest_resort_data_from_firebase(db) -> list[dict]:
         .stream()
     )
     latest_docs = [d.to_dict() for d in latest_q]
-    if not latest_docs:
-        # No reports at all → just stubs for all resorts
+    if not latest_docs or not latest_docs[0].get("date"):
         return get_latest_resort_data_from_firebase(None)
 
     latest_date = latest_docs[0]["date"]
@@ -284,57 +290,51 @@ def get_latest_resort_data_from_firebase(db) -> list[dict]:
     by_resort: dict[str, dict] = {}
     for row in raw_rows:
         r_key = row.get("resort")
-        if not r_key:
-            continue
-        by_resort[r_key] = row
+        if r_key:
+            by_resort[r_key] = row
 
     # 4) Build full master list in fixed order
     resort_list: list[dict] = []
     for r in MASTER_RESORTS:
         base = by_resort.get(r, {})
 
-        # Numeric helpers
         def num(field, default=0.0):
             try:
                 return float(base.get(field, default) or default)
             except (TypeError, ValueError):
                 return default
 
-        # String helpers
         def text(field, default="N/A"):
             val = base.get(field, default)
             if val is None:
                 return default
             return str(val)
 
-        # Dict helpers
         nws = base.get("nws_forecast")
         if not isinstance(nws, dict):
             nws = {}
+
         snotel = base.get("snotel_data")
         if not isinstance(snotel, dict):
             snotel = {}
 
-        # last_updated parsing
-        last_updated_str = base.get("last_updated")
-        last_updated_dt = None
-        if last_updated_str:
-            try:
-                dt = datetime.strptime(last_updated_str, "%Y-%m-%d %H:%M")
-                last_updated_dt = dt.replace(tzinfo=LOCAL_TZ)
-            except Exception:
-                last_updated_dt = None
+        last_updated_str = base.get("last_updated") or "No Report"
 
         resort_list.append({
             "resort": r,
             "display_name": get_display_name(r),
             "date": base.get("date", latest_date),
-            "last_updated": last_updated_str or "No Report",
-            "last_updated_dt": last_updated_dt,
+            "last_updated": last_updated_str,
+
+            # Stale logic will fill these
+            "last_updated_dt": None,
+            "last_updated_date": None,
 
             "snow_overnight": num("snow_overnight", 0.0),
             "snow_24h_summit": num("snow_24h_summit", 0.0),
             "snow_24h_base": num("snow_24h_base", 0.0),
+            "snow_24h_display": 0.0,  # computed later
+
             "base_depth": num("base_depth", 0.0),
             "summit_depth": num("summit_depth", 0.0),
             "temp_base": base.get("temp_base"),
@@ -353,24 +353,23 @@ def get_latest_resort_data_from_firebase(db) -> list[dict]:
     return resort_list
 
 
+
 # =============================================================================
 # STALE DATA LOGIC (mirrors dashboard-style behavior)
 # =============================================================================
 
-def apply_stale_logic_to_resorts(resort_data_list: List[Dict]) -> List[Dict]:
+def apply_stale_logic_to_resorts(resort_data_list: List[Dict], parse_last_updated_fn) -> List[Dict]:
     """
     Apply seasonal and freshness logic to resort data so that:
     - Data from a previous season (before Oct 1 of current season) has ALL snow and depth set to 0.
     - Data from this season but older than FRESHNESS_TOLERANCE_HOURS has 24h/overnight snow cleared but keeps depths.
-    - Also computes snow_24h_display = max(24h_summit, 24h_base) for unified use.
+    - Computes snow_24h_display = max(24h_summit, 24h_base).
+    - Computes last_updated_dt and last_updated_date using parse_last_updated_fn (NO pandas parsing).
     """
     if not resort_data_list:
         return resort_data_list
 
     df = pd.DataFrame(resort_data_list)
-
-    if "last_updated" not in df.columns:
-        return resort_data_list
 
     # Ensure numeric snow/depth columns exist and are numeric
     num_cols = [
@@ -385,27 +384,39 @@ def apply_stale_logic_to_resorts(resort_data_list: List[Dict]) -> List[Dict]:
             df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # Parse last_updated to timezone-aware datetimes in LOCAL_TZ
-    dt = pd.to_datetime(df["last_updated"], format="mixed", errors="coerce")
-    try:
-        if dt.dt.tz is None:
-            dt = dt.dt.tz_localize(LOCAL_TZ)
-        else:
-            dt = dt.dt.tz_convert(LOCAL_TZ)
-    except Exception:
-        # If timezone operations fail, keep as-is
-        df["last_updated_dt"] = dt
+    # Parse last_updated using provided robust parser (NO pandas TZ parsing)
+    parsed_dt = []
+    parsed_date = []
+
+    last_updated_series = df.get("last_updated")
+    if last_updated_series is None:
+        df["last_updated_dt"] = None
+        df["last_updated_date"] = None
     else:
-        df["last_updated_dt"] = dt
+        for s in last_updated_series.fillna("").astype(str).tolist():
+            dt_val = None
+            try:
+                dt_val = parse_last_updated_fn(s)
+            except Exception:
+                dt_val = None
+
+            parsed_dt.append(dt_val)
+            parsed_date.append(dt_val.date() if isinstance(dt_val, datetime) else None)
+
+        df["last_updated_dt"] = parsed_dt
+        df["last_updated_date"] = parsed_date
 
     # Season start is October 1 of current or previous year
     today_local = datetime.now(LOCAL_TZ).date()
     season_start_year = today_local.year if today_local.month >= 10 else today_local.year - 1
     season_start_dt = datetime(season_start_year, 10, 1, tzinfo=LOCAL_TZ)
 
-    is_from_this_season = df["last_updated_dt"] >= season_start_dt
+    def is_this_season(dt_val) -> bool:
+        return isinstance(dt_val, datetime) and dt_val >= season_start_dt
 
-    # Zero out *all* snow-related fields for prior seasons
+    is_from_this_season = df["last_updated_dt"].apply(is_this_season)
+
+    # Zero out all snow-related fields for prior seasons
     all_snow_cols = [
         "snow_24h_summit",
         "snow_24h_base",
@@ -419,21 +430,25 @@ def apply_stale_logic_to_resorts(resort_data_list: List[Dict]) -> List[Dict]:
 
     # For this season, clear 24h/overnight snow that's too old, but keep depths
     now_dt = datetime.now(LOCAL_TZ)
-    age_hours = (now_dt - df["last_updated_dt"]).dt.total_seconds() / 3600
-    is_fresh_snow = age_hours < FRESHNESS_TOLERANCE_HOURS
+
+    def age_hours(dt_val) -> Optional[float]:
+        if not isinstance(dt_val, datetime):
+            return None
+        return (now_dt - dt_val).total_seconds() / 3600.0
+
+    ages = df["last_updated_dt"].apply(age_hours)
+    is_fresh_snow = ages.apply(lambda h: (h is not None) and (h < FRESHNESS_TOLERANCE_HOURS))
 
     fresh_snow_cols = ["snow_24h_summit", "snow_24h_base", "snow_overnight"]
     for col in fresh_snow_cols:
         if col in df.columns:
             df.loc[is_from_this_season & ~is_fresh_snow, col] = 0
 
-    # Store a date-only version for sorting / dashboard-style logic
-    df["last_updated_date"] = df["last_updated_dt"].dt.date
-
     # Unified 24h snow (summit vs base) for email & charts
     df["snow_24h_display"] = df[["snow_24h_summit", "snow_24h_base"]].max(axis=1)
 
     return df.to_dict(orient="records")
+
 
 # =============================================================================
 # EMAIL THEME
@@ -574,6 +589,74 @@ class EmailSnowReportMessenger:
             return float(snow or 0)
         except (ValueError, TypeError):
             return 0.0
+            
+            
+
+    
+    def _parse_last_updated_dt(self, last_updated_str: str) -> Optional[datetime]:
+        """
+        Parse Firestore 'last_updated' strings into a tz-aware datetime in LOCAL_TZ.
+    
+        Returns:
+            datetime (tz-aware in LOCAL_TZ) on success, else None.
+    
+        Handles common formats you've seen:
+          - "2025-12-25 08:39 AM"
+          - "2025-12-25 08:39"
+          - "December 23, 2025 at 8:33 AM, PST"
+          - "December 23, 2025 at 8:33 AM PST"
+          - (and similar with MST/MDT/PDT)
+        """
+        if not last_updated_str:
+            return None
+    
+        s = str(last_updated_str).replace("\u00a0", " ").strip()
+        s = re.sub(r"\s+", " ", s)
+        if not s:
+            return None
+    
+        # Map common abbreviations to IANA zones (pandas won't do this reliably)
+        tz_map = {
+            "MST": "America/Denver",
+            "MDT": "America/Denver",
+            "PST": "America/Los_Angeles",
+            "PDT": "America/Los_Angeles",
+        }
+    
+        # 1) Fast path: ISO-ish formats (already local time in your system)
+        for fmt in ("%Y-%m-%d %I:%M %p", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt_naive = datetime.strptime(s, fmt)
+                return dt_naive.replace(tzinfo=LOCAL_TZ)
+            except Exception:
+                pass
+    
+        # 2) Verbose format with optional trailing timezone token
+        # Examples:
+        #   "December 23, 2025 at 8:33 AM, PST"
+        #   "December 23, 2025 at 8:33 AM PST"
+        tz_abbrev = None
+        m = re.search(r"(?:,\s*|\s+)(MST|MDT|PST|PDT)\s*$", s)
+        if m:
+            tz_abbrev = m.group(1)
+            s = re.sub(r"(?:,\s*|\s+)(MST|MDT|PST|PDT)\s*$", "", s).strip()
+    
+        # Remove any trailing comma left behind
+        s = re.sub(r",\s*$", "", s).strip()
+    
+        try:
+            dt_naive = datetime.strptime(s, "%B %d, %Y at %I:%M %p")
+        except Exception:
+            return None
+    
+        try:
+            if tz_abbrev and tz_abbrev in tz_map:
+                src_tz = ZoneInfo(tz_map[tz_abbrev])
+                return dt_naive.replace(tzinfo=src_tz).astimezone(LOCAL_TZ)
+            return dt_naive.replace(tzinfo=LOCAL_TZ)
+        except Exception:
+            return None
+
     
     def get_master_sort_key(self, resort_data: Dict) -> tuple:
             """
@@ -627,21 +710,20 @@ class EmailSnowReportMessenger:
     def _extract_last_updated_date(self, resort_data: Dict):
         """
         Extract a date object representing when this resort's report is considered 'current'.
-
+    
         Priority:
         1) resort_data['last_updated_date'] (set by apply_stale_logic_to_resorts)
-        2) resort_data['last_updated'] string
-        3) resort_data['date'] string (Firestore report date)
+        2) parse resort_data['last_updated'] using _parse_last_updated_dt (NO pandas)
+        3) resort_data['date'] (Firestore report date)
         """
         last_updated_date = None
-
-        # 1) last_updated_date from stale logic (can be date, datetime, Timestamp, etc.)
+    
+        # 1) last_updated_date from stale logic
         lud = resort_data.get("last_updated_date")
         if lud is not None:
             if isinstance(lud, datetime):
                 last_updated_date = lud.date()
             elif hasattr(lud, "to_pydatetime"):
-                # pandas Timestamp-like
                 try:
                     last_updated_date = lud.to_pydatetime().date()
                 except Exception:
@@ -652,28 +734,16 @@ class EmailSnowReportMessenger:
                 except ValueError:
                     last_updated_date = None
             elif hasattr(lud, "day"):
-                # datetime.date or similar
                 last_updated_date = lud
-
-        # 2) Fallback: parse last_updated string
+    
+        # 2) Fallback: parse last_updated string using robust parser
         if last_updated_date is None:
-            last_updated_str = resort_data.get("last_updated") or ""
+            last_updated_str = (resort_data.get("last_updated") or "").strip()
             if last_updated_str:
-                try:
-                    last_dt = pd.to_datetime(last_updated_str, errors="coerce")
-                except Exception:
-                    last_dt = None
-
-                if last_dt is not None and not pd.isna(last_dt):
-                    try:
-                        if getattr(last_dt, "tzinfo", None) is None:
-                            last_dt = last_dt.replace(tzinfo=LOCAL_TZ)
-                        else:
-                            last_dt = last_dt.tz_convert(LOCAL_TZ)
-                        last_updated_date = last_dt.date()
-                    except Exception:
-                        last_updated_date = None
-
+                dt_val = self._parse_last_updated_dt(last_updated_str)
+                if isinstance(dt_val, datetime):
+                    last_updated_date = dt_val.date()
+    
         # 3) Final fallback: Firestore 'date' field
         if last_updated_date is None:
             date_str = resort_data.get("date")
@@ -682,8 +752,9 @@ class EmailSnowReportMessenger:
                     last_updated_date = datetime.fromisoformat(date_str).date()
                 except ValueError:
                     pass
-
+    
         return last_updated_date
+
 
     def _is_resort_current(self, resort_data: Dict) -> bool:
         """
@@ -730,109 +801,80 @@ class EmailSnowReportMessenger:
     def _prepare_chart_data(self, resort_data_list: List[Dict]) -> List[Dict]:
         """
         Prepare 5-day snow accumulation chart data by querying Firebase history.
-
+    
         Logic:
-        - For each of the last 5 "report dates" (Firestore `date` field),
+        - For each of the last 5 report dates (Firestore `date` field),
           fetch all resort docs for that date.
         - For each resort/date, use max(24h_summit, 24h_base) for that day.
-        - We **trust the Firestore `date` field** for which day the snow
-          belongs to. `last_updated` is used only (optionally) to skip
-          truly stale records, not to reassign or drop valid report-day snow.
+        - Trust Firestore `date` for which day the snow belongs to.
+        - Optionally skip truly stale records using last_updated (> 7 days old).
         """
         chart_data: List[Dict] = []
         today = datetime.now(LOCAL_TZ).date()
-
-        # Map: { resort_name: { date_obj: snow_amount } }
+    
         history_map: Dict[str, Dict[datetime.date, float]] = {}
-
-        # Last 5 report dates (today, today-1, ..., today-4)
         dates_to_check: List[datetime.date] = [today - timedelta(days=i) for i in range(5)]
-
+    
         print("📊 Fetching 5-day history from Firebase for charts...")
+    
+        def clean_snow(val) -> float:
+            if isinstance(val, (int, float)):
+                return float(val)
+            if isinstance(val, str):
+                v = val.replace('"', "").replace("″", "").strip()
+                try:
+                    return float(v) if v else 0.0
+                except ValueError:
+                    return 0.0
+            return 0.0
+    
+        now_dt = datetime.now(LOCAL_TZ)
+    
         try:
             for date_obj in dates_to_check:
-                # Firestore stores `date` as a string like "YYYY-MM-DD"
                 date_str = date_obj.strftime("%Y-%m-%d")
-
+    
                 docs = (
                     self.db.collection("snow_reports")
-                    .where("date", "==", date_str)
+                    .where(filter=firestore.FieldFilter("date", "==", date_str))
                     .stream()
                 )
-
+    
                 for doc in docs:
                     data = doc.to_dict()
                     r_name = data.get("resort")
                     if not r_name:
                         continue
-
-                    # --- Optional staleness filter using last_updated ---
+    
+                    # --- Optional staleness filter using last_updated (defensive) ---
                     last_updated_str = (data.get("last_updated") or "").strip()
                     if last_updated_str:
-                        try:
-                            lu_dt = pd.to_datetime(last_updated_str, errors="coerce")
-                        except Exception:
-                            lu_dt = None
-
-                        # lu_dt might be a pandas Timestamp
-                        if lu_dt is not None and not pd.isna(lu_dt):
-                            try:
-                                # Ensure tz-aware in LOCAL_TZ
-                                if getattr(lu_dt, "tz", None) is None:
-                                    lu_dt = lu_dt.replace(tzinfo=LOCAL_TZ)
-                                else:
-                                    lu_dt = lu_dt.tz_convert(LOCAL_TZ)
-                                age_hours = (datetime.now(LOCAL_TZ) - lu_dt).total_seconds() / 3600.0
-                                # If it's insanely old, skip (defensive)
-                                if age_hours > 24 * 7:
-                                    continue
-                            except Exception:
-                                # If anything goes wrong, just don't apply age filter
-                                pass
-
-                    # At this point, we *accept* the record as belonging to `date_obj`
-                    # based purely on the Firestore `date` field we queried on.
-
-                    def clean_snow(val) -> float:
-                        if isinstance(val, (int, float)):
-                            return float(val)
-                        if isinstance(val, str):
-                            v = val.replace('"', "").strip()
-                            try:
-                                return float(v) if v else 0.0
-                            except ValueError:
-                                return 0.0
-                        return 0.0
-
-                    s_sum = data.get("snow_24h_summit", 0)
-                    s_base = data.get("snow_24h_base", 0)
-                    v_sum = clean_snow(s_sum)
-                    v_base = clean_snow(s_base)
-
+                        lu_dt = self._parse_last_updated_dt(last_updated_str)
+                        if lu_dt is not None:
+                            age_hours = (now_dt - lu_dt).total_seconds() / 3600.0
+                            if age_hours > 24 * 7:
+                                continue
+    
+                    v_sum = clean_snow(data.get("snow_24h_summit", 0))
+                    v_base = clean_snow(data.get("snow_24h_base", 0))
                     snow_val = max(v_sum, v_base)
-
-                    if r_name not in history_map:
-                        history_map[r_name] = {}
-                    history_map[r_name][date_obj] = snow_val
-
+    
+                    history_map.setdefault(r_name, {})[date_obj] = snow_val
+    
         except Exception as e:
             print(f"⚠️ Error fetching history from Firebase: {e}")
-
-        # Build the chart data structure aligned with resort_data_list
+    
         for resort_data in resort_data_list:
             resort_name = resort_data["resort"]
-
-            # Values always in the same order as dates_to_check (today, today-1, ...)
             values = [0.0] * 5
             r_history = history_map.get(resort_name, {})
-
+    
             for i, date_obj in enumerate(dates_to_check):
                 if date_obj in r_history:
                     values[i] = float(r_history[date_obj])
-
+    
             total = float(sum(values))
-            most_recent_update = today  # kept for completeness
-
+    
             chart_data.append(
                 {
                     "resort": resort_name,
@@ -840,11 +882,13 @@ class EmailSnowReportMessenger:
                     "date_labels": dates_to_check,
                     "total": total,
                     "has_current_data": True,
-                    "most_recent_update": most_recent_update,
+                    "most_recent_update": today,
                 }
             )
-
+    
         return chart_data
+
+
 
     
     # -------------------------------------------------------------------------
@@ -1155,91 +1199,107 @@ class EmailSnowReportMessenger:
 
     def _generate_mini_chart(self, values: List[float]) -> str:
         """Generate mini 5-day bar chart with true per-row proportional widths.
-
+    
         - Each resort uses its own max value for scaling.
         - All 5 days are always rendered as 5 <td> cells.
         - Non-zero segments get proportional widths; zero-days get a small fixed width.
+        - FIX: Avoid showing '0"' labels for small non-zero values (e.g., 0.5")
+          by labeling <1" with one decimal, and >=1" as an integer (round-half-up).
         """
+        import math
+    
+        def fmt_label(v: float) -> str:
+            """Human-friendly label for chart segments."""
+            if v <= 0:
+                return ""
+            if v < 1:
+                # Show one decimal for sub-inch values (0.5" instead of 0")
+                s = f"{v:.1f}".rstrip("0").rstrip(".")
+                return f'{s}"'
+            # Round-half-up for inches >= 1 (avoid banker's rounding surprises)
+            whole = int(math.floor(v + 0.5))
+            return f'{whole}"'
+    
         # Oldest on the left, newest on the right in the final chart
         values_reversed = list(reversed(values))
-
+    
         # If everything is zero, render a simple empty bar
         if all((v or 0) == 0 for v in values_reversed):
             return f"""
     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-radius:6px; overflow:hidden;">
       <tr><td style="height:14px; background:{EmailTheme.BG_OUTER};"></td></tr>
     </table>
-"""
-
+    """
+    
         # Clean and clamp to non-negative
-        vals = []
+        vals: List[float] = []
         for v in values_reversed:
             try:
                 vv = float(v or 0)
             except (TypeError, ValueError):
                 vv = 0.0
             vals.append(max(vv, 0.0))
-
+    
         max_val = max(vals)
         if max_val <= 0:
-            # Defensive fallback
             return f"""
     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-radius:6px; overflow:hidden;">
       <tr><td style="height:14px; background:{EmailTheme.BG_OUTER};"></td></tr>
     </table>
-"""
-
+    """
+    
         # Fractions relative to this resort's max
         fractions = [v / max_val if v > 0 else 0.0 for v in vals]
         sum_frac = sum(fractions)
-
+    
         # How much width do we reserve for zeros?
         zero_count = sum(1 for v in vals if v == 0)
         zero_width_each = 2.0 if zero_count > 0 else 0.0
         zeros_total = zero_width_each * zero_count
-
+    
         # Remaining width available for non-zero bars
         pos_total_pct = max(0.0, 100.0 - zeros_total)
-
+    
         # Compute final widths for each day
         widths: List[float] = []
         for v, frac in zip(vals, fractions):
             if v == 0:
                 widths.append(zero_width_each)
             else:
-                # Normalize among non-zero days
                 if sum_frac > 0:
                     widths.append((frac / sum_frac) * pos_total_pct)
                 else:
                     widths.append(0.0)
-
+    
         # Build HTML – *every* cell gets an explicit width
         html = [
             '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
             'width="100%" style="border-radius:6px; overflow:hidden;"><tr>'
         ]
-
+    
         for v, w, color in zip(vals, widths, EmailTheme.CHART_COLORS):
             if v > 0:
-                label = f'{int(round(v))}"'
+                label = fmt_label(v)
                 text_color = (
                     EmailTheme.BG_CONTAINER
                     if color == EmailTheme.CHART_COLORS[0]
                     else EmailTheme.TEXT_WHITE
                 )
+    
+                # If label is empty (shouldn't be for v>0), just omit it
                 html.append(
                     f'<td style="width:{w:.1f}%; height:14px; background:{color}; '
                     f'color:{text_color}; font-size:11px; text-align:center; '
                     f'white-space:nowrap;">{label}</td>'
                 )
             else:
-                # Zero day: small spacer segment with no label
                 html.append(
                     f'<td style="width:{w:.1f}%; height:14px; background:{EmailTheme.BG_CARD};"></td>'
                 )
-
+    
         html.append('</tr></table>')
         return ''.join(html)
+
 
     
     # -------------------------------------------------------------------------
@@ -1784,16 +1844,17 @@ class EmailSnowReportMessenger:
         if not recipients:
             print("No subscribers found")
             return
-        
+    
         # Apply stale logic so email matches dashboard-style behavior
-        resort_data_list = apply_stale_logic_to_resorts(resort_data_list)
-        
+        # IMPORTANT: pass the robust parser so PST/MDT strings never go through pandas
+        resort_data_list = apply_stale_logic_to_resorts(resort_data_list, self._parse_last_updated_dt)
+    
         # Sort resorts using unified sort key
         sorted_resorts = sorted(resort_data_list, key=self.get_master_sort_key)
-        
+    
         # Check powder alert
         is_powder_alert = self._check_powder_alert(sorted_resorts)
-        
+    
         # Build NWS outlooks list
         nws_outlooks_for_email = []
         for resort_data in sorted_resorts:
@@ -1801,29 +1862,23 @@ class EmailSnowReportMessenger:
                 "resort_name": resort_data["resort"],
                 "outlook": resort_data.get("nws_forecast")
             })
-
+    
         # Build email HTML
         email_html = self._build_email_html(sorted_resorts, is_powder_alert, nws_outlooks_for_email)
-        
+    
         # Debug: write out the exact html
         debug_path = os.path.expanduser("~/email_last_sent.html")
         with open(debug_path, "w", encoding="utf-8") as f:
             f.write(email_html)
         print("EMAIL DEBUG | Wrote exact outgoing HTML to:", debug_path)
-        
+    
         date_string = datetime.now().strftime('%A, %B %d, %Y')
-
+    
         # Subject
         if is_powder_alert:
-            # Restrict subject to *current* resorts so it matches the banner & table
-            current_resorts = [
-                r for r in sorted_resorts if self._is_resort_current(r)
-            ]
+            current_resorts = [r for r in sorted_resorts if self._is_resort_current(r)]
             if current_resorts:
-                best_resort_data = max(
-                    current_resorts,
-                    key=lambda x: self.get_24hr_snow(x)
-                )
+                best_resort_data = max(current_resorts, key=lambda x: self.get_24hr_snow(x))
                 max_snow = self.get_24hr_snow(best_resort_data)
                 best_resort = best_resort_data['resort']
                 subject = (
@@ -1831,20 +1886,18 @@ class EmailSnowReportMessenger:
                     f"{self._get_display_name(best_resort)} - {date_string}"
                 )
             else:
-                # Fallback safety: no current resorts, but _check_powder_alert said True
                 subject = f"Daily Snow Report - {date_string}"
         else:
             subject = f"Daily Snow Report - {date_string}"
-
-        
+    
         # Gmail API send
         try:
             creds = None
             SCOPES = ['https://www.googleapis.com/auth/gmail.send']
-            
+    
             if os.path.exists(self.token_path):
                 creds = Credentials.from_authorized_user_file(self.token_path, SCOPES)
-            
+    
             if not creds or not creds.valid:
                 if creds and creds.expired and creds.refresh_token:
                     print("Refreshing expired token...")
@@ -1854,21 +1907,21 @@ class EmailSnowReportMessenger:
                 else:
                     print(f"FATAL: No valid token.json found at {self.token_path}")
                     print("This script must be run with a valid token.json file.")
-                    return 
-
+                    return
+    
             service = build('gmail', 'v1', credentials=creds)
-            
+    
             message = MIMEMultipart('alternative')
             message['Subject'] = subject
             message['From'] = self.gmail_address
             message['To'] = ', '.join(recipients)
-
+    
             # List-Unsubscribe headers (improves deliverability)
             local, _, domain = self.gmail_address.partition("@")
             unsubscribe_email = f"{local}+unsubscribe@{domain}" if domain else self.gmail_address
             message['List-Unsubscribe'] = f"<mailto:{unsubscribe_email}?subject=Unsubscribe>"
             message['List-Unsubscribe-Post'] = "List-Unsubscribe=One-Click"
-            
+    
             # Plain-text fallback part
             text_part = MIMEText(
                 "Northern Rockies Daily Snow Report\n\n"
@@ -1878,23 +1931,24 @@ class EmailSnowReportMessenger:
                 "plain"
             )
             message.attach(text_part)
-            
+    
             # HTML part
             html_part = MIMEText(email_html, 'html')
             message.attach(html_part)
-
+    
             raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
-            
+    
             service.users().messages().send(userId='me', body={'raw': raw_message}).execute()
-            
-            print(f"✅ Report sent successfully to {len(recipients)} recipients")
-            
+    
+            print(f"Report sent successfully to {len(recipients)} recipients")
+    
         except HttpError as error:
             print(f"Gmail API error: {error}")
             if 'invalid_grant' in str(error):
                 print("FATAL: invalid_grant. The token in GitHub Secrets is expired or revoked.")
         except Exception as e:
             print(f"Error sending email: {e}")
+
 
 # =============================================================================
 # MAIN EXECUTION
