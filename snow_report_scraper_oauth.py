@@ -96,7 +96,7 @@ def normalize_text(s: str) -> str:
 def validate_scrape_minimums(resort_name: str, data: Optional[Dict]) -> List[str]:
     """
     Conservative checks: only flag when parsing looks clearly broken.
-    Returns a list of problems (empty list means OK).
+    IMPORTANT: 0.0 is valid data and must NOT be treated as missing.
     """
     if not data:
         return ["no_data_returned"]
@@ -110,62 +110,99 @@ def validate_scrape_minimums(resort_name: str, data: Optional[Dict]) -> List[str
         str(data.get("conditions_surface") or ""),
     ]).lower()
 
-    if "enable javascript" in blob:
+    if "enable javascript" in blob or "please enable javascript" in blob:
         problems.append("javascript_gate_page")
 
-    # Fragile resort-specific sanity checks
+    # Helper: missing means None or empty string only (NOT 0 / 0.0)
+    def _missing(v):
+        if v is None:
+            return True
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        return False
+
+    # Universal “completely empty scrape” check
+    # If ALL of these are missing, the parser probably failed.
+    universal_core = [
+        data.get("snow_overnight"),
+        data.get("snow_24h_base"),
+        data.get("snow_48h_base"),
+        data.get("base_depth"),
+        data.get("summit_depth"),
+        data.get("runs_open"),
+        data.get("lifts_open"),
+        data.get("comments"),
+        data.get("weather_current"),
+        data.get("conditions_surface"),
+    ]
+    if all(_missing(v) for v in universal_core):
+        problems.append("missing_all_core_fields")
+
+    # Resort-specific *light* checks (only if you want them)
     if resort_name == "Maverick":
-        core = [
+        # Maverick is allowed to report 0.0 snowfall; only quarantine if EVERYTHING is missing.
+        m_core = [
             data.get("snow_overnight"),
             data.get("snow_24h_base"),
             data.get("base_depth"),
             data.get("summit_depth"),
         ]
-        if all(v is None for v in core):
-            problems.append("missing_core_fields")
+        if all(_missing(v) for v in m_core):
+            problems.append("missing_maverick_core")
 
     if resort_name == "GreatDivide":
-        if data.get("runs_open") is None:
+        # Great Divide often reports strings like "0 / 6" — that's valid.
+        # Only quarantine if these are actually missing (None/blank), not "0 / 6".
+        if _missing(data.get("runs_open")):
             problems.append("missing_runs_open")
-        if data.get("lifts_open") is None:
+        if _missing(data.get("lifts_open")):
             problems.append("missing_lifts_open")
-        if data.get("base_depth") is None:
+        # base_depth can be 0 early season; only missing if None/blank
+        if _missing(data.get("base_depth")):
             problems.append("missing_base_depth")
 
     return problems
 
 
 
+
 def quarantine_bad_scrape(resort_name: str, data: Dict, problems: List[str]) -> Dict:
     """
     Lenient mode: keep pipeline running, but prevent bad parses from poisoning output.
-    - wipe key numeric + ops fields to None (NOT 0.0)
-    - last_updated=None so your existing staleness logic can handle it
-    - add a clean warning to comments
-    - mark data_source='quarantined'
+
+    CRITICAL FIX:
+      - DO NOT wipe last_updated. Staleness logic already ran earlier.
+      - Wipe only the fields that would create false powder alerts / leaderboards.
+      - Add a clear warning + mark data_source.
     """
+    # Keep whatever staleness logic decided earlier
+    # data["last_updated"] stays as-is.
+
     wipe_keys = [
+        # Snowfall / depth fields that can poison powder alert & charts
         "snow_overnight", "snow_24h_base", "snow_24h_summit",
         "snow_48h_base", "snow_48h_summit", "snow_7day",
         "base_depth", "summit_depth",
+        # Optionally wipe these too if you want to avoid bad-looking report text
         "temp_base", "temp_summit", "wind_speed",
-        "lifts_open", "runs_open",
         "conditions_surface", "weather_current",
         "forecast_base_temp_high", "forecast_base_temp_low",
         "forecast_summit_temp_high", "forecast_summit_temp_low",
         "forecast_precipitation", "forecast_snow",
     ]
+
     for k in wipe_keys:
         data[k] = None
-
-    data["last_updated"] = None
 
     prev = (data.get("comments") or "").strip()
     warn = f"SCRAPE_WARNING: {resort_name} quarantined ({', '.join(problems)})."
     data["comments"] = warn if not prev else f"{prev} | {warn}"
 
+    # Keep original data_source if you want, but mark as quarantined for downstream filters
     data["data_source"] = "quarantined"
+    data["scrape_warnings"] = problems  # machine-readable
     return data
+
 
 
 def apply_quarantine_if_needed(scraper_name: str, snow_data: Optional[Dict]) -> Optional[Dict]:
@@ -182,6 +219,7 @@ def apply_quarantine_if_needed(scraper_name: str, snow_data: Optional[Dict]) -> 
         snow_data = quarantine_bad_scrape(scraper_name, snow_data, problems)
 
     return snow_data
+
 
 
 
@@ -220,6 +258,33 @@ class BaseSnowReportScraper(ABC):
             'Connection': 'keep-alive',
         }
 
+    
+    def _sanitize_text_fields(self, data: Dict) -> Dict:
+        """
+        Final defensive cleanup for ALL string fields before persistence.
+        This prevents hidden Unicode, broken CSV rows, and HTML junk.
+        """
+        if not data:
+            return data
+
+        for k, v in data.items():
+            if isinstance(v, str):
+                s = normalize_text(v)
+
+                # Collapse whitespace
+                s = re.sub(r"\s+", " ", s).strip()
+
+                # Convert empty strings to None
+                if s == "":
+                    data[k] = None
+                else:
+                    data[k] = s
+
+        return data
+
+    
+    
+    
     #@staticmethod
     def clean_numeric(self, val):
         """
@@ -1663,6 +1728,7 @@ class BridgerBowlScraper(BaseSnowReportScraper):
             if data:
                 # Run the Universal Staleness Check
                 data = self._check_and_fix_staleness(data)
+                data = self._sanitize_text_fields(data)
                 
                 data.update({
                     'resort': self.resort_name,
@@ -2115,117 +2181,215 @@ class GreatDivideScraper(BaseSnowReportScraper):
 
 
 class MaverickScraper(BaseSnowReportScraper):
-    """
-    Maverick scraper - parse the visible text content from the /weather page.
-
-    Why this is better:
-      - Avoids brittle __BOOTSTRAP_STATE__ JSON parsing and control-character issues.
-      - Uses the rendered page text, which currently includes:
-        Overnight, Last 24/48/7 days, Snow Depth (base/summit), Annual Snowfall.
-    """
-
     def __init__(self):
         super().__init__("Maverick")
 
     def get_url(self) -> str:
         return "https://www.skimaverick.com/weather"
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
     @staticmethod
-    def _first_match(pattern: str, text: str, flags=re.IGNORECASE) -> Optional[str]:
+    def _first_match(pattern: str, text: str, flags=re.IGNORECASE):
         m = re.search(pattern, text, flags)
         return m.group(1).strip() if m else None
 
-    def process_data(self, response) -> Dict:
-        data = self.blank_record()
+    @staticmethod
+    def _brace_extract_json_object(text: str, start: int) -> str:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        raise ValueError("Unterminated JSON")
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        raw_text = normalize_text(soup.get_text("\n", strip=True))
-        raw_text = re.sub(r"\n{2,}", "\n", raw_text).strip()
+    def _extract_bootstrap_state(self, html: str):
+        key = "window.__BOOTSTRAP_STATE__"
+        i = html.find(key)
+        if i == -1:
+            return None
+        j = html.find("{", i)
+        if j == -1:
+            return None
+        try:
+            blob = self._brace_extract_json_object(html, j)
+            return json.loads(blob)
+        except Exception:
+            return None
 
-        # -----------------------------
-        # Core snowfall/depth fields
-        # Examples currently present on page (as visible text):
-        # Overnight: 0"
-        # Last 24 hours: 0"
-        # Last 48 hours: 4"
-        # Last 7 days: 14"
-        # Snow Depth (base): 5"
-        # Snow Depth (summit): 20"
-        # Annual Snowfall: 26"
-        # -----------------------------
-        patterns = {
-            "snow_overnight":  r"\bOvernight:\s*([0-9]+(?:\.[0-9]+)?)",
-            "snow_24h_base":   r"\bLast\s*24\s*hours:\s*([0-9]+(?:\.[0-9]+)?)",
-            "snow_48h_base":   r"\bLast\s*48\s*hours:\s*([0-9]+(?:\.[0-9]+)?)",
-            "snow_7day":       r"\bLast\s*7\s*days:\s*([0-9]+(?:\.[0-9]+)?)",
-            "base_depth":      r"\bSnow\s*Depth\s*\(base\):\s*([0-9]+(?:\.[0-9]+)?)",
-            "summit_depth":    r"\bSnow\s*Depth\s*\(summit\):\s*([0-9]+(?:\.[0-9]+)?)",
-        }
+    def _walk_quill_inserts(self, obj):
+        inserts = []
 
-        for key, pat in patterns.items():
-            v = self._first_match(pat, raw_text)
-            if v is not None:
-                data[key] = self.clean_numeric(v)
+        def walk(x):
+            if isinstance(x, dict):
+                q = x.get("quill")
+                if isinstance(q, dict):
+                    ops = q.get("ops", [])
+                    for op in ops:
+                        if isinstance(op, dict) and isinstance(op.get("insert"), str):
+                            inserts.append(op["insert"])
+                for v in x.values():
+                    walk(v)
+            elif isinstance(x, list):
+                for v in x:
+                    walk(v)
 
-        # Annual snowfall doesn't have a dedicated STANDARD_COLUMNS field.
-        # Keep it in comments so you still capture it reliably.
-        annual = self._first_match(r"\bAnnual\s*Snowfall:\s*([0-9]+(?:\.[0-9]+)?)", raw_text)
-        annual_num = self.clean_numeric(annual) if annual is not None else None
+        walk(obj)
+        return inserts
 
-        # -----------------------------
-        # Optional: surface conditions, if present
-        # -----------------------------
-        primary = self._first_match(r"\bPrimary\s*Surface\s*Conditions:\s*([^\n]+)", raw_text)
-        secondary = self._first_match(r"\bSecondary\s*Surface\s*Conditions:\s*([^\n]+)", raw_text)
+    # ------------------------------------------------------------------
+    # CORE TEXT PARSER (authoritative + sanitized)
+    # ------------------------------------------------------------------
+    def _parse_snow_report_blob(self, blob: str, data: dict):
+        """
+        Parse Maverick snow report text from a clean text blob.
+
+        Defensive by design:
+          - Hard-clips Square / Quill / JSON pollution
+          - Extracts only authoritative snow report text
+          - Guarantees validator-required fields
+        """
+        if not blob:
+            return
+
+        # ------------------------------------------------------------
+        # HARD CLIP — remove Square / site-state pollution
+        # ------------------------------------------------------------
+        for marker in (
+            "storeInfo",
+            "featureFlags",
+            "autoNavLinks",
+            "datadog",
+            "commerceLinks",
+            "window.__BOOTSTRAP_STATE__",
+        ):
+            idx = blob.find(marker)
+            if idx != -1:
+                blob = blob[:idx]
+
+        blob = normalize_text(blob)
+        blob = re.sub(r"\n{3,}", "\n\n", blob).strip()
+
+        # ------------------------------------------------------------
+        # Helpers
+        # ------------------------------------------------------------
+        def inches(label):
+            m = re.search(
+                rf"{label}\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+                blob,
+                flags=re.IGNORECASE,
+            )
+            return self.clean_numeric(m.group(1)) if m else None
+
+        def line_after(label):
+            m = re.search(
+                rf"{label}\s*:\s*([^\n\r]+)",
+                blob,
+                flags=re.IGNORECASE,
+            )
+            return normalize_text(m.group(1).strip()) if m else None
+
+        # ------------------------------------------------------------
+        # REQUIRED NUMERIC FIELDS (validator-safe)
+        # ------------------------------------------------------------
+        data["snow_overnight"] = inches("Overnight")
+        data["snow_24h_base"]  = inches("Last 24 hours")
+        data["snow_48h_base"]  = inches("Last 48 hours")
+        data["snow_7day"]      = inches("Last 7 days")
+        data["base_depth"]     = inches(r"Snow Depth\s*\(base\)")
+        data["summit_depth"]   = inches(r"Snow Depth\s*\(summit\)")
+
+        # ------------------------------------------------------------
+        # Surface conditions (STRICT)
+        # ------------------------------------------------------------
+        primary = line_after("Primary Surface Conditions")
+        secondary = line_after("Secondary Surface Conditions")
 
         if primary and secondary:
-            # Guard against the weird case you saw where primary is blank and it "captures" the secondary label
-            if primary.strip().lower() != "secondary surface conditions:":
-                data["conditions_surface"] = normalize_text(f"{primary}, {secondary}")
+            data["conditions_surface"] = f"{primary}, {secondary}"
         elif primary:
-            if primary.strip().lower() != "secondary surface conditions:":
-                data["conditions_surface"] = normalize_text(primary)
+            data["conditions_surface"] = primary
+        else:
+            data["conditions_surface"] = None
 
-        # -----------------------------
-        # last_updated
-        # -----------------------------
-        # If the page includes an explicit date anywhere (e.g., 12/14/2025), capture it.
-        # Otherwise leave None so your universal staleness check can fingerprint.
-        date_str = self._first_match(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", raw_text)
-        if date_str:
+        # ------------------------------------------------------------
+        # Timestamp
+        # ------------------------------------------------------------
+        date = self._first_match(r"(\d{1,2}/\d{1,2}/\d{4})", blob)
+        time = self._first_match(r"(\d{1,2}:\d{2}\s*(?:am|pm))", blob)
+
+        if date:
             try:
-                dt = datetime.strptime(date_str, "%m/%d/%Y")
-                data["last_updated"] = dt.strftime("%Y-%m-%d") + " 06:00 AM"
+                if time:
+                    dt = datetime.strptime(
+                        f"{date} {time.lower().replace(' ', '')}",
+                        "%m/%d/%Y %I:%M%p",
+                    )
+                else:
+                    dt = datetime.strptime(date, "%m/%d/%Y")
+                data["last_updated"] = dt.strftime("%Y-%m-%d %I:%M %p")
             except Exception:
-                data["last_updated"] = date_str
-        else:
-            data["last_updated"] = None
+                data["last_updated"] = date
 
-        # -----------------------------
-        # comments
-        # -----------------------------
-        comment_parts = []
+    # ------------------------------------------------------------------
+    # MAIN ENTRY
+    # ------------------------------------------------------------------
+    def process_data(self, response):
+        data = self.blank_record()
+        html = response.text
 
-        # If you want to preserve a small snippet of the page context, keep it short:
-        # Pull the first line that contains "Overnight" as proof-of-source.
-        if "Overnight:" in raw_text:
-            # find the line that contains Overnight and keep a limited run-on
-            lines = raw_text.splitlines()
-            for ln in lines:
-                if "Overnight:" in ln:
-                    comment_parts.append(f"Parsed page metrics line: {ln[:180]}")
-                    break
+        # 1️⃣ PRIMARY PATH — Square bootstrap → Quill Snow Report
+        state = self._extract_bootstrap_state(html)
+        if state:
+            inserts = self._walk_quill_inserts(state)
+            candidates = [
+                s for s in inserts
+                if isinstance(s, str)
+                and (
+                    "Last 24 hours" in s
+                    or "Snow Depth (base)" in s
+                    or "Snow Depth (summit)" in s
+                )
+            ]
 
-        if annual_num is not None:
-            comment_parts.append(f"Annual snowfall (site): {annual_num}\"")
 
-        if comment_parts:
-            data["comments"] = normalize_text(" | ".join(comment_parts))
-        else:
-            data["comments"] = "Data extracted from visible page text."
+            if candidates:
+                blob = normalize_text(max(candidates, key=len))
+                self._parse_snow_report_blob(blob, data)
 
-        data["data_source"] = "html_text_parse"
+                if any(data.get(k) is not None for k in (
+                    "snow_overnight",
+                    "snow_24h_base",
+                    "base_depth",
+                    "summit_depth",
+                )):
+                    data["data_source"] = "bootstrap_quill"
+                    return data
+
+        # 2️⃣ FALLBACK — visible text
+        soup = BeautifulSoup(html, "html.parser")
+        text_blob = normalize_text(soup.get_text("\n", strip=True))
+        self._parse_snow_report_blob(text_blob, data)
+
+        if any(data.get(k) is not None for k in (
+            "snow_overnight",
+            "snow_24h_base",
+            "base_depth",
+            "summit_depth",
+        )):
+            data["data_source"] = "html_text"
+            return data
+
+        # 3️⃣ LAST RESORT — raw HTML
+        self._parse_snow_report_blob(normalize_text(html), data)
+        data["data_source"] = "html_payload"
         return data
+
+
 
 
 
