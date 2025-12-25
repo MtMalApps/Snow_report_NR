@@ -8,3 +8,6 @@ credentials.json
 *_backup_*.py
 *_20*.py
 *.patch
+Archive.zip
+debug_nws_*.py
+*.html
