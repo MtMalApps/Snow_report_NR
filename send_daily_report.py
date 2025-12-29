@@ -1914,7 +1914,8 @@ class EmailSnowReportMessenger:
             message = MIMEMultipart('alternative')
             message['Subject'] = subject
             message['From'] = self.gmail_address
-            message['To'] = ', '.join(recipients)
+            message['To'] = self.gmail_address
+            message['Bcc'] = ', '.join(recipients)
     
             # List-Unsubscribe headers (improves deliverability)
             local, _, domain = self.gmail_address.partition("@")
