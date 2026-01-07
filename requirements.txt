@@ -1,6 +1,6 @@
 altair==5.5.0
-anyio==4.11.0
-attrs==25.4.0
+anyio>=4.11.0
+attrs>=25.4.0
 beautifulsoup4==4.13.4
 blinker==1.9.0
 branca==0.8.2
@@ -70,7 +70,7 @@ streamlit-folium==0.25.3
 tenacity==9.1.2
 toml==0.10.2
 tornado==6.5.2
-typing_extensions==4.13.2
+typing_extensions>=4.15.0,<5.0
 tzdata==2025.2
 urllib3>=2.5.0,<3.0
 watchdog==6.0.0
