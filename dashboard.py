@@ -799,7 +799,7 @@ def show_resort_modal(row):
         if display_comments:
             st.info(f"📝 {display_comments}")
 
-    # ──────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
     # TAB 2 — SNOTEL
     # ──────────────────────────────────────────────────────────
     with tab2:
@@ -853,8 +853,22 @@ def show_resort_modal(row):
         val_density = snotel.get('density', 'N/A')
         val_qual = snotel.get('snow_category', 'N/A')
         
+        # FIXED: More robust percent_of_median handling
         pct_raw = snotel.get('percent_of_median', 'N/A')
-        val_pct = f"{pct_raw}%" if (str(pct_raw) != "N/A" and pct_raw is not None) else "N/A"
+        
+        # Handle all possible data types from Firebase
+        if pct_raw is None:
+            val_pct = "N/A"
+        elif isinstance(pct_raw, (int, float)):
+            val_pct = f"{int(pct_raw)}%"
+        elif str(pct_raw).strip().upper() in ["N/A", "NA", "NONE", ""]:
+            val_pct = "N/A"
+        else:
+            # Try to convert string to number
+            try:
+                val_pct = f"{int(float(str(pct_raw)))}%"
+            except (ValueError, TypeError):
+                val_pct = "N/A"
         
         density_display = "N/A" if val_density == "N/A" else f"{val_density}<div class='data-sub'>{val_qual}</div>"
 
