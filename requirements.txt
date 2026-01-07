@@ -6,7 +6,7 @@ blinker==1.9.0
 branca==0.8.2
 CacheControl==0.14.4
 cachetools==6.2.2
-certifi==2025.4.26
+certifi>=2025.10.5
 cffi==2.0.0
 charset-normalizer==3.4.2
 click==8.3.1
