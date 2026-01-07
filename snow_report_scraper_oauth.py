@@ -243,6 +243,7 @@ class BaseSnowReportScraper(ABC):
         'lifts_open', 'runs_open',
         'comments', 'data_source',
         'nws_forecast', 'snotel_data',
+        'percent_of_median',  
         'forecast_base_temp_high', 'forecast_base_temp_low',
         'forecast_summit_temp_high', 'forecast_summit_temp_low',
         'forecast_precipitation', 'forecast_snow',
@@ -2041,144 +2042,168 @@ class BigSkyScraper(BaseSnowReportScraper):
 
 
 
+"""
+FIXED Great Divide Scraper - January 2026
+Based on the new page structure at https://www.skigd.com/weather-and-conditions
+
+Replace the entire GreatDivideScraper class (around line ~2800) with this version
+"""
+
+"""
+REPLACEMENT FOR GreatDivideScraper CLASS
+=========================================
+
+Instructions:
+1. Find the GreatDivideScraper class in snow_report_scraper_oauth.py
+2. Replace the ENTIRE class (from "class GreatDivideScraper" to the line before "class MaverickScraper")
+3. Paste this code in its place
+
+This version uses Selenium to render the JavaScript-loaded Bubble.io content.
+"""
+
 class GreatDivideScraper(BaseSnowReportScraper):
     """
-    Great Divide scraper - parses the mostly-static HTML text on:
+    Great Divide scraper - uses Selenium to render JavaScript from Bubble.io iframe:
     https://www.skigd.com/weather-and-conditions
-
-    Notes:
-      - The page includes a report date like "12-14-25" (no explicit time).
-        We normalize to "YYYY-MM-DD 06:00 AM" in America/Denver.
-      - "Season Total 26”" is *season snowfall*, not 7-day snowfall.
-        Your schema does not currently include seasonal snowfall (except in a couple scrapers),
-        so we store it in comments and (optionally) also in snow_7day ONLY if you want that behavior.
+    
+    The page loads data dynamically via a Bubble.io iframe that requires JavaScript execution.
+    Updated: January 2026 to use Selenium for dynamic content.
     """
-
     def __init__(self):
         super().__init__("GreatDivide")
-
+    
     def get_url(self) -> str:
-        return "https://www.skigd.com/weather-and-conditions"
-
-    @staticmethod
-    def _first_match(pattern: str, text: str, flags=re.IGNORECASE):
-        m = re.search(pattern, text, flags)
-        return m.group(1).strip() if m else None
-
+        return "https://snow-conditions.bubbleapps.io/public_output"
+    
+    def get_snow_report(self) -> Optional[Dict]:
+        """Override base method to use Selenium instead of requests"""
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.chrome.options import Options
+        from webdriver_manager.chrome import ChromeDriverManager
+        import time
+        
+        # Set up Chrome options for headless operation
+        chrome_options = Options()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        
+        driver = None
+        try:
+            # Initialize Chrome driver
+            logging.info(f"{self.resort_name}: Initializing Selenium Chrome driver...")
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            
+            # Load the Bubble.io page
+            logging.info(f"{self.resort_name}: Loading {self.get_url()}...")
+            driver.get(self.get_url())
+            
+            # Wait for JavaScript to render content (5 seconds should be enough)
+            time.sleep(5)
+            
+            # Get the rendered page source
+            page_source = driver.page_source
+            
+            # Parse with BeautifulSoup
+            soup = BeautifulSoup(page_source, 'html.parser')
+            
+            # Process the data using our custom parser
+            data = self.process_data_from_soup(soup)
+            
+            if data:
+                # Run the Universal Staleness Check
+                data = self._check_and_fix_staleness(data)
+                
+                # Add Standard Metadata
+                data.update({
+                    'resort': self.resort_name,
+                    'date': datetime.now().strftime('%Y-%m-%d'),
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                })
+            
+            logging.info(f"{self.resort_name}: Successfully scraped with Selenium")
+            return data
+            
+        except Exception as e:
+            logging.error(f"{self.resort_name}: Selenium scraping failed: {e}")
+            print(f"Error fetching snow report for {self.resort_name}: {e}")
+            return None
+        
+        finally:
+            # Clean up - close the browser
+            if driver:
+                driver.quit()
+    
     def process_data(self, response) -> Dict:
-        soup = BeautifulSoup(response.text, "html.parser")
+        """Not used - get_snow_report() is overridden to use Selenium"""
+        raise NotImplementedError("GreatDivideScraper uses Selenium via get_snow_report() method")
+    
+    def process_data_from_soup(self, soup) -> Dict:
+        """Process data from BeautifulSoup object (after Selenium render)"""
         data = self.blank_record()
-
-        # Work with normalized full-page text (very resilient for this site)
-        full_text = normalize_text(soup.get_text("\n", strip=True))
-        full_text = re.sub(r"\n{2,}", "\n", full_text).strip()
-
+        
+        # Get all text content
+        full_text = soup.get_text()
+        
         # -------------------------
-        # 1) last_updated (report date like "12-14-25")
+        # 1) Last Updated - "Report Date: Wed, Jan 7, 2026 7:36 am"
         # -------------------------
-        # The page includes a standalone MM-DD-YY line near the conditions block.
-        raw_date = self._first_match(r"\b(\d{1,2}-\d{1,2}-\d{2})\b", full_text)
-        if raw_date:
+        date_match = re.search(r'Report Date:\s*(.+?)(?:\n|Resort)', full_text)
+        if date_match:
+            raw_date = date_match.group(1).strip()
             try:
-                dt = datetime.strptime(raw_date, "%m-%d-%y")
-                # Great Divide doesn’t publish a time in that block; choose a stable morning time.
-                data["last_updated"] = dt.strftime("%Y-%m-%d") + " 06:00 AM"
-            except Exception:
+                # Parse: "Wed, Jan 7, 2026 7:36 am"
+                parsed = datetime.strptime(raw_date, "%a, %b %d, %Y %I:%M %p")
+                data["last_updated"] = parsed.strftime("%Y-%m-%d %I:%M %p")
+            except Exception as e:
+                logging.warning(f"Great Divide: Could not parse date '{raw_date}': {e}")
                 data["last_updated"] = raw_date
-
+        
         # -------------------------
-        # 2) Surface / weather summary lines
+        # 2) Lifts & Runs - "Lifts 4 / 6 open" and "Trails 45 / 123 open"
         # -------------------------
-        # Examples on the page:
-        #   "Forecast Weather: Mostly Sunny"
-        #   "Forecast: Mostly Sunny"
-        #   "Snow Surface: Groomed"
-        forecast_weather = (
-            self._first_match(r"Forecast Weather:\s*([^\n]+)", full_text)
-            or self._first_match(r"Forecast:\s*([^\n]+)", full_text)
-        )
-        if forecast_weather:
-            data["weather_current"] = forecast_weather
-
-        snow_surface = self._first_match(r"Snow Surface:\s*([^\n]+)", full_text)
-        if snow_surface:
-            data["conditions_surface"] = snow_surface
-
-        # Forecast temps (store in forecast_* fields; leave temp_base/temp_summit empty unless you prefer otherwise)
-        base_temp = self._first_match(r"Forecast Base Temp:\s*([-\d\.]+)", full_text)
-        top_temp  = self._first_match(r"Forecast Top Temp:\s*([-\d\.]+)", full_text)
-        if base_temp is not None:
-            data["forecast_base_temp_high"] = self.clean_numeric(base_temp)
-        if top_temp is not None:
-            data["forecast_summit_temp_high"] = self.clean_numeric(top_temp)
-
+        lifts_match = re.search(r'Lifts\s*(\d+)\s*/\s*(\d+)\s*open', full_text)
+        if lifts_match:
+            data['lifts_open'] = f"{lifts_match.group(1)} / {lifts_match.group(2)}"
+        
+        trails_match = re.search(r'Trails\s*(\d+)\s*/\s*(\d+)\s*open', full_text)
+        if trails_match:
+            data['runs_open'] = f"{trails_match.group(1)} / {trails_match.group(2)}"
+        
         # -------------------------
-        # 3) Depth / lifts / trails
+        # 3) Snowfall - "Overnight snowfall" or variations
         # -------------------------
-        # "Avg Base Depth min/max 10 / 10"
-        depth_pair = re.search(r"Avg Base Depth.*?(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)", full_text, re.IGNORECASE)
-        if depth_pair:
-            # Use max as the "base_depth" (more intuitive)
-            data["base_depth"] = self.clean_numeric(depth_pair.group(2))
-        else:
-            # Fallback: any single "Avg Base Depth" number
-            one_depth = self._first_match(r"Avg Base Depth.*?(\d+(?:\.\d+)?)", full_text)
-            if one_depth is not None:
-                data["base_depth"] = self.clean_numeric(one_depth)
-
-        # "Open Downhill Trails 3 / 127 max"
-        trails_pair = re.search(r"Open Downhill Trails\s+(\d+)\s*/\s*(\d+)", full_text, re.IGNORECASE)
-        if trails_pair:
-            data["runs_open"] = f"{trails_pair.group(1)} / {trails_pair.group(2)}"
-
-        # "Open Lifts 2 / 6 max"
-        lifts_pair = re.search(r"Open Lifts\s+(\d+)\s*/\s*(\d+)", full_text, re.IGNORECASE)
-        if lifts_pair:
-            data["lifts_open"] = f"{lifts_pair.group(1)} / {lifts_pair.group(2)}"
-
+        overnight_match = re.search(r'(?:Overnight|overnight).*?(\d+)\s*(?:inches|")', full_text)
+        if overnight_match:
+            data['snow_overnight'] = self.clean_numeric(overnight_match.group(1))
+        
         # -------------------------
-        # 4) Snowfall block
+        # 4) Snow Depth - "Base Depth 6"" and "Summit Depth 14""
         # -------------------------
-        # The page shows:
-        #   "Season Total 26”"
-        # It often does NOT include Last 12hrs / Last 72hrs numeric values.
-        season_total = self._first_match(r"Season Total\s+(\d+(?:\.\d+)?)", full_text)
-        if season_total is not None:
-            # Keep this true meaning in comments so you don't confuse it with 7-day.
-            # If you *want* to also fill snow_7day, uncomment the next line.
-            # data["snow_7day"] = self.clean_numeric(season_total)
-            season_total_num = self.clean_numeric(season_total)
-        else:
-            season_total_num = None
-
+        base_match = re.search(r'Base Depth[:\s]*(\d+)\s*(?:inches|")', full_text, re.IGNORECASE)
+        if base_match:
+            data['base_depth'] = self.clean_numeric(base_match.group(1))
+        
+        summit_match = re.search(r'Summit Depth[:\s]*(\d+)\s*(?:inches|")', full_text, re.IGNORECASE)
+        if summit_match:
+            data['summit_depth'] = self.clean_numeric(summit_match.group(1))
+        
         # -------------------------
-        # 5) Comments / bulletin
+        # 5) Comments - Extract condition report
         # -------------------------
-        # Try to extract the "Good morning from Great Divide!" section through the next major header-ish block.
-        bulletin = None
-        bullet_start = full_text.lower().find("good morning from great divide")
-        if bullet_start != -1:
-            snippet = full_text[bullet_start:]
-            # Stop at "Weather & Snow Update:" if present (keeps bulletin readable)
-            stop_idx = snippet.lower().find("weather & snow update")
-            if stop_idx != -1:
-                bulletin = snippet[:stop_idx].strip()
-            else:
-                bulletin = snippet[:1200].strip()  # hard cap to avoid huge comments
-
-        comment_parts = []
-        if bulletin:
-            comment_parts.append(bulletin)
-        if season_total_num is not None:
-            comment_parts.append(f"Season total snowfall (site): {season_total_num}\"")
-
-        if comment_parts:
-            data["comments"] = normalize_text("\n\n".join(comment_parts))
-
-        data["data_source"] = "html_static"
+        report_match = re.search(r"Today's Condition Report:(.+?)(?:Overnight|Snow|Grooming|$)", full_text, re.DOTALL)
+        if report_match:
+            condition_report = report_match.group(1).strip()
+            # Clean up whitespace
+            condition_report = re.sub(r'\s+', ' ', condition_report)
+            condition_report = condition_report[:1000]  # Cap at 1000 chars
+            data['comments'] = condition_report
+        
+        data['data_source'] = 'selenium_dynamic'
         return data
-
-
 
 class MaverickScraper(BaseSnowReportScraper):
     def __init__(self):
@@ -2498,178 +2523,283 @@ class SNOTELDataFetcher:
         # Fallback method, rarely used. Returns empty struct to be safe.
         return self._create_empty_report(error_reason="Use batch fetch")
 
+    """
+    COMPLETE FIXED VERSION of get_all_snowfall_reports
+    Replace the entire method in your SNOTELDataFetcher class with this version
+    
+    KEY FIX: Ensures percent_of_median is calculated for ALL resorts, 
+    even when hourly data parsing has issues
+    """
+    
     def get_all_snowfall_reports(self) -> Dict[str, Dict]:
-            """
-            Fetches HOURLY SNOTEL data for all stations.
-            Collects history (SNWD, WTEQ, TOBS) and calculates 24h deltas.
-            """
-            self._log.info("Starting batch SNOTEL API fetch (HOURLY)...")
-            triplet_to_resort = {v['triplet']: k for k, v in self.STATION_INFO.items()}
-            all_triplets = ",".join(triplet_to_resort.keys())
+        """
+        Fetches HOURLY SNOTEL data plus DAILY Median SWE.
+        Calculates 24h deltas, Density, and Percent of Median.
+        
+        FIXED: Uses yesterday for median (more reliable) and ensures 
+        percent_of_median is calculated even with limited hourly data
+        """
+        self._log.info("Starting batch SNOTEL API fetch (HOURLY + DAILY w/MEDIAN)...")
+        triplet_to_resort = {v['triplet']: k for k, v in self.STATION_INFO.items()}
+        all_triplets = ",".join(triplet_to_resort.keys())
+        
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        start_dt = now - timedelta(days=2)
+        begin_date_str = start_dt.strftime("%Y-%m-%d")
+        
+        # Use yesterday for median (more reliable than today)
+        yesterday = now - timedelta(days=1)
+        yesterday_str = yesterday.strftime("%Y-%m-%d")
+        today_str = now.strftime("%Y-%m-%d")
+        
+        # --- 1. Define URLs ---
+        hourly_url = (
+            "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
+            f"?stationTriplets={all_triplets}"
+            "&elements=WTEQ,SNWD,TOBS"
+            "&duration=HOURLY"
+            f"&beginDate={begin_date_str}"
+            "&endDate=9999-12-31"
+        )
+    
+        # Get yesterday's data with median
+        daily_median_url = (
+            "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
+            f"?stationTriplets={all_triplets}"
+            "&elements=WTEQ"
+            "&duration=DAILY"
+            f"&beginDate={yesterday_str}"
+            f"&endDate={today_str}"
+            "&centralTendencyType=MEDIAN"
+        )
+    
+        final_reports = {}
+        median_map = {}
+        current_swe_map = {}
+        
+        try:
+            # --- 2. Execute API Calls ---
+            self._log.info(f"Fetching hourly data...")
+            h_resp = self.session.get(hourly_url, timeout=self._timeout)
             
-            # --- FIX: Calculate explicit date instead of using relative "-2" ---
-            # This forces the API to respect our window regardless of server time
-            from datetime import datetime, timedelta
-            start_dt = datetime.now() - timedelta(days=2)
-            begin_date_str = start_dt.strftime("%Y-%m-%d")
+            self._log.info(f"Fetching daily+median data...")
+            m_resp = self.session.get(daily_median_url, timeout=self._timeout)
             
-            url = (
-                "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
-                f"?stationTriplets={all_triplets}"
-                "&elements=WTEQ,SNWD,TOBS"
-                "&duration=HOURLY"
-                f"&beginDate={begin_date_str}"  # Explicit start date
-                "&endDate=9999-12-31"           # Explicit end date (force to current)
-            )
+            h_resp.raise_for_status()
+            m_resp.raise_for_status()
             
-            final_reports = {}
-            try:
-                resp = self.session.get(url, timeout=self._timeout)
-                resp.raise_for_status()
-                api_data_list = resp.json()
+            hourly_data_list = h_resp.json()
+            daily_median_list = m_resp.json()
+            
+            self._log.info(f"Received {len(hourly_data_list)} hourly station records")
+            self._log.info(f"Received {len(daily_median_list)} daily+median records")
+    
+            # --- 3. Map Medians from DAILY response ---
+            for station in daily_median_list:
+                triplet = station.get('stationTriplet')
+                if not triplet:
+                    continue
+                    
+                data_list = station.get('data', [])
+                for data_obj in data_list:
+                    values = data_obj.get('values', [])
+                    if values:
+                        # Get the most recent value
+                        latest_data = values[-1]
+                        current_val = latest_data.get('value')
+                        median_val = latest_data.get('median')
+                        
+                        if current_val is not None:
+                            current_swe_map[triplet] = float(current_val)
+                        if median_val is not None:
+                            median_map[triplet] = float(median_val)
+                            self._log.info(f"  {triplet}: Current SWE={current_val}\", Median={median_val}\"")
+    
+            # --- 4. Process Each Station's Hourly Data ---
+            for station_data in hourly_data_list:
+                triplet = station_data.get('stationTriplet')
+                resort_name = triplet_to_resort.get(triplet)
+                if not resort_name:
+                    continue
                 
-                if not api_data_list:
-                    raise ValueError("API response was empty.")
+                # Build history map from hourly values
+                history_map = {}
                 
-                for station_data in api_data_list:
-                    triplet = station_data.get('stationTriplet')
-                    resort_name = triplet_to_resort.get(triplet)
-                    
-                    if not resort_name:
-                        continue
-                    
-                    station_name = self.STATION_INFO[resort_name]['name']
-                    station_elev = self.STATION_INFO[resort_name]['elevation']
-                    
-                    # Store series by timestamp to merge them
-                    history_map = {}
-                    
-                    def get_or_create(ts):
+                for val_obj in station_data.get('data', []):
+                    elem = val_obj.get('elementCd')
+                    for date_val in val_obj.get('dateTimeValues', []):
+                        ts = date_val.get('dateTime')
+                        value = date_val.get('value')
+                        if ts is None or value is None:
+                            continue
+                        
                         if ts not in history_map:
-                            history_map[ts] = {"timestamp": ts, "snow_depth": None, "swe": None, "temp": None}
-                        return history_map[ts]
-
-                    for element_data in station_data.get('data', []):
-                        element_code = element_data['stationElement']['elementCode'].lower()
-                        values = element_data.get('values', [])
+                            history_map[ts] = {'depth': None, 'swe': None, 'temp': None}
                         
-                        for v in values:
-                            date_str = v.get('date')
-                            val = v.get('value')
-                            if not date_str: continue
-                            
-                            entry = get_or_create(date_str)
-                            
-                            if element_code == 'snwd':
-                                entry['snow_depth'] = val
-                            elif element_code == 'wteq':
-                                entry['swe'] = val
-                            elif element_code == 'tobs':
-                                entry['temp'] = val
-
-                    # Convert map to sorted list
-                    full_history = sorted(history_map.values(), key=lambda x: x['timestamp'])
+                        if elem == 'SNWD':
+                            history_map[ts]['depth'] = float(value)
+                        elif elem == 'WTEQ':
+                            history_map[ts]['swe'] = float(value)
+                        elif elem == 'TOBS':
+                            history_map[ts]['temp'] = float(value)
+                
+                # CRITICAL FIX: Calculate percent even without full hourly data
+                if not history_map:
+                    station_median = median_map.get(triplet)
+                    raw_swe = current_swe_map.get(triplet, 0)
                     
-                    # Ensure we don't upload too much if the query returns tons of data
-                    # (Last 48 entries is roughly 2 days of hourly data)
-                    recent_history = full_history[-48:] if len(full_history) > 48 else full_history
-
-                    # --- CALCULATE 24H SUMMARY METRICS ---
-                    obs_time = "N/A"
-                    total_depth = None
-                    total_swe = None
-                    snow_change = None
-                    swe_change = None
+                    pct_median = "N/A"
+                    if station_median and station_median > 0 and raw_swe:
+                        pct_median = int(round((float(raw_swe) / station_median) * 100))
+                        self._log.info(f"  {resort_name}: {raw_swe}\" SWE / {station_median}\" median = {pct_median}% (limited hourly data)")
                     
-                    if recent_history:
-                        latest = recent_history[-1]
-                        obs_time = latest['timestamp']
-                        total_depth = latest['snow_depth']
-                        total_swe = latest['swe']
-                        
-                        # Find 24h ago
-                        try:
-                            # Parse formatting
-                            fmt_opts = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M']
-                            latest_dt = None
-                            for f in fmt_opts:
-                                try:
-                                    latest_dt = datetime.strptime(latest['timestamp'], f)
-                                    break
-                                except: pass
-                            
-                            if latest_dt:
-                                target_dt = latest_dt - timedelta(hours=24)
-                                prev_depth = None
-                                prev_swe = None
-                                min_diff = 5400 # 1.5 hours in seconds
-                                
-                                for h in recent_history:
-                                    try:
-                                        h_dt = None
-                                        for f in fmt_opts:
-                                            try:
-                                                h_dt = datetime.strptime(h['timestamp'], f)
-                                                break
-                                            except: pass
-                                        
-                                        if h_dt:
-                                            diff = abs((h_dt - target_dt).total_seconds())
-                                            if diff < min_diff:
-                                                min_diff = diff
-                                                prev_depth = h['snow_depth']
-                                                prev_swe = h['swe']
-                                    except: continue
-                                
-                                if total_depth is not None and prev_depth is not None:
-                                    snow_change = round(total_depth - prev_depth, 1)
-                                
-                                if total_swe is not None and prev_swe is not None:
-                                    swe_change = round(total_swe - prev_swe, 2)
-                        except Exception as e:
-                            self._log.warning(f"Error calculating summary delta for {resort_name}: {e}")
-
-                    # Calculate Density
-                    density = None
-                    if snow_change is not None and swe_change is not None and snow_change > 0.5 and swe_change > 0.01:
-                        density = round((swe_change / snow_change) * 100, 1)
-                    
-                    percent_of_median = "N/A" 
-                    is_new_snow = (density is not None)
-    
-                    report = {
-                        'station_name': station_name,
-                        'triplet': triplet,
-                        'elevation': station_elev,
-                        'snow_depth': snow_change if snow_change is not None else 0,
-                        'swe': swe_change if swe_change is not None else 0,
-                        'snotel_total_depth': total_depth if total_depth is not None else 0, 
-                        'snotel_total_swe': total_swe if total_swe is not None else 0,
-                        'density': density if is_new_snow else 'N/A',
-                        'percent_of_median': percent_of_median,
-                        'snow_category': self._snow_category(density) if is_new_snow else 'N/A',
-                        'latest_observation': obs_time,
-                        'history': recent_history,
-                        'unavailable': False,
-                        'error_reason': None if is_new_snow else "No new snow"
-                    }
-                    
-                    final_reports[resort_name] = report
-    
-            except Exception as e:
-                self._log.error(f"SNOTEL batch API fetch error: {e}", exc_info=True)
-            
-            # Fill missing resorts
-            for resort_name in self.STATION_INFO.keys():
-                if resort_name not in final_reports:
                     final_reports[resort_name] = self._create_empty_report(
-                        station_name=self.STATION_INFO[resort_name]['name'], 
-                        error_reason='batch_api_fail', 
-                        triplet=self.STATION_INFO[resort_name]['triplet'],
-                        elevation=self.STATION_INFO[resort_name]['elevation']
+                        station_name=self.STATION_INFO[resort_name]['name'],
+                        triplet=triplet,
+                        elevation=self.STATION_INFO[resort_name]['elevation'],
+                        error_reason='no_hourly_data'
                     )
+                    final_reports[resort_name]['percent_of_median'] = pct_median
+                    final_reports[resort_name]['snotel_total_swe'] = raw_swe if raw_swe else 'N/A'
+                    # Clear error if we successfully calculated percent_of_median
+                    if pct_median != "N/A":
+                        final_reports[resort_name]['error_reason'] = None
+                        final_reports[resort_name]['unavailable'] = False
+                    continue
+                
+                # Sort timestamps and get most recent
+                sorted_times = sorted(history_map.keys(), reverse=True)
+                latest_time = sorted_times[0]
+                latest = history_map[latest_time]
+                
+                # Calculate 24h changes
+                cutoff_24h = datetime.fromisoformat(latest_time.replace('Z', '+00:00')) - timedelta(hours=24)
+                
+                prior_depth = None
+                prior_swe = None
+                for ts in sorted_times[1:]:
+                    ts_dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    if ts_dt <= cutoff_24h:
+                        prior_depth = history_map[ts].get('depth')
+                        prior_swe = history_map[ts].get('swe')
+                        break
+                
+                total_depth = latest.get('depth') or 0
+                total_swe = latest.get('swe') or 0
+                
+                snow_change = (total_depth - prior_depth) if (prior_depth is not None) else 0
+                swe_change = (total_swe - prior_swe) if (prior_swe is not None) else 0
+                
+                # Calculate density
+                density = None
+                if total_depth and total_depth > 0:
+                    density = round((total_swe / total_depth) * 100, 1)
+                
+                # Build recent history (last 48h)
+                cutoff_48h = datetime.fromisoformat(latest_time.replace('Z', '+00:00')) - timedelta(hours=48)
+                recent_history = []
+                for ts in sorted_times:
+                    ts_dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    if ts_dt < cutoff_48h:
+                        break
+                    h = history_map[ts]
+                    recent_history.append({
+                        'timestamp': ts,
+                        'depth': h.get('depth'),
+                        'swe': h.get('swe'),
+                        'temp': h.get('temp')
+                    })
+                
+                # Parse observation time
+                try:
+                    obs_dt = datetime.fromisoformat(latest_time.replace('Z', '+00:00'))
+                    obs_time = obs_dt.strftime('%Y-%m-%d %I:%M %p')
+                except:
+                    obs_time = latest_time
+                
+                # --- 5. Calculate Percent of Median ---
+                pct_median = "N/A"
+                station_median = median_map.get(triplet)
+                
+                # Use the daily SWE if available, otherwise use hourly
+                raw_swe = current_swe_map.get(triplet) or total_swe
+                
+                if station_median and station_median > 0 and raw_swe:
+                    pct_median = int(round((float(raw_swe) / station_median) * 100))
+                    self._log.info(f"  {resort_name}: {raw_swe}\" SWE / {station_median}\" median = {pct_median}%")
+                elif raw_swe and float(raw_swe) > 0:
+                    pct_median = ">100"
+                    self._log.warning(f"  {resort_name}: No median data, SWE={raw_swe}\"")
+                
+                # --- 6. Build Final Report ---
+                final_reports[resort_name] = {
+                    'station_name': self.STATION_INFO[resort_name]['name'],
+                    'triplet': triplet,
+                    'elevation': self.STATION_INFO[resort_name]['elevation'],
+                    'snow_depth': round(snow_change, 1) if snow_change else 0,
+                    'swe': round(swe_change, 2) if swe_change else 0,
+                    'snotel_total_depth': round(total_depth, 1) if total_depth else 0,
+                    'snotel_total_swe': round(total_swe, 2) if total_swe else 0,
+                    'density': density,
+                    'percent_of_median': pct_median,
+                    'snow_category': self._snow_category(density),
+                    'latest_observation': obs_time,
+                    'history': recent_history,
+                    'unavailable': False,
+                    'error_reason': None
+                }
+            
+            # --- 7. FINAL SAFETY NET: Fill in percent for any resort that was missed ---
+            for r_name, station_info in self.STATION_INFO.items():
+                if r_name not in final_reports:
+                    # Resort wasn't in hourly data at all - create minimal report
+                    triplet = station_info['triplet']
+                    station_median = median_map.get(triplet)
+                    raw_swe = current_swe_map.get(triplet, 0)
                     
-            return final_reports
+                    pct_median = "N/A"
+                    if station_median and station_median > 0 and raw_swe:
+                        pct_median = int(round((float(raw_swe) / station_median) * 100))
+                        self._log.info(f"  {r_name}: Fallback calc: {raw_swe}\" / {station_median}\" = {pct_median}%")
+                    
+                    final_reports[r_name] = self._create_empty_report(
+                        station_name=station_info['name'],
+                        triplet=triplet,
+                        elevation=station_info['elevation'],
+                        error_reason='not_in_hourly_data'
+                    )
+                    final_reports[r_name]['percent_of_median'] = pct_median
+                    final_reports[r_name]['snotel_total_swe'] = raw_swe if raw_swe else 'N/A'
+                else:
+                    # Resort WAS processed - double-check percent exists
+                    if final_reports[r_name].get('percent_of_median') == "N/A":
+                        triplet = station_info['triplet']
+                        station_median = median_map.get(triplet)
+                        raw_swe = current_swe_map.get(triplet) or final_reports[r_name].get('snotel_total_swe', 0)
+                        
+                        if station_median and station_median > 0 and raw_swe and raw_swe != 'N/A':
+                            pct_median = int(round((float(raw_swe) / station_median) * 100))
+                            final_reports[r_name]['percent_of_median'] = pct_median
+                            self._log.info(f"  {r_name}: Backfilled percent: {raw_swe}\" / {station_median}\" = {pct_median}%")
+    
+        except Exception as e:
+            self._log.error(f"SNOTEL batch API fetch error: {e}", exc_info=True)
+            import traceback
+            traceback.print_exc()
+            
+            # Fill missing entries
+            for r_name in self.STATION_INFO.keys():
+                if r_name not in final_reports:
+                    final_reports[r_name] = self._create_empty_report(
+                        station_name=self.STATION_INFO[r_name]['name'],
+                        triplet=self.STATION_INFO[r_name]['triplet'],
+                        elevation=self.STATION_INFO[r_name]['elevation'],
+                        error_reason='batch_api_fail'
+                    )
+    
+        return final_reports
+
 
 # =============================================================================
 # MAIN EXECUTION
@@ -2704,8 +2834,9 @@ def main():
         snotel_fetcher = SNOTELDataFetcher()
         nws_fetcher = NWSStormOutlook()
 
-        logging.info("Fetching all SNOTEL data in one batch...")
+        logging.info("Fetching all SNOTEL data in one batch (including medians)...")
         try:
+            # This now calls your updated function that calculates percent of median
             all_snotel_data = snotel_fetcher.get_all_snowfall_reports()
             logging.info(f"Batch SNOTEL fetch complete. Got data for {len(all_snotel_data)} stations.")
         except Exception as e:
@@ -2735,49 +2866,56 @@ def main():
             logging.info(f"Fetching data for {scraper.resort_name}...")
             snow_data = scraper.get_snow_report()
             
+            # Universal Scrape Validation/Quarantine
             snow_data = apply_quarantine_if_needed(scraper.resort_name, snow_data)
 
-            
-            
             if snow_data:
                 resort_name = snow_data["resort"]
                 
-                # SNOTEL Logic
-                snow_data['snotel_data'] = all_snotel_data.get(resort_name)
-                if snow_data['snotel_data'] is None:
+                # --- SNOTEL Logic & Median Mapping ---
+                snotel_report = all_snotel_data.get(resort_name)
+                
+                if snotel_report is None:
                     logging.warning(f"No pre-fetched SNOTEL data for {resort_name}, attempting single fallback fetch...")
                     try:
-                        snow_data['snotel_data'] = snotel_fetcher.get_snowfall_report(resort_name)
+                        snotel_report = snotel_fetcher.get_snowfall_report(resort_name)
                     except Exception as e:
                         logging.error(f"SNOTEL fallback fetch failed for {resort_name}: {e}")
-                        snow_data['snotel_data'] = snotel_fetcher._create_empty_report(
+                        snotel_report = snotel_fetcher._create_empty_report(
                             station_name=snotel_fetcher.STATION_INFO.get(resort_name, {}).get('name', 'SNOTEL'),
                             error_reason='fallback_fail',
                             triplet=snotel_fetcher.STATION_INFO.get(resort_name, {}).get('triplet')
                         )
 
-                # NWS Logic
+                # Attach the full snotel object
+                snow_data['snotel_data'] = snotel_report
+                
+                # Pull Percent of Median to the top level for CSV/Firebase columns
+                if snotel_report:
+                    val = snotel_report.get('percent_of_median', 'N/A')
+                    snow_data['percent_of_median'] = val
+                    logging.info(f"SNOTEL Median for {resort_name}: {val}%")
+
+                # --- NWS Logic ---
                 logging.info(f"Fetching NWS for: {resort_name}")
                 coords = RESORT_COORDS.get(resort_name)
                 if coords:
                     try:
                         snow_data['nws_forecast'] = nws_fetcher.get_outlook(coords["lat"], coords["lon"])
-                        #debug
+                        # Debug for Big Mountain
                         if resort_name == "BigMountain":
                             logging.info(f"NWS DEBUG BigMountain: {snow_data['nws_forecast']}")
-
                         
-                        #debug
-                        time.sleep(0.3) 
+                        time.sleep(0.3) # Rate limit protection
                     except Exception as e:
                         logging.warning(f"NWS fetch failed for {resort_name}: {e}")
                         snow_data['nws_forecast'] = None
                 else:
                     snow_data['nws_forecast'] = None
 
-                resort_data_list.append(snow_data)
+                resort_data_list = resort_data_list + [snow_data]
                 
-                # Save to CSV - This includes the calculated snotel_data with density
+                # Save to CSV (Includes the calculated percent_of_median column)
                 scraper.save_to_csv(snow_data)  
                 logging.info(f"Complete data saved to CSV for {scraper.resort_name}")
             else:
