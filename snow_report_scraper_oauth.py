@@ -2556,6 +2556,24 @@ class MaverickScraper(BaseSnowReportScraper):
 # =============================================================================
 # SNOTEL DATA INTEGRATION (HOURLY)
 # =============================================================================
+"""
+COMPLETE SNOTELDataFetcher REPLACEMENT — February 2026
+======================================================
+
+Replace the ENTIRE SNOTELDataFetcher class in snow_report_scraper_oauth.py
+with this version.
+
+FIXES:
+1. Hourly API response structure changed:
+   - elementCd → stationElement.elementCode
+   - dateTimeValues → values
+   - dateTime → date
+2. Timestamp format changed from ISO "2026-02-11T00:00:00Z" 
+   to simple "2026-02-11 00:00"
+3. All fromisoformat() calls replaced with robust parse_snotel_ts() helper
+"""
+
+
 class SNOTELDataFetcher:
     """
     Fetches backcountry snow data from SNOTEL stations via the AWDB REST API.
@@ -2646,41 +2664,50 @@ class SNOTELDataFetcher:
             'percent_of_median': 'N/A', 
             'snow_category': 'N/A',
             'latest_observation': latest_observation,
-            'history': [], # Empty history list
+            'history': [],
             'unavailable': bool(error_reason),
             'error_reason': error_reason 
         }
 
     def get_snowfall_report(self, resort_name: str):
-        # Fallback method, rarely used. Returns empty struct to be safe.
         return self._create_empty_report(error_reason="Use batch fetch")
 
-    """
-    COMPLETE FIXED VERSION of get_all_snowfall_reports
-    Replace the entire method in your SNOTELDataFetcher class with this version
-    
-    KEY FIX: Ensures percent_of_median is calculated for ALL resorts, 
-    even when hourly data parsing has issues
-    """
-    
+    @staticmethod
+    def _parse_snotel_ts(ts_str):
+        """
+        Parse SNOTEL timestamp to tz-aware datetime.
+        Handles both old and new API formats:
+          OLD: '2026-02-11T00:00:00Z' or '2026-02-11T00:00:00+00:00'
+          NEW: '2026-02-11 00:00'
+        Returns tz-aware UTC datetime.
+        """
+        from datetime import timezone
+        s = ts_str.strip()
+        # Old format: ISO with T separator
+        if 'T' in s:
+            s = s.replace('Z', '+00:00')
+            return datetime.fromisoformat(s)
+        # New format: "2026-02-11 00:00" (assumed UTC)
+        try:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
     def get_all_snowfall_reports(self) -> Dict[str, Dict]:
         """
         Fetches HOURLY SNOTEL data plus DAILY Median SWE.
         Calculates 24h deltas, Density, and Percent of Median.
         
-        FIXED: Uses yesterday for median (more reliable) and ensures 
-        percent_of_median is calculated even with limited hourly data
+        FIXED Feb 2026: Updated for new AWDB REST API response structure.
         """
         self._log.info("Starting batch SNOTEL API fetch (HOURLY + DAILY w/MEDIAN)...")
         triplet_to_resort = {v['triplet']: k for k, v in self.STATION_INFO.items()}
         all_triplets = ",".join(triplet_to_resort.keys())
         
-        from datetime import datetime, timedelta
         now = datetime.now()
         start_dt = now - timedelta(days=2)
         begin_date_str = start_dt.strftime("%Y-%m-%d")
         
-        # Use yesterday for median (more reliable than today)
         yesterday = now - timedelta(days=1)
         yesterday_str = yesterday.strftime("%Y-%m-%d")
         today_str = now.strftime("%Y-%m-%d")
@@ -2695,7 +2722,6 @@ class SNOTELDataFetcher:
             "&endDate=9999-12-31"
         )
     
-        # Get yesterday's data with median
         daily_median_url = (
             "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
             f"?stationTriplets={all_triplets}"
@@ -2735,9 +2761,9 @@ class SNOTELDataFetcher:
                     
                 data_list = station.get('data', [])
                 for data_obj in data_list:
+                    # FIX: daily response also uses 'values' now
                     values = data_obj.get('values', [])
                     if values:
-                        # Get the most recent value
                         latest_data = values[-1]
                         current_val = latest_data.get('value')
                         median_val = latest_data.get('median')
@@ -2759,9 +2785,16 @@ class SNOTELDataFetcher:
                 history_map = {}
                 
                 for val_obj in station_data.get('data', []):
-                    elem = val_obj.get('elementCd')
-                    for date_val in val_obj.get('dateTimeValues', []):
-                        ts = date_val.get('dateTime')
+                    # FIX: API now nests element code under stationElement
+                    station_elem = val_obj.get('stationElement') or {}
+                    elem = station_elem.get('elementCode') or val_obj.get('elementCd')
+                    
+                    # FIX: API now uses 'values' instead of 'dateTimeValues'
+                    hourly_values = val_obj.get('values') or val_obj.get('dateTimeValues') or []
+                    
+                    for date_val in hourly_values:
+                        # FIX: API now uses 'date' instead of 'dateTime'
+                        ts = date_val.get('date') or date_val.get('dateTime')
                         value = date_val.get('value')
                         if ts is None or value is None:
                             continue
@@ -2794,7 +2827,6 @@ class SNOTELDataFetcher:
                     )
                     final_reports[resort_name]['percent_of_median'] = pct_median
                     final_reports[resort_name]['snotel_total_swe'] = raw_swe if raw_swe else 'N/A'
-                    # Clear error if we successfully calculated percent_of_median
                     if pct_median != "N/A":
                         final_reports[resort_name]['error_reason'] = None
                         final_reports[resort_name]['unavailable'] = False
@@ -2805,13 +2837,13 @@ class SNOTELDataFetcher:
                 latest_time = sorted_times[0]
                 latest = history_map[latest_time]
                 
-                # Calculate 24h changes
-                cutoff_24h = datetime.fromisoformat(latest_time.replace('Z', '+00:00')) - timedelta(hours=24)
+                # Calculate 24h changes — FIX: use robust timestamp parser
+                cutoff_24h = self._parse_snotel_ts(latest_time) - timedelta(hours=24)
                 
                 prior_depth = None
                 prior_swe = None
                 for ts in sorted_times[1:]:
-                    ts_dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    ts_dt = self._parse_snotel_ts(ts)
                     if ts_dt <= cutoff_24h:
                         prior_depth = history_map[ts].get('depth')
                         prior_swe = history_map[ts].get('swe')
@@ -2828,11 +2860,11 @@ class SNOTELDataFetcher:
                 if total_depth and total_depth > 0:
                     density = round((total_swe / total_depth) * 100, 1)
                 
-                # Build recent history (last 48h)
-                cutoff_48h = datetime.fromisoformat(latest_time.replace('Z', '+00:00')) - timedelta(hours=48)
+                # Build recent history (last 48h) — FIX: use robust timestamp parser
+                cutoff_48h = self._parse_snotel_ts(latest_time) - timedelta(hours=48)
                 recent_history = []
                 for ts in sorted_times:
-                    ts_dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    ts_dt = self._parse_snotel_ts(ts)
                     if ts_dt < cutoff_48h:
                         break
                     h = history_map[ts]
@@ -2843,9 +2875,9 @@ class SNOTELDataFetcher:
                         'temp': h.get('temp')
                     })
                 
-                # Parse observation time
+                # Parse observation time — FIX: use robust timestamp parser
                 try:
-                    obs_dt = datetime.fromisoformat(latest_time.replace('Z', '+00:00'))
+                    obs_dt = self._parse_snotel_ts(latest_time)
                     obs_time = obs_dt.strftime('%Y-%m-%d %I:%M %p')
                 except:
                     obs_time = latest_time
@@ -2854,7 +2886,6 @@ class SNOTELDataFetcher:
                 pct_median = "N/A"
                 station_median = median_map.get(triplet)
                 
-                # Use the daily SWE if available, otherwise use hourly
                 raw_swe = current_swe_map.get(triplet) or total_swe
                 
                 if station_median and station_median > 0 and raw_swe:
@@ -2885,7 +2916,6 @@ class SNOTELDataFetcher:
             # --- 7. FINAL SAFETY NET: Fill in percent for any resort that was missed ---
             for r_name, station_info in self.STATION_INFO.items():
                 if r_name not in final_reports:
-                    # Resort wasn't in hourly data at all - create minimal report
                     triplet = station_info['triplet']
                     station_median = median_map.get(triplet)
                     raw_swe = current_swe_map.get(triplet, 0)
@@ -2904,7 +2934,6 @@ class SNOTELDataFetcher:
                     final_reports[r_name]['percent_of_median'] = pct_median
                     final_reports[r_name]['snotel_total_swe'] = raw_swe if raw_swe else 'N/A'
                 else:
-                    # Resort WAS processed - double-check percent exists
                     if final_reports[r_name].get('percent_of_median') == "N/A":
                         triplet = station_info['triplet']
                         station_median = median_map.get(triplet)
@@ -2920,7 +2949,6 @@ class SNOTELDataFetcher:
             import traceback
             traceback.print_exc()
             
-            # Fill missing entries
             for r_name in self.STATION_INFO.keys():
                 if r_name not in final_reports:
                     final_reports[r_name] = self._create_empty_report(
