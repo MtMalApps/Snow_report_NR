@@ -1125,6 +1125,21 @@ class BigMountainScraper(BaseSnowReportScraper):
         
         return data
 
+"""
+LOST TRAIL SCRAPER FIX v2 — February 2026
+==========================================
+
+CHANGES FROM v1:
+- FIXED: Comments now correctly extracts the morning narrative by finding
+  text between "Snow Report for..." heading and first data label
+- FIXED: All numeric fields now go through clean_numeric() so Firebase
+  stores them as numbers (31) not strings ("31")
+- FIXED: Fallback heuristic excluded to avoid grabbing webcam blurb
+
+Replace the entire LostTrailScraper class in snow_report_scraper_oauth.py
+"""
+
+
 class LostTrailScraper(BaseSnowReportScraper):
     def __init__(self):
         super().__init__("LostTrail")
@@ -1137,8 +1152,14 @@ class LostTrailScraper(BaseSnowReportScraper):
         
         data = {col: None for col in self.STANDARD_COLUMNS}
         
-        last_updated_element = soup.find('div', class_='elementor-heading-title elementor-size-default',
-                                         string=re.compile(r'Snow Report for', re.I))
+        # ---------------------------------------------------------------
+        # 1) LAST UPDATED — "Snow Report for February 13, 2026 6:00 am"
+        # ---------------------------------------------------------------
+        last_updated_element = soup.find(
+            'div',
+            class_='elementor-heading-title elementor-size-default',
+            string=re.compile(r'Snow Report for', re.I)
+        )
         
         if last_updated_element:
             last_updated_text = last_updated_element.get_text(strip=True)
@@ -1151,23 +1172,121 @@ class LostTrailScraper(BaseSnowReportScraper):
                 except ValueError as e:
                     print(f"Error parsing last updated date for Lost Trail: {e}")
         
+        # ---------------------------------------------------------------
+        # 2) COMMENTS — Morning narrative paragraph
+        #
+        #    Strategy: The narrative is the text block that appears AFTER
+        #    the "Snow Report for..." heading and BEFORE the first data
+        #    label ("New Snow (since lifts closed)").
+        #
+        #    We find the heading element, then walk forward through
+        #    sibling/cousin elements looking for a substantial text block
+        #    that does NOT match a known data label.
+        # ---------------------------------------------------------------
+        comments_text = None
+        
+        # Known data labels to skip (these are NOT the narrative)
+        data_labels = {
+            "new snow", "week total", "temperature", "weather",
+            "season snowfall", "snow depth", "surface conditions",
+            "number of lifts", "trails open", "terrain parks",
+            "chair 1", "chair 2", "chair 3", "chair 4", "chair 5",
+            "lift report", "terrain report", "web cam",
+            "take a look at our mountainside camera",
+        }
+        
+        if last_updated_element:
+            # Get the parent widget of the heading
+            heading_widget = last_updated_element.find_parent(
+                'div', class_=lambda c: c and any('elementor-widget' in x for x in c) if c else False
+            )
+            
+            if heading_widget:
+                # Walk through the next sibling widgets
+                for sib in heading_widget.find_next_siblings():
+                    # Get all text widgets within this sibling
+                    text_containers = sib.find_all('div', class_='elementor-widget-container')
+                    if not text_containers:
+                        text_containers = [sib]
+                    
+                    for container in text_containers:
+                        candidate = container.get_text(strip=True)
+                        if not candidate or len(candidate) < 40:
+                            continue
+                        
+                        # Skip if it matches a known data label
+                        candidate_lower = candidate.lower()
+                        if any(label in candidate_lower for label in data_labels):
+                            continue
+                        
+                        # Skip if it looks like navigation or boilerplate
+                        if candidate_lower.startswith(('home', 'skip to', 'mountain', 'ski & ride')):
+                            continue
+                        
+                        # This should be the morning narrative
+                        comments_text = candidate
+                        break
+                    
+                    if comments_text:
+                        break
+        
+        # Second approach: use full page text and extract between heading and first label
+        if not comments_text:
+            full_text = soup.get_text('\n', strip=True)
+            # Find text between "Snow Report for..." line and "New Snow" line
+            m = re.search(
+                r'Snow Report for .+?\d{4}\s+\d{1,2}:\d{2}\s*(?:am|pm)\s*\n(.+?)\nNew Snow',
+                full_text,
+                re.IGNORECASE | re.DOTALL
+            )
+            if m:
+                comments_text = m.group(1).strip()
+        
+        if comments_text:
+            data['comments'] = normalize_text(comments_text)
+        
+        # ---------------------------------------------------------------
+        # 3) SNOW DATA — label-value pairs
+        # ---------------------------------------------------------------
         labels = {
             "New Snow (since lifts closed)": "snow_overnight",
             "New Snow, 24 hours": "snow_24h_base",
             "New Snow, 48 hours": "snow_48h_base",
+            "Week Total Snow": "snow_7day",
             "Snow Depth - Bottom": "base_depth",
-            "Snow Depth - Top": "summit_depth"
+            "Snow Depth - Top": "summit_depth",
         }
         
         for label, key in labels.items():
-            element = soup.find(string=re.compile(label, re.I))
+            element = soup.find(string=re.compile(re.escape(label), re.I))
             if element:
                 next_sibling = element.find_next("span", class_="elementor-heading-title")
                 if next_sibling:
-                    data[key] = next_sibling.text.strip().replace('"', '')
+                    raw = next_sibling.text.strip().replace('"', '').replace('\u2033', '')
+                    # FIX: Convert to numeric so Firebase stores as number, not string
+                    data[key] = self.clean_numeric(raw)
         
-        primary_condition = soup.find(string=re.compile("Surface Conditions \(Primary\)", re.I))
-        secondary_condition = soup.find(string=re.compile("Surface Conditions \(Secondary\)", re.I))
+        # Temperature — "18°" → 18
+        temp_element = soup.find(string=re.compile(r'^Temperature$', re.I))
+        if temp_element:
+            temp_val = temp_element.find_next("span", class_="elementor-heading-title")
+            if temp_val:
+                temp_match = re.search(r'(-?\d+)', temp_val.text)
+                if temp_match:
+                    data['temp_base'] = self.clean_numeric(temp_match.group(1))
+        
+        # Weather — "Partly Sunny"
+        weather_element = soup.find(string=re.compile(r'^Weather$', re.I))
+        if weather_element:
+            weather_val = weather_element.find_next("span", class_="elementor-heading-title")
+            if weather_val:
+                data['weather_current'] = weather_val.text.strip()
+
+        # ---------------------------------------------------------------
+        # 4) SURFACE CONDITIONS
+        # ---------------------------------------------------------------
+        primary_condition = soup.find(string=re.compile(r"Surface Conditions \(Primary\)", re.I))
+        secondary_condition = soup.find(string=re.compile(r"Surface Conditions \(Secondary\)", re.I))
         if primary_condition:
             primary_text = primary_condition.find_next("span").text.strip()
             if secondary_condition:
@@ -1176,23 +1295,36 @@ class LostTrailScraper(BaseSnowReportScraper):
             else:
                 data['conditions_surface'] = primary_text
         
+        # ---------------------------------------------------------------
+        # 5) LIFTS & TRAILS
+        # ---------------------------------------------------------------
         lifts_section = soup.find(string=re.compile("Number of Lifts Open", re.I))
         if lifts_section:
             lifts_value = lifts_section.find_next("span", class_="elementor-heading-title")
             if lifts_value:
                 data['lifts_open'] = lifts_value.text.strip()
         
-        trails_section = soup.find(string=re.compile("Trails Open", re.I))
+        trails_section = soup.find(string=re.compile(r"^Trails Open$", re.I))
         if trails_section:
             trails_value = trails_section.find_next("span", class_="elementor-heading-title")
             if trails_value:
                 data['runs_open'] = trails_value.text.strip()
         
-        comments_section = soup.find('div', class_='elementor-widget-container')
-        if comments_section:
-            data['comments'] = comments_section.get_text(strip=True)
-        
+        # ---------------------------------------------------------------
+        # 6) SEASON TOTAL — append to comments
+        # ---------------------------------------------------------------
+        season_element = soup.find(string=re.compile(r'^Season Snowfall$', re.I))
+        if season_element:
+            season_val = season_element.find_next("span", class_="elementor-heading-title")
+            if season_val:
+                season_text = season_val.text.strip()
+                if data['comments']:
+                    data['comments'] += f" | Season Total: {season_text}"
+                else:
+                    data['comments'] = f"Season Total: {season_text}"
+
         return data
+
 
 class TetonPassScraper(BaseSnowReportScraper):
     def __init__(self):
