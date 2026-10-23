@@ -114,7 +114,11 @@ def llm_extract(resort_name: str, page_html: str) -> Optional[dict]:
             }]
         )
 
-        raw = response.content[0].text.strip()
+        text_block = next((b for b in response.content if hasattr(b, 'text')), None)
+        if text_block is None:
+            logging.warning(f"LLM fallback for {resort_name}: no text block in response")
+            return None
+        raw = text_block.text.strip()
         # Strip accidental markdown fences
         raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE).strip()
         raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE).strip()
