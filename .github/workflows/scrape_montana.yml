@@ -22,19 +22,23 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        
+
+    - name: Install Playwright browsers
+      run: playwright install chromium --with-deps
+
     - name: Create data directory
       run: mkdir -p ~/snow_reports/data ~/snow_reports/logs
-        
+
     - name: Set up Firebase credentials
       env:
         FIREBASE_CREDS: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
       run: |
         echo "$FIREBASE_CREDS" > firebase-service-account.json
-        
+
     - name: Run scraper with Firebase upload
       env:
         FIREBASE_SERVICE_ACCOUNT: firebase-service-account.json
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       run: python run_scraper_with_firebase.py
       
     - name: Clean up credentials

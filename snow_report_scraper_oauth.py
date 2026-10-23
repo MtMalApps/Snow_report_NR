@@ -94,72 +94,98 @@ def normalize_text(s: str) -> str:
     
     
 def validate_scrape_minimums(resort_name: str, data: Optional[Dict]) -> List[str]:
-    """
+    “””
     Conservative checks: only flag when parsing looks clearly broken.
     IMPORTANT: 0.0 is valid data and must NOT be treated as missing.
-    """
+    “””
     if not data:
-        return ["no_data_returned"]
+        return [“no_data_returned”]
 
     problems: List[str] = []
 
-    # Basic "wrong page" / interstitial hint
-    blob = " ".join([
-        str(data.get("comments") or ""),
-        str(data.get("weather_current") or ""),
-        str(data.get("conditions_surface") or ""),
+    # Basic “wrong page” / interstitial hint
+    blob = “ “.join([
+        str(data.get(“comments”) or “”),
+        str(data.get(“weather_current”) or “”),
+        str(data.get(“conditions_surface”) or “”),
     ]).lower()
 
-    if "enable javascript" in blob or "please enable javascript" in blob:
-        problems.append("javascript_gate_page")
+    if “enable javascript” in blob or “please enable javascript” in blob:
+        problems.append(“javascript_gate_page”)
 
     # Helper: missing means None or empty string only (NOT 0 / 0.0)
     def _missing(v):
         if v is None:
             return True
-        if isinstance(v, str) and v.strip() == "":
+        if isinstance(v, str) and v.strip() == “”:
             return True
         return False
 
     # Universal “completely empty scrape” check
     # If ALL of these are missing, the parser probably failed.
     universal_core = [
-        data.get("snow_overnight"),
-        data.get("snow_24h_base"),
-        data.get("snow_48h_base"),
-        data.get("base_depth"),
-        data.get("summit_depth"),
-        data.get("runs_open"),
-        data.get("lifts_open"),
-        data.get("comments"),
-        data.get("weather_current"),
-        data.get("conditions_surface"),
+        data.get(“snow_overnight”),
+        data.get(“snow_24h_base”),
+        data.get(“snow_48h_base”),
+        data.get(“base_depth”),
+        data.get(“summit_depth”),
+        data.get(“runs_open”),
+        data.get(“lifts_open”),
+        data.get(“comments”),
+        data.get(“weather_current”),
+        data.get(“conditions_surface”),
     ]
     if all(_missing(v) for v in universal_core):
-        problems.append("missing_all_core_fields")
+        problems.append(“missing_all_core_fields”)
 
     # Resort-specific *light* checks (only if you want them)
-    if resort_name == "Maverick":
+    if resort_name == “Maverick”:
         # Maverick is allowed to report 0.0 snowfall; only quarantine if EVERYTHING is missing.
         m_core = [
-            data.get("snow_overnight"),
-            data.get("snow_24h_base"),
-            data.get("base_depth"),
-            data.get("summit_depth"),
+            data.get(“snow_overnight”),
+            data.get(“snow_24h_base”),
+            data.get(“base_depth”),
+            data.get(“summit_depth”),
         ]
         if all(_missing(v) for v in m_core):
-            problems.append("missing_maverick_core")
+            problems.append(“missing_maverick_core”)
 
-    if resort_name == "GreatDivide":
-        # Great Divide often reports strings like "0 / 6" — that's valid.
-        # Only quarantine if these are actually missing (None/blank), not "0 / 6".
-        if _missing(data.get("runs_open")):
-            problems.append("missing_runs_open")
-        if _missing(data.get("lifts_open")):
-            problems.append("missing_lifts_open")
+    if resort_name == “GreatDivide”:
+        # Great Divide often reports strings like “0 / 6” — that's valid.
+        # Only quarantine if these are actually missing (None/blank), not “0 / 6”.
+        if _missing(data.get(“runs_open”)):
+            problems.append(“missing_runs_open”)
+        if _missing(data.get(“lifts_open”)):
+            problems.append(“missing_lifts_open”)
         # base_depth can be 0 early season; only missing if None/blank
-        if _missing(data.get("base_depth")):
-            problems.append("missing_base_depth")
+        if _missing(data.get(“base_depth”)):
+            problems.append(“missing_base_depth”)
+
+    # --- Range validation: flag physically impossible values ---
+    # These catch hallucinations or misread year-to-date totals as daily snowfall.
+    RANGES = {
+        “snow_overnight”:  (0, 36),
+        “snow_24h_base”:   (0, 48),
+        “snow_24h_summit”: (0, 48),
+        “snow_48h_base”:   (0, 72),
+        “snow_48h_summit”: (0, 72),
+        “snow_7day”:       (0, 200),
+        “base_depth”:      (0, 400),
+        “summit_depth”:    (0, 400),
+        “temp_base”:       (-60, 100),
+        “temp_summit”:     (-60, 100),
+        “wind_speed”:      (0, 200),
+    }
+    for field, (lo, hi) in RANGES.items():
+        v = data.get(field)
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+            if fv < lo or fv > hi:
+                problems.append(f”{field}_out_of_range({fv})”)
+        except (ValueError, TypeError):
+            pass
 
     return problems
 
@@ -440,15 +466,17 @@ class BaseSnowReportScraper(ABC):
         pass
 
     def get_snow_report(self) -> Optional[Dict]:
+        self._last_page_html = None  # reset each run; populated on success for LLM fallback
         try:
             response = requests.get(self.get_url(), headers=self.headers, timeout=20)
             response.raise_for_status()
+            self._last_page_html = response.text
             data = self.process_data(response)
 
             if data:
                 # 1. Run the Universal Staleness Check
                 data = self._check_and_fix_staleness(data)
-                
+
                 # 2. Add Standard Metadata
                 data.update({
                     'resort': self.resort_name,
@@ -462,6 +490,7 @@ class BaseSnowReportScraper(ABC):
             try:
                 response = requests.get(self.get_url(), headers=self.headers, timeout=20, verify=False)
                 response.raise_for_status()
+                self._last_page_html = response.text
                 data = self.process_data(response)
 
                 if data:
@@ -2195,83 +2224,59 @@ This version uses Selenium to render the JavaScript-loaded Bubble.io content.
 
 class GreatDivideScraper(BaseSnowReportScraper):
     """
-    Great Divide scraper - uses Selenium to render JavaScript from Bubble.io iframe:
+    Great Divide scraper - uses Playwright to render JavaScript from Bubble.io iframe:
     https://www.skigd.com/weather-and-conditions
-    
+
     The page loads data dynamically via a Bubble.io iframe that requires JavaScript execution.
-    Updated: January 2026 to use Selenium for dynamic content.
+    Uses Playwright (replaced Selenium Jan 2026 → Oct 2026) for better GitHub Actions reliability.
     """
     def __init__(self):
         super().__init__("GreatDivide")
-    
+
     def get_url(self) -> str:
         return "https://snow-conditions.bubbleapps.io/public_output"
-    
+
     def get_snow_report(self) -> Optional[Dict]:
-        """Override base method to use Selenium instead of requests"""
-        from selenium import webdriver
-        from selenium.webdriver.chrome.service import Service
-        from selenium.webdriver.chrome.options import Options
-        from webdriver_manager.chrome import ChromeDriverManager
-        import time
-        
-        # Set up Chrome options for headless operation
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        
-        driver = None
+        """Override base method to use Playwright instead of requests."""
         try:
-            # Initialize Chrome driver
-            logging.info(f"{self.resort_name}: Initializing Selenium Chrome driver...")
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            
-            # Load the Bubble.io page
-            logging.info(f"{self.resort_name}: Loading {self.get_url()}...")
-            driver.get(self.get_url())
-            
-            # Wait for JavaScript to render content (5 seconds should be enough)
-            time.sleep(5)
-            
-            # Get the rendered page source
-            page_source = driver.page_source
-            
-            # Parse with BeautifulSoup
-            soup = BeautifulSoup(page_source, 'html.parser')
-            
-            # Process the data using our custom parser
-            data = self.process_data_from_soup(soup)
-            
-            if data:
-                # Run the Universal Staleness Check
-                data = self._check_and_fix_staleness(data)
-                
-                # Add Standard Metadata
-                data.update({
-                    'resort': self.resort_name,
-                    'date': datetime.now().strftime('%Y-%m-%d'),
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                })
-            
-            logging.info(f"{self.resort_name}: Successfully scraped with Selenium")
-            return data
-            
-        except Exception as e:
-            logging.error(f"{self.resort_name}: Selenium scraping failed: {e}")
-            print(f"Error fetching snow report for {self.resort_name}: {e}")
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            logging.error(f"{self.resort_name}: playwright not installed. Run: pip install playwright && playwright install chromium")
             return None
-        
-        finally:
-            # Clean up - close the browser
-            if driver:
-                driver.quit()
-    
+
+        logging.info(f"{self.resort_name}: Launching headless Chromium via Playwright...")
+        page_source = None
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(self.get_url(), wait_until='networkidle', timeout=30000)
+                page_source = page.content()
+                browser.close()
+        except Exception as e:
+            logging.error(f"{self.resort_name}: Playwright fetch failed: {e}")
+            return None
+
+        soup = BeautifulSoup(page_source, 'html.parser')
+        data = self.process_data_from_soup(soup)
+
+        # Store page source for potential LLM fallback
+        self._last_page_html = page_source
+
+        if data:
+            data = self._check_and_fix_staleness(data)
+            data.update({
+                'resort': self.resort_name,
+                'date': datetime.now().strftime('%Y-%m-%d'),
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            })
+
+        logging.info(f"{self.resort_name}: Successfully scraped with Playwright")
+        return data
+
     def process_data(self, response) -> Dict:
-        """Not used - get_snow_report() is overridden to use Selenium"""
-        raise NotImplementedError("GreatDivideScraper uses Selenium via get_snow_report() method")
+        """Not used — get_snow_report() is overridden to use Playwright."""
+        raise NotImplementedError("GreatDivideScraper uses Playwright via get_snow_report()")
     
     def process_data_from_soup(self, soup) -> Dict:
         """Process data from BeautifulSoup object (after Selenium render)"""
@@ -2968,6 +2973,8 @@ def main():
     warnings.filterwarnings("ignore", category=FutureWarning)
     warnings.filterwarnings("ignore", category=UserWarning)
 
+    from llm_fallback import llm_extract
+
     log_file = os.path.join(LOG_DIR, "snow_report.log")
     
     logging.basicConfig(
@@ -3028,6 +3035,28 @@ def main():
             
             # Universal Scrape Validation/Quarantine
             snow_data = apply_quarantine_if_needed(scraper.resort_name, snow_data)
+
+            # LLM fallback: if quarantined AND we have page HTML, try to recover
+            if snow_data and snow_data.get('data_source') == 'quarantined':
+                page_html = getattr(scraper, '_last_page_html', None)
+                if page_html:
+                    logging.info(f"{scraper.resort_name}: Quarantined — attempting LLM fallback extraction...")
+                    llm_fields = llm_extract(scraper.resort_name, page_html)
+                    if llm_fields:
+                        # Merge LLM fields over the quarantined record (preserves metadata)
+                        snow_data.update(llm_fields)
+                        snow_data['data_source'] = 'llm_fallback'
+                        # Re-run range validation on LLM output
+                        problems = validate_scrape_minimums(scraper.resort_name, snow_data)
+                        if problems:
+                            logging.warning(f"{scraper.resort_name}: LLM output still has issues: {problems}")
+                            snow_data['data_source'] = 'llm_fallback_partial'
+                        else:
+                            logging.info(f"{scraper.resort_name}: LLM fallback succeeded")
+                    else:
+                        logging.warning(f"{scraper.resort_name}: LLM fallback returned nothing — keeping quarantined record")
+                else:
+                    logging.warning(f"{scraper.resort_name}: Quarantined but no page HTML available for LLM fallback")
 
             if snow_data:
                 resort_name = snow_data["resort"]
