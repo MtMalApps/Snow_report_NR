@@ -94,87 +94,87 @@ def normalize_text(s: str) -> str:
     
     
 def validate_scrape_minimums(resort_name: str, data: Optional[Dict]) -> List[str]:
-    “””
+    """
     Conservative checks: only flag when parsing looks clearly broken.
     IMPORTANT: 0.0 is valid data and must NOT be treated as missing.
-    “””
+    """
     if not data:
-        return [“no_data_returned”]
+        return ["no_data_returned"]
 
     problems: List[str] = []
 
-    # Basic “wrong page” / interstitial hint
-    blob = “ “.join([
-        str(data.get(“comments”) or “”),
-        str(data.get(“weather_current”) or “”),
-        str(data.get(“conditions_surface”) or “”),
+    # Basic "wrong page" / interstitial hint
+    blob = " ".join([
+        str(data.get("comments") or ""),
+        str(data.get("weather_current") or ""),
+        str(data.get("conditions_surface") or ""),
     ]).lower()
 
-    if “enable javascript” in blob or “please enable javascript” in blob:
-        problems.append(“javascript_gate_page”)
+    if "enable javascript" in blob or "please enable javascript" in blob:
+        problems.append("javascript_gate_page")
 
     # Helper: missing means None or empty string only (NOT 0 / 0.0)
     def _missing(v):
         if v is None:
             return True
-        if isinstance(v, str) and v.strip() == “”:
+        if isinstance(v, str) and v.strip() == "":
             return True
         return False
 
-    # Universal “completely empty scrape” check
+    # Universal "completely empty scrape" check
     # If ALL of these are missing, the parser probably failed.
     universal_core = [
-        data.get(“snow_overnight”),
-        data.get(“snow_24h_base”),
-        data.get(“snow_48h_base”),
-        data.get(“base_depth”),
-        data.get(“summit_depth”),
-        data.get(“runs_open”),
-        data.get(“lifts_open”),
-        data.get(“comments”),
-        data.get(“weather_current”),
-        data.get(“conditions_surface”),
+        data.get("snow_overnight"),
+        data.get("snow_24h_base"),
+        data.get("snow_48h_base"),
+        data.get("base_depth"),
+        data.get("summit_depth"),
+        data.get("runs_open"),
+        data.get("lifts_open"),
+        data.get("comments"),
+        data.get("weather_current"),
+        data.get("conditions_surface"),
     ]
     if all(_missing(v) for v in universal_core):
-        problems.append(“missing_all_core_fields”)
+        problems.append("missing_all_core_fields")
 
     # Resort-specific *light* checks (only if you want them)
-    if resort_name == “Maverick”:
+    if resort_name == "Maverick":
         # Maverick is allowed to report 0.0 snowfall; only quarantine if EVERYTHING is missing.
         m_core = [
-            data.get(“snow_overnight”),
-            data.get(“snow_24h_base”),
-            data.get(“base_depth”),
-            data.get(“summit_depth”),
+            data.get("snow_overnight"),
+            data.get("snow_24h_base"),
+            data.get("base_depth"),
+            data.get("summit_depth"),
         ]
         if all(_missing(v) for v in m_core):
-            problems.append(“missing_maverick_core”)
+            problems.append("missing_maverick_core")
 
-    if resort_name == “GreatDivide”:
-        # Great Divide often reports strings like “0 / 6” — that's valid.
-        # Only quarantine if these are actually missing (None/blank), not “0 / 6”.
-        if _missing(data.get(“runs_open”)):
-            problems.append(“missing_runs_open”)
-        if _missing(data.get(“lifts_open”)):
-            problems.append(“missing_lifts_open”)
+    if resort_name == "GreatDivide":
+        # Great Divide often reports strings like "0 / 6" — that's valid.
+        # Only quarantine if these are actually missing (None/blank), not "0 / 6".
+        if _missing(data.get("runs_open")):
+            problems.append("missing_runs_open")
+        if _missing(data.get("lifts_open")):
+            problems.append("missing_lifts_open")
         # base_depth can be 0 early season; only missing if None/blank
-        if _missing(data.get(“base_depth”)):
-            problems.append(“missing_base_depth”)
+        if _missing(data.get("base_depth")):
+            problems.append("missing_base_depth")
 
     # --- Range validation: flag physically impossible values ---
     # These catch hallucinations or misread year-to-date totals as daily snowfall.
     RANGES = {
-        “snow_overnight”:  (0, 36),
-        “snow_24h_base”:   (0, 48),
-        “snow_24h_summit”: (0, 48),
-        “snow_48h_base”:   (0, 72),
-        “snow_48h_summit”: (0, 72),
-        “snow_7day”:       (0, 200),
-        “base_depth”:      (0, 400),
-        “summit_depth”:    (0, 400),
-        “temp_base”:       (-60, 100),
-        “temp_summit”:     (-60, 100),
-        “wind_speed”:      (0, 200),
+        "snow_overnight":  (0, 36),
+        "snow_24h_base":   (0, 48),
+        "snow_24h_summit": (0, 48),
+        "snow_48h_base":   (0, 72),
+        "snow_48h_summit": (0, 72),
+        "snow_7day":       (0, 200),
+        "base_depth":      (0, 400),
+        "summit_depth":    (0, 400),
+        "temp_base":       (-60, 100),
+        "temp_summit":     (-60, 100),
+        "wind_speed":      (0, 200),
     }
     for field, (lo, hi) in RANGES.items():
         v = data.get(field)
@@ -183,7 +183,7 @@ def validate_scrape_minimums(resort_name: str, data: Optional[Dict]) -> List[str
         try:
             fv = float(v)
             if fv < lo or fv > hi:
-                problems.append(f”{field}_out_of_range({fv})”)
+                problems.append(f"{field}_out_of_range({fv})")
         except (ValueError, TypeError):
             pass
 
@@ -694,7 +694,7 @@ class SnowbowlScraper(BaseSnowReportScraper):
                         if data.get("base_depth") is None:
                             data["base_depth"] = _safe_num(cells[1].get_text(strip=True))
                         if data.get("snow_24h_base") in (None, "", 0, 0.0):
-                            # Snowbowl’s "New Snow" here is not necessarily 24h, but it matches the polling totals when present
+                            # Snowbowl's "New Snow" here is not necessarily 24h, but it matches the polling totals when present
                             v = _safe_num(cells[2].get_text(strip=True))
                             if v is not None:
                                 data["snow_24h_base"] = v
@@ -1129,7 +1129,7 @@ class BigMountainScraper(BaseSnowReportScraper):
                 val_candidate = h5.get_text(strip=True)
                 label_candidate = p.get_text(strip=True)
 
-            val_clean = val_candidate.replace('"', '').replace('”', '').strip()
+            val_clean = val_candidate.replace('"', '').replace('"', '').strip()
             
             if 'Overnight Fresh' in label_candidate:
                 data['snow_overnight'] = val_clean
