@@ -1,0 +1,32 @@
+{
+  "hosting": {
+    "public": ".",
+    "ignore": [
+      "firebase.json",
+      ".firebaserc",
+      ".gitignore",
+      "**/.git/**",
+      "**/node_modules/**",
+      "*.py",
+      "requirements.txt",
+      "*.yml",
+      "*.csv",
+      "*.log",
+      "firebase-service-account.json"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/snow_report.html"
+      }
+    ],
+    "headers": [
+      {
+        "source": "**",
+        "headers": [
+          { "key": "Cache-Control", "value": "no-cache, max-age=0" }
+        ]
+      }
+    ]
+  }
+}
