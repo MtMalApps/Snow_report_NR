@@ -139,6 +139,26 @@ def validate_scrape_minimums(resort_name: str, data: Optional[Dict]) -> List[str
     if all(_missing(v) for v in universal_core):
         problems.append("missing_all_core_fields")
 
+    # Hollow scrape: depth + 24h snow fields ALL missing, AND no context fields.
+    # Catches scrapers that matched one superficial field (e.g. overnight=0 from
+    # a stale selector) but missed all structural data because the page layout changed.
+    # This would NOT trigger in legitimate early-season pre-opening (base_depth=0 is
+    # not missing; only None/"" is treated as missing).
+    hollow_structural = [
+        data.get("snow_24h_base"),
+        data.get("snow_24h_summit"),
+        data.get("base_depth"),
+        data.get("summit_depth"),
+    ]
+    hollow_context = [
+        data.get("conditions_surface"),
+        data.get("runs_open"),
+        data.get("lifts_open"),
+        data.get("comments"),
+    ]
+    if all(_missing(v) for v in hollow_structural) and all(_missing(v) for v in hollow_context):
+        problems.append("hollow_scrape_no_structural_data")
+
     # Resort-specific *light* checks (only if you want them)
     if resort_name == "Maverick":
         # Maverick is allowed to report 0.0 snowfall; only quarantine if EVERYTHING is missing.
@@ -1093,66 +1113,65 @@ class BigMountainScraper(BaseSnowReportScraper):
         return weather_data
 
     def process_data(self, response):
-        soup = BeautifulSoup(response.text, 'html.parser')
+        # Site migrated to wmr_snow_* plugin (Nov 2026)
+        soup = BeautifulSoup(response.content, 'html.parser')
         data = {col: None for col in self.STANDARD_COLUMNS}
-        
-        # --- 1. DATE PARSING ---
-        for p_tag in soup.find_all('p'):
-            strong_tag = p_tag.find('strong')
-            if strong_tag:
-                text = strong_tag.text
-                if re.search(r'\w+,\s+\w+\.?\s+\d{1,2},\s+\d{4}', text):
-                    try:
-                        clean_date = text.replace('.', '').replace('  ', ' ').strip().rstrip(':')
-                        if 'm' not in clean_date.lower(): clean_date += " 6:00 AM"
-                        clean_date = re.sub(r'(\d)(am|pm)', r'\1 \2', clean_date, flags=re.I)
-                        parsed_date = datetime.strptime(clean_date, '%A, %b %d, %Y %I:%M %p')
-                        data['last_updated'] = parsed_date.strftime('%Y-%m-%d %I:%M %p')
-                        break
-                    except:
-                        data['last_updated'] = text
 
-        # --- 2. EXTRACT DATA ---
-        summit_cols = soup.find_all('div', class_='wp-block-column')
-        for col in summit_cols:
-            h5 = col.find('h5')
-            p = col.find('p')
-            
-            if not h5 or not p:
-                text = col.get_text(separator='|', strip=True)
-                parts = text.split('|')
-                if len(parts) >= 2:
-                    val_candidate = parts[0]
-                    label_candidate = parts[1]
-                else:
-                    continue
-            else:
-                val_candidate = h5.get_text(strip=True)
-                label_candidate = p.get_text(strip=True)
+        try:
+            current_group = None
 
-            val_clean = val_candidate.replace('"', '').replace('"', '').strip()
-            
-            if 'Overnight Fresh' in label_candidate:
-                data['snow_overnight'] = val_clean
-            elif 'Past 24 Hours' in label_candidate:
-                data['snow_24h_summit'] = self.clean_numeric(val_clean)
-                data['snow_24h_base'] = self.clean_numeric(val_clean)
-            elif 'Past 7 Days' in label_candidate:
-                data['snow_7day'] = val_clean
-            elif 'Settled Base' in label_candidate:
-                data['base_depth'] = val_clean
-                data['summit_depth'] = val_clean
-            elif 'Season to Date' in label_candidate:
-                if data['comments']:
-                    data['comments'] += f" | Season Total: {val_clean}\""
-                else:
-                    data['comments'] = f"Season Total: {val_clean}\""
+            for group in soup.select('.wmr_snow_stat_group'):
+                header_el = group.select_one('.wmr_snow_stat_group_header')
+                if header_el:
+                    htext = header_el.get_text(strip=True)
+                    if 'Summit' in htext:
+                        current_group = 'summit'
+                    elif 'Base' in htext:
+                        current_group = 'base'
+                    else:
+                        current_group = None
 
-        # --- 3. WEATHER ---
-        weather_data = self._get_weather_data(soup)
-        if weather_data:
-            data.update(weather_data)
-        
+                for row in group.select('.wmr_snow_stat_row'):
+                    lbl_el = row.select_one('.wmr_snow_stat_label')
+                    val_el = row.select_one('.wmr_snow_stat_value')
+                    if not lbl_el or not val_el:
+                        continue
+                    lbl = lbl_el.get_text(strip=True)
+                    val = val_el.get_text(strip=True).replace('"', '').replace('"', '').strip()
+
+                    if 'Overnight Fresh' in lbl:
+                        data['snow_overnight'] = self.clean_numeric(val)
+                    elif 'Past 24' in lbl:
+                        if current_group == 'summit':
+                            data['snow_24h_summit'] = self.clean_numeric(val)
+                        elif current_group == 'base':
+                            data['snow_24h_base'] = self.clean_numeric(val)
+                        else:
+                            data['snow_24h_summit'] = self.clean_numeric(val)
+                            data['snow_24h_base'] = self.clean_numeric(val)
+                    elif 'Past 48' in lbl:
+                        if current_group == 'summit':
+                            data['snow_48h_summit'] = self.clean_numeric(val)
+                        elif current_group == 'base':
+                            data['snow_48h_base'] = self.clean_numeric(val)
+                    elif 'Settled Base' in lbl or 'Base Depth' in lbl:
+                        if current_group == 'summit':
+                            data['summit_depth'] = self.clean_numeric(val)
+                        else:
+                            data['base_depth'] = self.clean_numeric(val)
+                    elif 'Season to Date' in lbl:
+                        data['comments'] = f"Season total: {val}\""
+
+            # Story text as last_updated
+            footer_el = soup.select_one('.wmr_snow_story_footer')
+            if footer_el:
+                data['last_updated'] = footer_el.get_text(strip=True)[:100]
+
+        except Exception as e:
+            print(f"BigMountain: Error processing data: {e}")
+            import traceback
+            traceback.print_exc()
+
         return data
 
 """
