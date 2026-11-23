@@ -1,0 +1,893 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0f172a">
+<title>Northern Rockies Snow Report</title>
+
+<!-- Firebase JS SDK (compat v9) -->
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+
+<style>
+/* ── Design tokens ───────────────────────────────────────────── */
+:root {
+  --bg:          #0f172a;
+  --surface:     #1e293b;
+  --surface2:    #263045;
+  --border:      #334155;
+  --border2:     #475569;
+  --text:        #f1f5f9;
+  --text2:       #94a3b8;
+  --text3:       #64748b;
+  --accent:      #38bdf8;
+  --accent-bg:   rgba(56,189,248,.12);
+  --accent-text: #bae6fd;
+  --success:     #4ade80;
+  --success-bg:  rgba(74,222,128,.12);
+  --warn:        #fbbf24;
+  --warn-bg:     rgba(251,191,36,.12);
+  --danger:      #f87171;
+  --danger-bg:   rgba(248,113,113,.12);
+  --radius:      8px;
+  --card-radius: 14px;
+  --gap:         12px;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:          #f8fafc;
+    --surface:     #ffffff;
+    --surface2:    #f1f5f9;
+    --border:      #e2e8f0;
+    --border2:     #cbd5e1;
+    --text:        #0f172a;
+    --text2:       #475569;
+    --text3:       #94a3b8;
+    --accent-bg:   rgba(56,189,248,.10);
+    --accent-text: #0369a1;
+    --success-bg:  rgba(74,222,128,.10);
+    --warn-bg:     rgba(251,191,36,.10);
+    --danger-bg:   rgba(248,113,113,.10);
+  }
+}
+
+/* ── Base ────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ── Layout ──────────────────────────────────────────────────── */
+.page {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 24px 20px 48px;
+}
+
+/* ── Header ──────────────────────────────────────────────────── */
+.site-header {
+  margin-bottom: 24px;
+}
+.site-header h1 {
+  font-size: clamp(18px, 2.5vw, 24px);
+  font-weight: 600;
+  letter-spacing: -.3px;
+  color: var(--text);
+}
+.site-header h1 span { color: var(--accent); }
+.header-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.header-meta {
+  font-size: 13px;
+  color: var(--text2);
+}
+.refresh-btn {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border2);
+  background: transparent;
+  color: var(--text2);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.refresh-btn:hover { background: var(--surface2); color: var(--text); }
+
+/* ── Banner ──────────────────────────────────────────────────── */
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  margin-bottom: 20px;
+  border: 1px solid;
+}
+.banner-warn { background: var(--warn-bg); border-color: rgba(251,191,36,.3); color: var(--warn); }
+.banner-info { background: var(--accent-bg); border-color: rgba(56,189,248,.3); color: var(--accent-text); }
+.banner-ok   { background: var(--success-bg); border-color: rgba(74,222,128,.3); color: var(--success); }
+
+/* ── Controls ────────────────────────────────────────────────── */
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.ctrl-label {
+  font-size: 12px;
+  color: var(--text3);
+  white-space: nowrap;
+}
+.btn-group {
+  display: flex;
+  gap: 3px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 3px;
+}
+.btn-group button {
+  font-size: 12px;
+  font-family: var(--font);
+  padding: 4px 11px;
+  border-radius: 5px;
+  border: none;
+  background: transparent;
+  color: var(--text2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-group button.active {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+.btn-group button:hover:not(.active) { background: var(--surface2); color: var(--text); }
+
+/* ── Grid ────────────────────────────────────────────────────── */
+#resort-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: var(--gap);
+}
+
+/* ── Card ────────────────────────────────────────────────────── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--card-radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.card:hover { border-color: var(--border2); }
+
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.resort-name {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text);
+  flex: 1;
+  line-height: 1.3;
+}
+.state-pill {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: 20px;
+  background: var(--surface2);
+  color: var(--text2);
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.status-pill {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 20px;
+  flex-shrink: 0;
+  margin-top: 1px;
+  font-weight: 500;
+}
+.s-open   { background: var(--success-bg); color: var(--success); }
+.s-pre    { background: var(--warn-bg);    color: var(--warn); }
+.s-closed { background: var(--danger-bg);  color: var(--danger); }
+
+.divider {
+  border: none;
+  border-top: 1px solid var(--border);
+}
+
+/* New snow */
+.snow-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  text-align: center;
+}
+.snow-stat .val {
+  font-size: 24px;
+  font-weight: 500;
+  display: block;
+  line-height: 1.1;
+  letter-spacing: -.5px;
+}
+.snow-stat .has-snow { color: var(--accent); }
+.snow-stat .no-snow  { color: var(--text3); }
+.snow-stat .lbl {
+  font-size: 11px;
+  color: var(--text3);
+  display: block;
+  margin-top: 1px;
+}
+
+/* Depths */
+.depth-row {
+  display: flex;
+  gap: 16px;
+}
+.depth-item { flex: 1; }
+.depth-item .lbl { font-size: 11px; color: var(--text3); display: block; }
+.depth-item .val { font-weight: 500; color: var(--text); font-size: 14px; }
+
+/* % of median */
+.median-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.median-header .lbl { color: var(--text3); }
+.median-header .pct { font-weight: 500; }
+.pct-good { color: var(--success); }
+.pct-warn { color: var(--warn); }
+.pct-low  { color: var(--danger); }
+.pct-na   { color: var(--text3); }
+.track {
+  height: 4px;
+  background: var(--surface2);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.fill { height: 100%; border-radius: 2px; }
+.fill-good { background: var(--success); }
+.fill-warn { background: var(--warn); }
+.fill-low  { background: var(--danger); }
+.fill-na   { background: var(--border2); }
+
+/* Meta row */
+.meta-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  font-size: 12px;
+  color: var(--text2);
+  gap: 8px;
+}
+.nws-block { flex: 1; }
+.nws-snow  { color: var(--accent); font-weight: 500; }
+.nws-dry   { color: var(--text3); }
+.conditions-text { text-align: right; color: var(--text3); font-size: 11px; }
+
+/* Footer */
+.card-footer {
+  font-size: 11px;
+  color: var(--text3);
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+/* Loading skeleton */
+.skeleton .card {
+  pointer-events: none;
+}
+.skel {
+  background: linear-gradient(90deg, var(--surface2) 25%, var(--border) 50%, var(--surface2) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+  border-radius: 4px;
+}
+@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+
+/* ── 5-Day Chart ─────────────────────────────────────────────── */
+.chart-section {
+  margin-bottom: 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--card-radius);
+  padding: 14px 18px 10px;
+}
+.chart-header {
+  display: flex; align-items: center;
+  flex-wrap: wrap; margin-bottom: 10px;
+  gap: 10px; justify-content: space-between;
+}
+.chart-title { font-size: 14px; font-weight: 600; color: var(--text); letter-spacing: -.2px; }
+.chart-legend { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.legend-item { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text3); }
+.legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.chart-row { display: flex; align-items: center; padding: 2px 0; }
+.chart-name {
+  width: 130px; font-size: 12px; font-weight: 500;
+  color: var(--text); text-align: right;
+  padding-right: 12px; flex-shrink: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chart-name.dim { color: var(--text3); font-weight: 400; font-size: 11px; }
+.chart-bar-area { flex: 1; display: flex; align-items: center; min-width: 0; }
+.chart-bar {
+  display: flex; height: 18px;
+  border-radius: 3px; overflow: hidden;
+  min-width: 2px;
+}
+.chart-seg {
+  height: 100%; display: flex; align-items: center;
+  justify-content: center; font-size: 10px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; min-width: 0;
+}
+.chart-total {
+  width: 50px; font-size: 11px; color: var(--text2);
+  text-align: right; flex-shrink: 0; padding-left: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.chart-sep {
+  display: flex; align-items: center; gap: 8px;
+  margin: 5px 0 3px 130px;
+  font-size: 10px; color: var(--text3);
+  letter-spacing: .4px; text-transform: uppercase;
+}
+.chart-sep::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+/* ── Footer ──────────────────────────────────────────────────── */
+.page-footer {
+  margin-top: 40px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text3);
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <header class="site-header">
+    <h1>Northern Rockies <span>Snow Report</span></h1>
+    <div class="header-row">
+      <span class="header-meta" id="report-date">Loading…</span>
+      <button class="refresh-btn" onclick="loadData()">↻ Refresh</button>
+    </div>
+  </header>
+
+  <!-- Status banner -->
+  <div id="status-banner" class="banner banner-info" style="display:none"></div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <span class="ctrl-label">Region</span>
+    <div class="btn-group" id="filter-grp">
+      <button class="active" data-filter="all">All</button>
+      <button data-filter="MT">MT</button>
+      <button data-filter="ID">ID</button>
+      <button data-filter="BC">BC</button>
+    </div>
+    <span class="ctrl-label" style="margin-left:6px">Sort</span>
+    <div class="btn-group" id="sort-grp">
+      <button class="active" data-sort="h24">24hr snow</button>
+      <button data-sort="base">Base depth</button>
+      <button data-sort="pct">% median</button>
+      <button data-sort="name">Name</button>
+    </div>
+  </div>
+
+  <!-- 5-Day Snow Chart -->
+  <section class="chart-section" id="chart-section">
+    <div class="chart-header">
+      <h2 class="chart-title">5-Day New Snow</h2>
+      <div class="chart-legend" id="chart-legend"></div>
+    </div>
+    <div id="snow-chart"></div>
+  </section>
+
+  <!-- Cards -->
+  <div id="resort-grid"></div>
+
+  <footer class="page-footer">
+    <span>SNOTEL data: USDA NRCS. NWS forecasts: api.weather.gov. Scraper runs 5–11 AM MST.</span>
+    <span id="footer-updated"></span>
+  </footer>
+</div>
+
+<script>
+/* ══════════════════════════════════════════════════════════════
+   FIREBASE CONFIG
+   Fill this in with your Firebase web app config.
+   Get it from: Firebase Console → Project settings → Your apps → Web app.
+   The API key here is a PUBLIC web key (not the service account).
+   ══════════════════════════════════════════════════════════════ */
+const FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyD_HxXI2Esxe7FXjbwZs5pyOW2Aw2wmxpo",
+  authDomain:        "snow-reports-b0ce4.firebaseapp.com",
+  projectId:         "snow-reports-b0ce4",
+  storageBucket:     "snow-reports-b0ce4.firebasestorage.app",
+  messagingSenderId: "900679706545",
+  appId:             "1:900679706545:web:93fb2bbb9431d6ade07f90"
+};
+
+/* Resort metadata — name, state, and sort key */
+const RESORT_META = [
+  { key:"BigSky",          name:"Big Sky",          state:"MT" },
+  { key:"BridgerBowl",     name:"Bridger Bowl",      state:"MT" },
+  { key:"Showdown",        name:"Showdown",           state:"MT" },
+  { key:"Snowbowl",        name:"Montana Snowbowl",  state:"MT" },
+  { key:"Discovery",       name:"Discovery",          state:"MT" },
+  { key:"LookoutPass",     name:"Lookout Pass",       state:"ID" },
+  { key:"LostTrail",       name:"Lost Trail",         state:"MT" },
+  { key:"TetonPass",       name:"Teton Pass Ski Area",state:"MT" },
+  { key:"Blacktail",       name:"Blacktail Mountain", state:"MT" },
+  { key:"BigMountain",     name:"Whitefish",           state:"MT" },
+  { key:"TurnerMountain",  name:"Turner Mountain",    state:"MT" },
+  { key:"Schweitzer",      name:"Schweitzer",         state:"ID" },
+  { key:"SilverMountain",  name:"Silver Mountain",    state:"ID" },
+  { key:"Maverick",        name:"Maverick Mountain",  state:"MT" },
+  { key:"RedLodge",        name:"Red Lodge",          state:"MT" },
+  { key:"GreatDivide",     name:"Great Divide",       state:"MT" },
+  { key:"Fernie",          name:"Fernie",             state:"BC" },
+];
+
+/* Mock data — shown when Firebase is not configured */
+const MOCK = [
+  {key:"BigSky",         state:"MT",status:"pre",overnight:0,  h24:2,  h48:4,  base:28, summit:42,   pct:72,  temp:20,conditions:"Early season",   nws_snow:1.0, nws_hi:24,nws_lo:14},
+  {key:"BridgerBowl",    state:"MT",status:"pre",overnight:0,  h24:1,  h48:3,  base:18, summit:30,   pct:65,  temp:18,conditions:"Early season",   nws_snow:0.5, nws_hi:22,nws_lo:12},
+  {key:"Showdown",       state:"MT",status:"open",overnight:1, h24:3,  h48:5,  base:32, summit:44,   pct:88,  temp:14,conditions:"Packed powder",  nws_snow:2.0, nws_hi:20,nws_lo:10},
+  {key:"MontanaSnowbowl",state:"MT",status:"pre",overnight:0,  h24:0,  h48:1,  base:10, summit:22,   pct:62,  temp:24,conditions:"Variable",       nws_snow:0,   nws_hi:28,nws_lo:18},
+  {key:"Discovery",      state:"MT",status:"pre",overnight:0,  h24:0,  h48:1,  base:12, summit:20,   pct:70,  temp:16,conditions:"Early season",   nws_snow:0,   nws_hi:22,nws_lo:12},
+  {key:"LookoutPass",    state:"ID",status:"open",overnight:2, h24:4,  h48:7,  base:44, summit:58,   pct:94,  temp:28,conditions:"Packed powder",  nws_snow:3.0, nws_hi:30,nws_lo:22},
+  {key:"LostTrail",      state:"MT",status:"pre",overnight:0,  h24:2,  h48:3,  base:20, summit:32,   pct:78,  temp:16,conditions:"Early season",   nws_snow:1.5, nws_hi:20,nws_lo:10},
+  {key:"TetonPass",      state:"MT",status:"pre",overnight:0,  h24:1,  h48:2,  base:16, summit:28,   pct:74,  temp:18,conditions:"Early season",   nws_snow:0,   nws_hi:24,nws_lo:14},
+  {key:"Blacktail",      state:"MT",status:"pre",overnight:0,  h24:0,  h48:0,  base:8,  summit:14,   pct:64,  temp:22,conditions:"Variable",       nws_snow:0,   nws_hi:28,nws_lo:18},
+  {key:"BigMountain",    state:"MT",status:"pre",overnight:0,  h24:0,  h48:0,  base:0,  summit:null, pct:null,temp:20,conditions:"Pre-season",    nws_snow:0,   nws_hi:26,nws_lo:16},
+  {key:"TurnerMountain", state:"MT",status:"pre",overnight:0,  h24:0,  h48:0,  base:0,  summit:null, pct:null,temp:14,conditions:"Pre-season",    nws_snow:0,   nws_hi:18,nws_lo:8 },
+  {key:"Schweitzer",     state:"ID",status:"open",overnight:3, h24:5,  h48:8,  base:50, summit:66,   pct:97,  temp:25,conditions:"Loose granular", nws_snow:4.0, nws_hi:28,nws_lo:20},
+  {key:"SilverMountain", state:"ID",status:"pre",overnight:0,  h24:0,  h48:0,  base:6,  summit:null, pct:null,temp:27,conditions:"Pre-season",    nws_snow:0,   nws_hi:32,nws_lo:24},
+  {key:"Maverick",       state:"MT",status:"pre",overnight:0,  h24:1,  h48:1,  base:10, summit:18,   pct:72,  temp:20,conditions:"Early season",   nws_snow:0,   nws_hi:24,nws_lo:14},
+  {key:"RedLodge",       state:"MT",status:"pre",overnight:1,  h24:3,  h48:5,  base:30, summit:42,   pct:84,  temp:16,conditions:"Early season",   nws_snow:1.5, nws_hi:20,nws_lo:10},
+  {key:"GreatDivide",    state:"MT",status:"pre",overnight:0,  h24:1,  h48:2,  base:14, summit:20,   pct:70,  temp:20,conditions:"Variable",       nws_snow:0,   nws_hi:24,nws_lo:14},
+  {key:"Fernie",         state:"BC",status:"pre",overnight:0,  h24:0.8,h48:0.8,base:3.9,summit:null, pct:null,temp:28,conditions:"Early season",   nws_snow:null,nws_hi:null,nws_lo:null},
+];
+
+/* ── State ─────────────────────────────────────────────────── */
+let allData     = [];
+let curFilter   = "all";
+let curSort     = "h24";
+let usingMock   = false;
+let lastUpdated = null;
+
+/* ── Firebase init ─────────────────────────────────────────── */
+function isMockConfig() {
+  return !FIREBASE_CONFIG.apiKey || FIREBASE_CONFIG.apiKey === "YOUR_WEB_API_KEY";
+}
+
+let db = null;
+function initFirebase() {
+  if (isMockConfig()) return false;
+  try {
+    if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+    db = firebase.firestore();
+    return true;
+  } catch(e) {
+    console.error("Firebase init failed:", e);
+    return false;
+  }
+}
+
+/* ── Data loading ──────────────────────────────────────────── */
+async function loadData() {
+  setBanner("info", "↻ Loading snow data…");
+
+  if (isMockConfig() || !initFirebase()) {
+    usingMock = true;
+    allData = normalizeMockData(MOCK);
+    setBanner("warn", "⚠ Mock data — add your Firebase config to snow_report.html to load live data.");
+    lastUpdated = new Date();
+    renderAll();
+    loadHistoricalData().then(hist => { histData = hist; renderChart(hist); });
+    return;
+  }
+
+  try {
+    const today = fmtDate(new Date());
+    const yesterday = fmtDate(new Date(Date.now() - 86400000));
+
+    const snap = await db.collection("snow_reports")
+      .where("date", "in", [today, yesterday])
+      .get();
+
+    if (snap.empty) {
+      throw new Error("No documents found for today or yesterday.");
+    }
+
+    const byResort = {};
+    snap.forEach(doc => {
+      const d = doc.data();
+      const r = d.resort;
+      if (!r) return;
+      if (!byResort[r] || (d.date > byResort[r].date)) {
+        byResort[r] = d;
+      }
+    });
+
+    allData = RESORT_META.map(meta => {
+      const raw = byResort[meta.key];
+      if (!raw) return { key: meta.key, name: meta.name, state: meta.state, noData: true };
+      return normalizeFirestoreDoc(meta, raw);
+    });
+
+    usingMock = false;
+    lastUpdated = new Date();
+    setBanner("ok", `✓ Live data loaded — ${Object.keys(byResort).length} resorts as of ${today}`);
+    setTimeout(() => setBanner(null), 4000);
+    renderAll();
+    loadHistoricalData().then(hist => { histData = hist; renderChart(hist); });
+
+  } catch(e) {
+    console.error("Firestore load failed:", e);
+    setBanner("warn", `⚠ Could not load live data (${e.message}). Showing mock data.`);
+    usingMock = true;
+    allData = normalizeMockData(MOCK);
+    lastUpdated = new Date();
+    renderAll();
+    loadHistoricalData().then(hist => { histData = hist; renderChart(hist); });
+  }
+}
+
+function normalizeFirestoreDoc(meta, raw) {
+  const nws  = raw.nws_forecast  || {};
+  const sno  = raw.snotel_data   || {};
+  const lifts = Number(raw.lifts_open);
+  const status = lifts > 0 ? "open"
+    : (raw.base_depth > 0 || raw.summit_depth > 0) ? "pre" : "closed";
+  return {
+    key:        meta.key,
+    name:       meta.name,
+    state:      meta.state,
+    status,
+    overnight:  num(raw.snow_overnight),
+    h24:        num(raw.snow_24h_summit ?? raw.snow_24h_base),
+    h48:        num(raw.snow_48h_summit ?? raw.snow_48h_base),
+    base:       num(raw.base_depth),
+    summit:     num(raw.summit_depth),
+    pct:        parsePct(raw.percent_of_median),
+    temp:       num(sno.temp_f),
+    conditions: raw.conditions_surface || null,
+    nws_snow:   num(nws.total_snow_inches),
+    nws_hi:     num(nws.temp_high_f),
+    nws_lo:     num(nws.temp_low_f),
+    last_updated: raw.last_updated || raw.date,
+    comments:   raw.comments || null,
+  };
+}
+
+function normalizeMockData(arr) {
+  return arr.map(m => {
+    const meta = RESORT_META.find(r => r.key === m.key) || {};
+    return { ...m, name: meta.name || m.key, last_updated: "Mock data" };
+  });
+}
+
+function parsePct(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    if (v.startsWith(">")) return 110;
+    const n = parseFloat(v);
+    return isNaN(n) ? null : n;
+  }
+  return null;
+}
+
+function num(v) {
+  const n = parseFloat(v);
+  return isNaN(n) ? null : n;
+}
+
+function fmtDate(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+/* ── Render ────────────────────────────────────────────────── */
+function getFiltered() {
+  return allData.filter(r => {
+    if (curFilter === "all") return true;
+    return r.state === curFilter || r.state.startsWith(curFilter);
+  });
+}
+
+function getSorted(arr) {
+  const copy = [...arr];
+  if (curSort === "name")  return copy.sort((a,b) => a.name.localeCompare(b.name));
+  if (curSort === "base")  return copy.sort((a,b) => (b.base||0) - (a.base||0));
+  if (curSort === "pct")   return copy.sort((a,b) => {
+    const av = a.pct == null ? -1 : a.pct;
+    const bv = b.pct == null ? -1 : b.pct;
+    return bv - av;
+  });
+  return copy.sort((a,b) => (b.h24||0) - (a.h24||0));  // h24 default
+}
+
+function renderAll() {
+  const grid = document.getElementById("resort-grid");
+  const data = getSorted(getFiltered());
+  grid.innerHTML = data.map(renderCard).join("");
+
+  const now = lastUpdated;
+  const dateEl = document.getElementById("report-date");
+  if (now) {
+    dateEl.textContent = now.toLocaleDateString("en-US", {weekday:"long",month:"long",day:"numeric",year:"numeric"})
+      + "  ·  " + now.toLocaleTimeString("en-US", {hour:"numeric",minute:"2-digit"});
+  }
+  document.getElementById("footer-updated").textContent =
+    usingMock ? "Mock data" : "Updated " + (now ? now.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}) : "");
+}
+
+function renderCard(r) {
+  if (r.noData) {
+    return `<div class="card" style="opacity:.45">
+      <div class="card-head">
+        <span class="resort-name">${r.name}</span>
+        <span class="state-pill">${r.state}</span>
+        <span class="status-pill s-closed">No data</span>
+      </div>
+      <hr class="divider">
+      <div style="font-size:12px;color:var(--text3);text-align:center;padding:16px 0">
+        No report yet today
+      </div>
+    </div>`;
+  }
+
+  const fmtIn = v => {
+    if (v === null) return "—";
+    if (v === 0) return '0"';
+    return (v % 1 === 0 ? v : v.toFixed(1)) + '"';
+  };
+
+  const pct = r.pct;
+  const pctLabel = pct === null ? "N/A" : (pct >= 110 ? ">110%" : pct + "%");
+  const pctCls   = pct === null ? "pct-na" : pct >= 90 ? "pct-good" : pct >= 70 ? "pct-warn" : "pct-low";
+  const fillCls  = pct === null ? "fill-na" : pct >= 90 ? "fill-good" : pct >= 70 ? "fill-warn" : "fill-low";
+  const fillW    = pct === null ? 0 : Math.min(pct, 130);
+
+  const statusLabel = { open:"Open", pre:"Pre-season", closed:"Closed" }[r.status] || "?";
+  const statusCls   = "s-" + (r.status || "pre");
+
+  const nwsHtml = r.nws_snow === null
+    ? `<span class="nws-dry">NWS: N/A</span>`
+    : r.nws_snow > 0
+      ? `<span>NWS 48hr: <span class="nws-snow">${fmtIn(r.nws_snow)}</span></span>`
+      : `<span class="nws-dry">NWS 48hr: dry</span>`;
+
+  const tempStr = r.temp !== null ? `${r.temp}°F` : "—";
+  const condStr = r.conditions || "";
+
+  return `<div class="card">
+  <div class="card-head">
+    <span class="resort-name">${r.name}</span>
+    <span class="state-pill">${r.state}</span>
+    <span class="status-pill ${statusCls}">${statusLabel}</span>
+  </div>
+  <hr class="divider">
+  <div class="snow-row">
+    <div class="snow-stat">
+      <span class="val ${(r.overnight||0)>0?'has-snow':'no-snow'}">${fmtIn(r.overnight)}</span>
+      <span class="lbl">Overnight</span>
+    </div>
+    <div class="snow-stat">
+      <span class="val ${(r.h24||0)>0?'has-snow':'no-snow'}">${fmtIn(r.h24)}</span>
+      <span class="lbl">24 hr</span>
+    </div>
+    <div class="snow-stat">
+      <span class="val ${(r.h48||0)>0?'has-snow':'no-snow'}">${fmtIn(r.h48)}</span>
+      <span class="lbl">48 hr</span>
+    </div>
+  </div>
+  <div class="depth-row">
+    <div class="depth-item">
+      <span class="lbl">Base</span>
+      <span class="val">${fmtIn(r.base)}</span>
+    </div>
+    <div class="depth-item">
+      <span class="lbl">Summit</span>
+      <span class="val">${r.summit !== null ? fmtIn(r.summit) : "—"}</span>
+    </div>
+    <div class="depth-item">
+      <span class="lbl">SNOTEL</span>
+      <span class="val">${tempStr}</span>
+    </div>
+  </div>
+  <div>
+    <div class="median-header">
+      <span class="lbl">Snowpack vs. median</span>
+      <span class="pct ${pctCls}">${pctLabel}</span>
+    </div>
+    <div class="track"><div class="fill ${fillCls}" style="width:${fillW}%"></div></div>
+  </div>
+  <div class="meta-row">
+    <div class="nws-block">${nwsHtml}</div>
+    <div class="conditions-text">${condStr}</div>
+  </div>
+  ${r.last_updated ? `<div class="card-footer"><span>Updated: ${r.last_updated}</span></div>` : ""}
+</div>`;
+}
+
+/* ── UI helpers ────────────────────────────────────────────── */
+function setBanner(type, msg) {
+  const el = document.getElementById("status-banner");
+  if (!type) { el.style.display = "none"; return; }
+  el.className = `banner banner-${type}`;
+  el.textContent = msg;
+  el.style.display = "flex";
+}
+
+/* ── Chart ─────────────────────────────────────────────────── */
+// Oldest day → today, pale blue → vivid purple
+const DAY_COLORS = ['#9ab8cc','#4d99c0','#1e7bbf','#1155cc','#6622ee'];
+let histData = null;
+
+function dateShort(str) {
+  const d = new Date(str + 'T12:00:00');
+  return d.toLocaleDateString('en-US', {month:'short', day:'numeric'});
+}
+
+function buildMockHistory() {
+  const today = new Date();
+  const dates = Array.from({length:5}, (_,i) => fmtDate(new Date(today - i*86400000)));
+  // Per resort: [today, yesterday, -2d, -3d, -4d]
+  const raw = {
+    BigSky:[2,1,0,0,0], BridgerBowl:[1,0,0,0,0],
+    Showdown:[3,2,0,0,15], Snowbowl:[0,0,0,0,0],
+    Discovery:[0,0,0,0,0], LookoutPass:[4,2,0,2,5],
+    LostTrail:[2,0,0,1,0], TetonPass:[1,0,0,12,12],
+    Blacktail:[0,0,0,0,0], BigMountain:[0,0,0,0,0], TurnerMountain:[0,0,0,0,0],
+    Schweitzer:[5,0,3,0,0],
+    SilverMountain:[0,0,0,0,0], Maverick:[1,0,0,0,0],
+    RedLodge:[3,2,0,0,0], GreatDivide:[1,0,0,0,0],
+    Fernie:[0.8,0.8,0,0,0],
+  };
+  const data = {};
+  for (const [key, vals] of Object.entries(raw)) {
+    data[key] = {};
+    vals.forEach((v,i) => { data[key][dates[i]] = v; });
+  }
+  return { dates, data };
+}
+
+async function loadHistoricalData() {
+  if (usingMock || !db) return buildMockHistory();
+  try {
+    const today = new Date();
+    const dates = Array.from({length:5}, (_,i) => fmtDate(new Date(today - i*86400000)));
+    const snap = await db.collection("snow_reports").where("date","in",dates).get();
+    const data = {};
+    snap.forEach(doc => {
+      const d = doc.data();
+      if (!d.resort || !d.date) return;
+      if (!data[d.resort]) data[d.resort] = {};
+      data[d.resort][d.date] = num(d.snow_24h_summit ?? d.snow_24h_base) || 0;
+    });
+    return { dates, data };
+  } catch(e) {
+    console.error("[chart] Historical load failed:", e);
+    return buildMockHistory();
+  }
+}
+
+function renderChartLegend(dates) {
+  document.getElementById("chart-legend").innerHTML = dates.map((d,i) => {
+    const label = i === 0 ? `Today (${dateShort(d)})` : dateShort(d);
+    return `<div class="legend-item">
+      <span class="legend-swatch" style="background:${DAY_COLORS[4-i]}"></span>
+      <span>${label}</span>
+    </div>`;
+  }).join("");
+}
+
+function renderChart({ dates, data }) {
+  const rows = RESORT_META.map(meta => {
+    const rd = data[meta.key] || {};
+    const days = dates.map(d => rd[d] || 0);
+    const total = days.reduce((s,v) => s+v, 0);
+    return { key:meta.key, name:meta.name, state:meta.state, days, total };
+  });
+
+  const filtered = curFilter === "all" ? rows
+    : rows.filter(r => r.state === curFilter || r.state.startsWith(curFilter));
+
+  filtered.sort((a,b) => b.days[0]-a.days[0] || b.total-a.total);
+
+  const snowRows   = filtered.filter(r => r.total > 0);
+  const noSnowRows = filtered.filter(r => r.total === 0);
+  const maxTotal   = Math.max(...snowRows.map(r=>r.total), 1);
+
+  function snowRowHtml(r) {
+    const barW = (r.total / maxTotal * 100).toFixed(1);
+    const segs = [...r.days].reverse().map((v, i) => {
+      if (!v) return '';
+      const pct = (v / r.total * 100).toFixed(1);
+      const fg  = i === 0 ? '#c8dde8' : '#fff';
+      const lbl = v >= 1.5 ? (v%1===0 ? v+'"' : v.toFixed(1)+'"') : '';
+      return `<div class="chart-seg" style="width:${pct}%;background:${DAY_COLORS[i]};color:${fg}">${lbl}</div>`;
+    }).join('');
+    const tot = r.total%1===0 ? r.total : r.total.toFixed(1);
+    return `<div class="chart-row">
+      <div class="chart-name">${r.name}</div>
+      <div class="chart-bar-area"><div class="chart-bar" style="width:${barW}%">${segs}</div></div>
+      <div class="chart-total">${tot}"</div>
+    </div>`;
+  }
+
+  let html = snowRows.map(snowRowHtml).join('');
+
+  if (noSnowRows.length > 0 && snowRows.length > 0) {
+    html += `<div class="chart-sep">no recent snow</div>`;
+  }
+
+  html += noSnowRows.map(r => `<div class="chart-row">
+    <div class="chart-name dim">${r.name}</div>
+    <div class="chart-bar-area"></div>
+    <div class="chart-total" style="color:var(--text3)">—</div>
+  </div>`).join('');
+
+  document.getElementById("snow-chart").innerHTML = html;
+  renderChartLegend(dates);
+}
+
+/* ── Wire controls ─────────────────────────────────────────── */
+document.querySelectorAll("#filter-grp button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#filter-grp button").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    curFilter = btn.dataset.filter;
+    renderAll();
+    if (histData) renderChart(histData);
+  });
+});
+document.querySelectorAll("#sort-grp button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#sort-grp button").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    curSort = btn.dataset.sort;
+    renderAll();
+  });
+});
+
+/* ── Boot ──────────────────────────────────────────────────── */
+loadData();
+</script>
+</body>
+</html>
