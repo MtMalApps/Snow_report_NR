@@ -58,6 +58,7 @@ jobs:
       env:
         FIREBASE_SERVICE_ACCOUNT: firebase-service-account.json
         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        SNOTEL_API_KEY: ${{ secrets.SNOTEL_API_KEY }}
       run: python run_scraper_with_firebase.py
       
     - name: Clean up credentials
