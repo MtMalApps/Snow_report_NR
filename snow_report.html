@@ -275,15 +275,22 @@ body {
 .fill-low  { background: var(--danger); }
 .fill-na   { background: var(--border2); }
 
-/* Meta row */
-.meta-row { font-size: 12px; color: var(--text2); }
+/* Section labels */
+.section-lbl {
+  font-size: 10px; font-weight: 600; color: var(--text3);
+  text-transform: uppercase; letter-spacing: .5px;
+  margin: 8px 0 3px;
+}
+
+/* NWS block */
+.nws-block  { border-top: 1px solid var(--border); padding-top: 6px; }
 .nws-snow  { color: var(--accent); font-weight: 500; }
 .nws-dry   { color: var(--text3); }
 .nws-line  { font-size: 12px; color: var(--text2); line-height: 1.5; }
 .nws-line2 { font-size: 11px; color: var(--text3); margin-top: 2px; line-height: 1.5; }
 
 /* SNOTEL block */
-.snotel-block { border-top: 1px solid var(--border); padding-top: 8px; }
+.snotel-block { border-top: 1px solid var(--border); padding-top: 6px; }
 .snotel-hdr {
   display: flex; justify-content: space-between; align-items: baseline;
   margin-bottom: 3px;
@@ -796,14 +803,10 @@ function renderCard(r) {
       <span class="lbl">Summit</span>
       <span class="val">${r.summit !== null ? fmtIn(r.summit) : "—"}</span>
     </div>
-    <div class="depth-item">
-      <span class="lbl">${r.snotel_depth !== null ? 'SNOTEL' : 'Temp'}</span>
-      <span class="val">${r.snotel_depth !== null ? fmtIn(r.snotel_depth) : tempStr}</span>
-    </div>
   </div>
   <div>
     <div class="median-header">
-      <span class="lbl">Snowpack vs. median${r.temp !== null && r.snotel_depth !== null ? ` · ${tempStr}` : ''}</span>
+      <span class="lbl">Snowpack vs. median</span>
       <span class="pct ${pctCls}">${pctLabel}</span>
     </div>
     <div class="track"><div class="fill ${fillCls}" style="width:${fillW}%"></div></div>
@@ -813,17 +816,14 @@ function renderCard(r) {
     const elevStr = r.snotel_elev ? `${r.snotel_elev.toLocaleString()}'` : '';
     const d1 = [];
     if (r.snotel_new_snow != null) d1.push(`24hr: <span class="snotel-val">${fmtIn(r.snotel_new_snow)}</span>`);
+    if (r.snotel_depth    != null) d1.push(`Depth: <span class="snotel-val">${fmtIn(r.snotel_depth)}</span>`);
     if (r.snotel_swe      != null) d1.push(`SWE: <span class="snotel-val">${r.snotel_swe.toFixed(1)}"</span>`);
     if (r.temp            != null) d1.push(`<span class="snotel-val">${r.temp}°F</span>`);
     const obsStr = fmtSnotelObs(r.snotel_obs);
     const d2 = [];
     if (obsStr) d2.push(`Obs: ${obsStr}`);
-    if (r.snotel_7d_max != null) {
-      const lo = r.snotel_7d_min != null && r.snotel_7d_min !== r.snotel_7d_max
-        ? `${r.snotel_7d_min}"–` : '';
-      d2.push(`NWS 7-day: ${lo}${r.snotel_7d_max}"`);
-    }
     return `<div class="snotel-block">
+      <div class="section-lbl">SNOTEL</div>
       <div class="snotel-hdr">
         <span class="snotel-name">${r.snotel_name}</span>
         <span class="snotel-elev">${elevStr}</span>
@@ -832,10 +832,10 @@ function renderCard(r) {
       ${d2.length ? `<div class="snotel-line">${d2.join(' · ')}</div>` : ''}
     </div>`;
   })()}
-  <div class="meta-row">${(() => {
+  <div class="nws-block">${(() => {
     const snowTxt = r.nws_snow === null ? 'N/A' : r.nws_snow > 0 ? fmtIn(r.nws_snow) : 'dry';
     const snowCls = (r.nws_snow !== null && r.nws_snow > 0) ? 'nws-snow' : 'nws-dry';
-    const f1 = [`NWS 48hr: <span class="${snowCls}">${snowTxt}</span>`];
+    const f1 = [`48hr: <span class="${snowCls}">${snowTxt}</span>`];
     if (r.nws_hi != null && r.nws_lo != null) f1.push(`${r.nws_hi}°/${r.nws_lo}°F`);
     if (r.nws_precip_prob != null && r.nws_precip_prob >= 20) f1.push(`${r.nws_precip_prob}% precip`);
     const f2 = [];
@@ -843,7 +843,13 @@ function renderCard(r) {
     if (r.nws_wind_gust != null && r.nws_wind_gust >= 20) f2.push(`Gusts ${r.nws_wind_gust}mph`);
     const condSrc = r.conditions || (r.nws_conditions ? r.nws_conditions.split(',')[0].trim() : null);
     if (condSrc) f2.push(condSrc);
-    return `<div class="nws-line">${f1.join(' · ')}</div>`
+    if (r.snotel_7d_max != null) {
+      const lo = r.snotel_7d_min != null && r.snotel_7d_min !== r.snotel_7d_max
+        ? `${r.snotel_7d_min}"–` : '';
+      f2.push(`7-day: ${lo}${r.snotel_7d_max}"`);
+    }
+    return `<div class="section-lbl">NWS Forecast</div>`
+      + `<div class="nws-line">${f1.join(' · ')}</div>`
       + (f2.length ? `<div class="nws-line2">${f2.join(' · ')}</div>` : '');
   })()}</div>
   ${r.last_updated ? `<div class="card-footer"><span>As of ${dateShort(r.last_updated)}</span></div>` : ""}
