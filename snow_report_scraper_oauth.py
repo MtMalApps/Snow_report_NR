@@ -2673,12 +2673,13 @@ class SNOTELDataFetcher:
 
     def _fetch_awdb_medians(self, all_triplets: str, today_str: str) -> dict:
         """Fetch median SWE from AWDB. Returns dict keyed by triplet."""
+        yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         url = (
             f"{self.AWDB_URL}"
             f"?stationTriplets={all_triplets}"
             "&elements=WTEQ"
             "&duration=DAILY"
-            f"&beginDate={today_str}"
+            f"&beginDate={yesterday_str}"
             f"&endDate={today_str}"
             "&centralTendencyType=MEDIAN"
         )
