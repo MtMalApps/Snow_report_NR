@@ -282,6 +282,17 @@ body {
 .nws-line  { font-size: 12px; color: var(--text2); line-height: 1.5; }
 .nws-line2 { font-size: 11px; color: var(--text3); margin-top: 2px; line-height: 1.5; }
 
+/* SNOTEL block */
+.snotel-block { border-top: 1px solid var(--border); padding-top: 8px; }
+.snotel-hdr {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 3px;
+}
+.snotel-name { font-size: 12px; font-weight: 500; color: var(--text2); }
+.snotel-elev { font-size: 11px; color: var(--text3); }
+.snotel-line { font-size: 11px; color: var(--text3); line-height: 1.5; }
+.snotel-val  { color: var(--text2); font-weight: 500; }
+
 /* Footer */
 .card-footer {
   font-size: 11px;
@@ -606,6 +617,13 @@ function normalizeFirestoreDoc(meta, raw) {
     pct:             parsePct(raw.percent_of_median),
     temp:            num(sno.temp_f),
     snotel_depth:    num(sno.snotel_total_depth),
+    snotel_name:     sno.station_name   || null,
+    snotel_elev:     num(sno.elevation),
+    snotel_new_snow: num(sno.snow_depth),
+    snotel_swe:      num(sno.snotel_total_swe),
+    snotel_obs:      sno.latest_observation || null,
+    snotel_7d_min:   num(sno.nws_7d_min_in),
+    snotel_7d_max:   num(sno.nws_7d_max_in),
     conditions:      raw.conditions_surface || null,
     nws_snow:        num(nws.total_snow_inches),
     nws_hi:          num(nws.temp_high_f),
@@ -620,13 +638,39 @@ function normalizeFirestoreDoc(meta, raw) {
 }
 
 function normalizeMockData(arr) {
+  const MOCK_SNOTEL = {
+    BigSky:         { name:"Lone Mountain",    elev:8810 },
+    BridgerBowl:    { name:"Brackett Creek",   elev:7370 },
+    Showdown:       { name:"Deadman Creek",    elev:6440 },
+    Snowbowl:       { name:"Stuart Mountain",  elev:7270 },
+    Discovery:      { name:"Warm Springs",     elev:7840 },
+    LookoutPass:    { name:"Lookout",          elev:5180 },
+    LostTrail:      { name:"Saddle Mountain",  elev:7890 },
+    TetonPass:      { name:"Mount Lockhart",   elev:6430 },
+    Blacktail:      { name:"Blacktail Mtn",    elev:5660 },
+    BigMountain:    { name:"Emery Creek",      elev:4340 },
+    Schweitzer:     { name:"Schweitzer Basin", elev:6090 },
+    SilverMountain: { name:"Sunset",           elev:5580 },
+    Maverick:       { name:"Mule Creek",       elev:8300 },
+    RedLodge:       { name:"Cole Creek",       elev:7910 },
+    GreatDivide:    { name:"Nevada Ridge",     elev:7030 },
+    Fernie:         { name:"Morrissey Ridge",  elev:6102 },
+  };
   return arr.map(m => {
-    const meta = RESORT_META.find(r => r.key === m.key) || {};
+    const meta  = RESORT_META.find(r => r.key === m.key) || {};
+    const snotel = MOCK_SNOTEL[m.key] || {};
     return {
       ...m,
-      name:         meta.name || m.key,
-      last_updated: fmtDate(new Date()),  // today's date as YYYY-MM-DD
-      snotel_depth: m.base || null,       // mock: use base as stand-in
+      name:            meta.name || m.key,
+      last_updated:    fmtDate(new Date()),
+      snotel_depth:    m.base || null,
+      snotel_name:     snotel.name || null,
+      snotel_elev:     snotel.elev || null,
+      snotel_new_snow: (m.h24 || 0) > 0 ? +(m.h24 * 0.6).toFixed(1) : 0,
+      snotel_swe:      m.base ? +(m.base * 0.1).toFixed(1) : null,
+      snotel_obs:      fmtDate(new Date()) + ' 04:00',
+      snotel_7d_min:   m.nws_snow != null ? Math.round(m.nws_snow * 0.8) : null,
+      snotel_7d_max:   m.nws_snow != null ? Math.round(m.nws_snow * 2.2) : null,
       nws_precip_prob: null,
       nws_snow_level:  null,
       nws_wind_gust:   null,
@@ -764,6 +808,30 @@ function renderCard(r) {
     </div>
     <div class="track"><div class="fill ${fillCls}" style="width:${fillW}%"></div></div>
   </div>
+  ${(() => {
+    if (!r.snotel_name) return '';
+    const elevStr = r.snotel_elev ? `${r.snotel_elev.toLocaleString()}'` : '';
+    const d1 = [];
+    if (r.snotel_new_snow != null) d1.push(`24hr: <span class="snotel-val">${fmtIn(r.snotel_new_snow)}</span>`);
+    if (r.snotel_swe      != null) d1.push(`SWE: <span class="snotel-val">${r.snotel_swe.toFixed(1)}"</span>`);
+    if (r.temp            != null) d1.push(`<span class="snotel-val">${r.temp}°F</span>`);
+    const obsStr = fmtSnotelObs(r.snotel_obs);
+    const d2 = [];
+    if (obsStr) d2.push(`Obs: ${obsStr}`);
+    if (r.snotel_7d_max != null) {
+      const lo = r.snotel_7d_min != null && r.snotel_7d_min !== r.snotel_7d_max
+        ? `${r.snotel_7d_min}"–` : '';
+      d2.push(`NWS 7-day: ${lo}${r.snotel_7d_max}"`);
+    }
+    return `<div class="snotel-block">
+      <div class="snotel-hdr">
+        <span class="snotel-name">${r.snotel_name}</span>
+        <span class="snotel-elev">${elevStr}</span>
+      </div>
+      ${d1.length ? `<div class="snotel-line">${d1.join(' · ')}</div>` : ''}
+      ${d2.length ? `<div class="snotel-line">${d2.join(' · ')}</div>` : ''}
+    </div>`;
+  })()}
   <div class="meta-row">${(() => {
     const snowTxt = r.nws_snow === null ? 'N/A' : r.nws_snow > 0 ? fmtIn(r.nws_snow) : 'dry';
     const snowCls = (r.nws_snow !== null && r.nws_snow > 0) ? 'nws-snow' : 'nws-dry';
@@ -799,6 +867,16 @@ let histData = null;
 function dateShort(str) {
   const d = new Date(str + 'T12:00:00');
   return d.toLocaleDateString('en-US', {month:'short', day:'numeric'});
+}
+
+function fmtSnotelObs(ts) {
+  if (!ts) return null;
+  try {
+    const d = new Date(ts.replace(' ', 'T') + (ts.length <= 16 ? ':00' : ''));
+    if (isNaN(d)) return null;
+    return d.toLocaleDateString('en-US', {month:'short', day:'numeric'})
+      + ' ' + d.toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit'});
+  } catch(e) { return null; }
 }
 
 function buildMockHistory() {
