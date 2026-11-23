@@ -1560,119 +1560,56 @@ class BlacktailScraper(BaseSnowReportScraper):
 
 class SilverMountainScraper(BaseSnowReportScraper):
     """
-    Silver Mountain scraper - calls their API directly (no Playwright needed)
-    Tested and working as of Nov 2025
-    Date format fixed to match other scrapers
+    Silver Mountain scraper - parses HTML snow report page.
+    Updated Nov 2026: old token API (/api/access_token) no longer exists;
+    data is now server-rendered at /snow-report/ as .stat-tile elements.
     """
-    
+
     def __init__(self):
         super().__init__("SilverMountain")
-        self.BASE_URL = "https://www.silvermt.com"
-    
+
     def get_url(self):
-        return f"{self.BASE_URL}/mountain-info/expanded-conditions"
-    
-    def get_token(self) -> Optional[str]:
-        """Get API token from Silver Mountain"""
-        try:
-            url = f"{self.BASE_URL}/api/access_token"
-            params = {'xid': '6c153b1f29c65c918831da5de0e73d2e0aca6f2a'}
-            
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            return response.text.strip('"')
-        except Exception as e:
-            print(f"Silver Mountain: Error getting token: {e}")
-            return None
-    
+        return "https://www.silvermt.com/snow-report/"
+
     def process_data(self, response) -> Dict:
-        """
-        Get Silver Mountain data from their APIs.
-        Calls 2 endpoints:
-          1. /api - weather/bulletin
-          2. /api/snow-api - snow depths
-        """
         data = {col: None for col in self.STANDARD_COLUMNS}
-        
         try:
-            # Get token
-            token = self.get_token()
-            if not token:
-                print("Silver Mountain: Failed to get API token")
-                return data
-            
-            # Call API #1: Weather/Bulletin data
-            weather_url = f"{self.BASE_URL}/api"
-            weather_params = {'token': token}
-            
-            weather_response = requests.get(weather_url, params=weather_params, timeout=10)
-            weather_response.raise_for_status()
-            weather_data = weather_response.json()
-            
-            # Call API #2: Snow data
-            snow_url = f"{self.BASE_URL}/api/snow-api"
-            snow_params = {
-                'xid': '6c153b1f29c65c918831da5de0e73d2e0aca6f2a',
-                'token': token
-            }
-            
-            snow_response = requests.get(snow_url, params=snow_params, timeout=10)
-            snow_response.raise_for_status()
-            snow_data = snow_response.json()
-            
-            # Parse weather/bulletin data
-            if weather_data.get('content', {}).get('resorts'):
-                resort = weather_data['content']['resorts'][0]
-                
-                # Bulletin - strip HTML tags
-                if resort.get('weatherSkyInfos'):
-                    for bulletin_obj in resort['weatherSkyInfos']:
-                        if bulletin_obj.get('type') == 'WEATHER_BULLETIN_OF_THE_DAY':
-                            bulletin_html = bulletin_obj['data'][0]['data']
-                            # Strip HTML tags
-                            bulletin_text = re.sub(r'<[^>]+>', ' ', bulletin_html)
-                            bulletin_text = re.sub(r'\s+', ' ', bulletin_text).strip()
-                            data['comments'] = bulletin_text
-                
-                # Last updated timestamp - FORMAT TO MATCH OTHER SCRAPERS
-                weather_zones = resort.get('weatherZones', [])
-                if len(weather_zones) > 1:
-                    summit_zone = weather_zones[1]
-                    if summit_zone.get('weatherInfos'):
-                        last_updated_raw = summit_zone['weatherInfos'][0].get('lastModified')
-                        if last_updated_raw:
-                            try:
-                                # Parse ISO 8601 format: 2025-11-20T23:37:00.000-07:00
-                                parsed = datetime.fromisoformat(last_updated_raw.replace('Z', '+00:00'))
-                                # Format to match Showdown: 2025-11-20 03:17 PM
-                                data['last_updated'] = parsed.strftime('%Y-%m-%d %I:%M %p')
-                            except Exception as e:
-                                logging.warning(f"Silver Mountain: Could not parse date '{last_updated_raw}': {e}")
-                                data['last_updated'] = last_updated_raw
-            
-            # Parse snow data
-            if snow_data.get('content', {}).get('resorts'):
-                snow_zones = snow_data['content']['resorts'][0]['snowZones']
-                
-                # Base/Lodge (snowZones[0])
-                lodge = snow_zones[0]
-                data['snow_overnight'] = self.clean_numeric(lodge['freshSnowFallDepth12H']['countryValue'])
-                data['snow_24h_base'] = self.clean_numeric(lodge['freshSnowFallDepth24H']['countryValue'])
-                data['snow_48h_base'] = self.clean_numeric(lodge['freshSnowFallDepth48H']['countryValue'])
-                data['base_depth'] = self.clean_numeric(lodge['snowTotalDepth']['countryValue'])
-                data['conditions_surface'] = lodge.get('snowQuality')  # Pass through as-is (e.g., "EARLY_SEASON")
-                
-                # Summit (snowZones[1])
-                summit = snow_zones[1]
-                data['snow_24h_summit'] = self.clean_numeric(summit['freshSnowFallDepth24H']['countryValue'])
-                data['snow_48h_summit'] = self.clean_numeric(summit['freshSnowFallDepth48H']['countryValue'])
-                data['summit_depth'] = self.clean_numeric(summit['snowTotalDepth']['countryValue'])
-            
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            # Build label→value dict from all stat tiles
+            tiles = {}
+            for tile in soup.select('.stat-tile'):
+                label_el = tile.select_one('.stat-tile__label')
+                value_el = tile.select_one('.stat-tile__value')
+                if label_el and value_el:
+                    tiles[label_el.get_text(strip=True)] = value_el.get_text(strip=True)
+
+            data['snow_overnight']   = self.clean_numeric(tiles.get('Last 12 Hours'))
+            data['snow_24h_summit']  = self.clean_numeric(tiles.get('Last 24 Hours'))
+            data['snow_48h_summit']  = self.clean_numeric(tiles.get('Last 48 Hours'))
+            data['summit_depth']     = self.clean_numeric(tiles.get('Summit Snow Depth'))
+            data['snow_24h_base']    = data['snow_24h_summit']   # page reports one set of values
+            data['snow_48h_base']    = data['snow_48h_summit']
+            data['conditions_surface'] = tiles.get('Surface Conditions')
+
+            # Special notes as comments
+            for tile in soup.select('.stat-tile'):
+                label_el = tile.select_one('.stat-tile__label')
+                if label_el and 'special notes' in label_el.get_text(strip=True).lower():
+                    tile_text = tile.get_text(separator=' ', strip=True)
+                    label_text = label_el.get_text(strip=True)
+                    notes = tile_text.replace(label_text, '', 1).strip()
+                    if notes:
+                        data['comments'] = notes
+                    break
+
+            data['last_updated'] = datetime.now().strftime('%Y-%m-%d')
+
         except Exception as e:
             print(f"Silver Mountain: Error processing data: {e}")
             import traceback
             traceback.print_exc()
-        
+
         return data
 
 
