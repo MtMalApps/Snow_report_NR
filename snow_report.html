@@ -276,18 +276,11 @@ body {
 .fill-na   { background: var(--border2); }
 
 /* Meta row */
-.meta-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  font-size: 12px;
-  color: var(--text2);
-  gap: 8px;
-}
-.nws-block { flex: 1; }
+.meta-row { font-size: 12px; color: var(--text2); }
 .nws-snow  { color: var(--accent); font-weight: 500; }
 .nws-dry   { color: var(--text3); }
-.conditions-text { text-align: right; color: var(--text3); font-size: 11px; }
+.nws-line  { font-size: 12px; color: var(--text2); line-height: 1.5; }
+.nws-line2 { font-size: 11px; color: var(--text3); margin-top: 2px; line-height: 1.5; }
 
 /* Footer */
 .card-footer {
@@ -593,34 +586,52 @@ async function loadData() {
 function normalizeFirestoreDoc(meta, raw) {
   const nws  = raw.nws_forecast  || {};
   const sno  = raw.snotel_data   || {};
+  const wind = nws.wind          || {};
   const lifts = Number(raw.lifts_open);
   const status = lifts > 0 ? "open"
     : (raw.base_depth > 0 || raw.summit_depth > 0) ? "pre" : "closed";
+  // Use date field when last_updated is not a clean YYYY-MM-DD string
+  const lu = raw.last_updated;
+  const cleanLU = (lu && /^\d{4}-\d{2}-\d{2}$/.test(lu)) ? lu : (raw.date || null);
   return {
-    key:        meta.key,
-    name:       meta.name,
-    state:      meta.state,
+    key:             meta.key,
+    name:            meta.name,
+    state:           meta.state,
     status,
-    overnight:  num(raw.snow_overnight),
-    h24:        num(raw.snow_24h_summit ?? raw.snow_24h_base),
-    h48:        num(raw.snow_48h_summit ?? raw.snow_48h_base),
-    base:       num(raw.base_depth),
-    summit:     num(raw.summit_depth),
-    pct:        parsePct(raw.percent_of_median),
-    temp:       num(sno.temp_f),
-    conditions: raw.conditions_surface || null,
-    nws_snow:   num(nws.total_snow_inches),
-    nws_hi:     num(nws.temp_high_f),
-    nws_lo:     num(nws.temp_low_f),
-    last_updated: raw.last_updated || raw.date,
-    comments:   raw.comments || null,
+    overnight:       num(raw.snow_overnight),
+    h24:             num(raw.snow_24h_summit ?? raw.snow_24h_base),
+    h48:             num(raw.snow_48h_summit ?? raw.snow_48h_base),
+    base:            num(raw.base_depth),
+    summit:          num(raw.summit_depth),
+    pct:             parsePct(raw.percent_of_median),
+    temp:            num(sno.temp_f),
+    snotel_depth:    num(sno.snotel_total_depth),
+    conditions:      raw.conditions_surface || null,
+    nws_snow:        num(nws.total_snow_inches),
+    nws_hi:          num(nws.temp_high_f),
+    nws_lo:          num(nws.temp_low_f),
+    nws_precip_prob: num(nws.precip_probability_max),
+    nws_snow_level:  num(nws.snow_level_feet),
+    nws_wind_gust:   num(wind.gust_max_mph),
+    nws_conditions:  nws.conditions || null,
+    last_updated:    cleanLU,
+    comments:        raw.comments || null,
   };
 }
 
 function normalizeMockData(arr) {
   return arr.map(m => {
     const meta = RESORT_META.find(r => r.key === m.key) || {};
-    return { ...m, name: meta.name || m.key, last_updated: "Mock data" };
+    return {
+      ...m,
+      name:         meta.name || m.key,
+      last_updated: fmtDate(new Date()),  // today's date as YYYY-MM-DD
+      snotel_depth: m.base || null,       // mock: use base as stand-in
+      nws_precip_prob: null,
+      nws_snow_level:  null,
+      nws_wind_gust:   null,
+      nws_conditions:  m.conditions || null,
+    };
   });
 }
 
@@ -695,7 +706,7 @@ function renderCard(r) {
   }
 
   const fmtIn = v => {
-    if (v === null) return "—";
+    if (v == null || isNaN(v)) return "—";
     if (v === 0) return '0"';
     return (v % 1 === 0 ? v : v.toFixed(1)) + '"';
   };
@@ -709,14 +720,7 @@ function renderCard(r) {
   const statusLabel = { open:"Open", pre:"Pre-season", closed:"Closed" }[r.status] || "?";
   const statusCls   = "s-" + (r.status || "pre");
 
-  const nwsHtml = r.nws_snow === null
-    ? `<span class="nws-dry">NWS: N/A</span>`
-    : r.nws_snow > 0
-      ? `<span>NWS 48hr: <span class="nws-snow">${fmtIn(r.nws_snow)}</span></span>`
-      : `<span class="nws-dry">NWS 48hr: dry</span>`;
-
   const tempStr = r.temp !== null ? `${r.temp}°F` : "—";
-  const condStr = r.conditions || "";
 
   return `<div class="card">
   <div class="card-head">
@@ -749,22 +753,32 @@ function renderCard(r) {
       <span class="val">${r.summit !== null ? fmtIn(r.summit) : "—"}</span>
     </div>
     <div class="depth-item">
-      <span class="lbl">SNOTEL</span>
-      <span class="val">${tempStr}</span>
+      <span class="lbl">${r.snotel_depth !== null ? 'SNOTEL' : 'Temp'}</span>
+      <span class="val">${r.snotel_depth !== null ? fmtIn(r.snotel_depth) : tempStr}</span>
     </div>
   </div>
   <div>
     <div class="median-header">
-      <span class="lbl">Snowpack vs. median</span>
+      <span class="lbl">Snowpack vs. median${r.temp !== null && r.snotel_depth !== null ? ` · ${tempStr}` : ''}</span>
       <span class="pct ${pctCls}">${pctLabel}</span>
     </div>
     <div class="track"><div class="fill ${fillCls}" style="width:${fillW}%"></div></div>
   </div>
-  <div class="meta-row">
-    <div class="nws-block">${nwsHtml}</div>
-    <div class="conditions-text">${condStr}</div>
-  </div>
-  ${r.last_updated ? `<div class="card-footer"><span>Updated: ${r.last_updated}</span></div>` : ""}
+  <div class="meta-row">${(() => {
+    const snowTxt = r.nws_snow === null ? 'N/A' : r.nws_snow > 0 ? fmtIn(r.nws_snow) : 'dry';
+    const snowCls = (r.nws_snow !== null && r.nws_snow > 0) ? 'nws-snow' : 'nws-dry';
+    const f1 = [`NWS 48hr: <span class="${snowCls}">${snowTxt}</span>`];
+    if (r.nws_hi != null && r.nws_lo != null) f1.push(`${r.nws_hi}°/${r.nws_lo}°F`);
+    if (r.nws_precip_prob != null && r.nws_precip_prob >= 20) f1.push(`${r.nws_precip_prob}% precip`);
+    const f2 = [];
+    if (r.nws_snow_level != null) f2.push(`Snow lvl ${(r.nws_snow_level/1000).toFixed(1)}k\'`);
+    if (r.nws_wind_gust != null && r.nws_wind_gust >= 20) f2.push(`Gusts ${r.nws_wind_gust}mph`);
+    const condSrc = r.conditions || (r.nws_conditions ? r.nws_conditions.split(',')[0].trim() : null);
+    if (condSrc) f2.push(condSrc);
+    return `<div class="nws-line">${f1.join(' · ')}</div>`
+      + (f2.length ? `<div class="nws-line2">${f2.join(' · ')}</div>` : '');
+  })()}</div>
+  ${r.last_updated ? `<div class="card-footer"><span>As of ${dateShort(r.last_updated)}</span></div>` : ""}
 </div>`;
 }
 
