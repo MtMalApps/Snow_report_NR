@@ -62,6 +62,7 @@ RESORT_COORDS = {
     "BigSky": {"lat": 45.2809, "lon": -111.4406},
     "BridgerBowl": {"lat": 45.8139, "lon": -110.9219},
     "RedLodge": {"lat": 45.1811, "lon": -109.3543},
+    "Fernie": {"lat": 49.4650, "lon": -115.0920},
 }
 
 # Data directory
@@ -1613,6 +1614,64 @@ class SilverMountainScraper(BaseSnowReportScraper):
         return data
 
 
+class FernieScraper(BaseSnowReportScraper):
+    """
+    Fernie Alpine Resort (BC, Canada) scraper.
+    Server-rendered HTML with stable element IDs. Data in CM; converted to inches.
+    """
+
+    _CM_TO_IN = 1 / 2.54
+
+    def __init__(self):
+        super().__init__("Fernie")
+
+    def get_url(self):
+        return "https://skifernie.com/conditions/snow-report/"
+
+    def _cm(self, raw):
+        val = self.clean_numeric(raw)
+        return round(float(val) * self._CM_TO_IN, 1) if val is not None else None
+
+    def process_data(self, response) -> Dict:
+        data = {col: None for col in self.STANDARD_COLUMNS}
+        try:
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            def gid(id_str):
+                el = soup.find(id=id_str)
+                return el.get_text(strip=True) if el else None
+
+            data['snow_overnight']  = self._cm(gid('snowReportNewSnowFallOvernight'))
+            data['snow_24h_summit'] = self._cm(gid('snowReportNewSnowFall24'))
+            data['snow_48h_summit'] = self._cm(gid('snowReportNewSnowFall48'))
+            data['snow_24h_base']   = data['snow_24h_summit']
+            data['snow_48h_base']   = data['snow_48h_summit']
+            data['base_depth']      = self._cm(gid('snowReportNewSnowFallPack'))
+
+            comments_el = soup.find(id='SnowreportComments')
+            if comments_el:
+                data['comments'] = comments_el.get_text(separator=' ', strip=True)[:500]
+
+            raw_ts = gid('snowReportTH_SnowreportRecentSnowSaveDate')
+            if raw_ts:
+                try:
+                    # "NOVEMBER 23, 2026 | 7:14am"
+                    date_part, time_part = raw_ts.split('|')
+                    parsed = datetime.strptime(
+                        f"{date_part.strip()} {time_part.strip().upper()}",
+                        "%B %d, %Y %I:%M%p"
+                    )
+                    data['last_updated'] = parsed.strftime('%Y-%m-%d %I:%M %p')
+                except Exception:
+                    data['last_updated'] = raw_ts
+
+        except Exception as e:
+            print(f"Fernie: Error processing data: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return data
+
 
 class SchweitzerScraper(BaseSnowReportScraper):
     """
@@ -2533,6 +2592,7 @@ class SNOTELDataFetcher:
             "BigSky":         {"triplet": "590:MT:SNTL", "name": "Lone Mountain",     "lat": 45.27, "lon": -111.43, "elevation": 8810},
             "BridgerBowl":    {"triplet": "365:MT:SNTL", "name": "Brackett Creek",    "lat": 45.89, "lon": -110.94, "elevation": 7370},
             "RedLodge":       {"triplet": "407:MT:SNTL", "name": "Cole Creek",        "lat": 45.19, "lon": -109.35, "elevation": 7910},
+            "Fernie":         {"triplet": "2C09Q:BC:MSNT", "name": "Morrissey Ridge",  "lat": 49.45, "lon": -114.97, "elevation": 6102},
         }
     
     def __init__(self):
@@ -2656,9 +2716,18 @@ class SNOTELDataFetcher:
         all_triplets = ",".join(triplet_to_resort.keys())
         today_str = datetime.now().strftime("%Y-%m-%d")
 
-        # Numeric IDs are the first segment of each triplet (e.g. "437" from "437:MT:SNTL")
-        numeric_ids = [int(t.split(':')[0]) for t in triplet_to_resort.keys()]
-        id_to_triplet = {int(t.split(':')[0]): t for t in triplet_to_resort.keys()}
+        # Numeric IDs for the station API (e.g. "437" from "437:MT:SNTL").
+        # Non-numeric triplet prefixes (e.g. "2C09Q" for BC stations) are skipped for the
+        # station API call but still included in the AWDB median call.
+        numeric_ids = []
+        id_to_triplet = {}
+        for t in triplet_to_resort.keys():
+            try:
+                nid = int(t.split(':')[0])
+                numeric_ids.append(nid)
+                id_to_triplet[nid] = t
+            except ValueError:
+                self._log.debug(f"Non-numeric station ID skipped for station API: {t}")
 
         station_data = self._fetch_station_api(numeric_ids)
         median_map, swe_map = self._fetch_awdb_medians(all_triplets, today_str)
@@ -2670,8 +2739,11 @@ class SNOTELDataFetcher:
 
         for r_name, info in self.STATION_INFO.items():
             triplet = info['triplet']
-            numeric_id = int(triplet.split(':')[0])
-            station = station_data.get(numeric_id)
+            try:
+                numeric_id = int(triplet.split(':')[0])
+            except ValueError:
+                numeric_id = None
+            station = station_data.get(numeric_id) if numeric_id is not None else None
 
             # --- percent of median ---
             swe = (station.get('swe_in') if station else None) or swe_map.get(triplet)
@@ -2770,6 +2842,7 @@ def main():
             BlacktailScraper(),
             SchweitzerScraper(),
             SilverMountainScraper(),
+            FernieScraper(),
             BridgerBowlScraper(),
             MaverickScraper(),
             RedLodgeScraper(),
