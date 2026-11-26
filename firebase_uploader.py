@@ -15,11 +15,14 @@ import os
 import json
 import sys
 import ast
+import base64
 import pandas as pd
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
 from typing import List, Dict, Optional
 import firebase_admin
 from firebase_admin import credentials, firestore
+from zoneinfo import ZoneInfo
 
 # Global Firebase client
 db = None
@@ -162,6 +165,188 @@ def save_resort_data_to_firestore(resort_data: Dict) -> bool:
         return False
 
 
+LOCAL_TZ = ZoneInfo("America/Denver")
+
+# Fields to watch for null-regression between scraper runs
+MONITORED_FIELDS = [
+    'snow_overnight', 'snow_24h_base', 'snow_24h_summit',
+    'snow_48h_base', 'snow_48h_summit',
+    'base_depth', 'summit_depth',
+    'lifts_open', 'runs_open',
+]
+
+def _is_numeric(v) -> bool:
+    if v is None:
+        return False
+    try:
+        f = float(v)
+        return f == f  # exclude NaN
+    except (ValueError, TypeError):
+        return False
+
+
+def write_scraper_health(uploaded_data: List[Dict], upload_results: Dict[str, bool]) -> List[str]:
+    """
+    After uploading, compare each resort's data against yesterday's Firestore doc.
+    Flag quarantined records, upload failures, and any numeric fields that
+    regressed from a real value to null since the previous run.
+    Writes a 'scraper_health/{today}' doc to Firestore and returns a list of alert strings.
+    """
+    if db is None:
+        print("⚠️  Firebase not initialized — skipping health doc")
+        return []
+
+    today     = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(LOCAL_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Fetch yesterday's docs for regression comparison
+    prev_data: Dict[str, dict] = {}
+    try:
+        for doc in db.collection('snow_reports').where('date', '==', yesterday).stream():
+            d = doc.to_dict()
+            if d.get('resort'):
+                prev_data[d['resort']] = d
+    except Exception as e:
+        print(f"⚠️  Could not fetch yesterday's data for regression check: {e}")
+
+    health: Dict[str, dict] = {}
+    alerts: List[str] = []
+
+    for resort_data in uploaded_data:
+        resort  = resort_data.get('resort', 'unknown')
+        status  = 'ok'
+        issues: List[str] = []
+
+        # Quarantine / LLM-fallback markers written by the scraper
+        data_source = str(resort_data.get('data_source') or '')
+        scrape_warnings = resort_data.get('scrape_warnings') or []
+        if isinstance(scrape_warnings, str):
+            try:
+                scrape_warnings = json.loads(scrape_warnings)
+            except Exception:
+                scrape_warnings = []
+
+        if data_source == 'quarantined':
+            status = 'error'
+            issues.append('quarantined_by_scraper')
+        elif 'partial' in data_source:
+            status = 'partial'
+            issues.append(data_source)
+
+        if scrape_warnings:
+            if status == 'ok':
+                status = 'partial'
+            issues.extend(scrape_warnings)
+
+        # Stale last_updated from resort website
+        lu = resort_data.get('last_updated') or ''
+        if lu and len(lu) >= 10:
+            try:
+                lu_date = datetime.strptime(lu[:10], '%Y-%m-%d').date()
+                age = (datetime.now(LOCAL_TZ).date() - lu_date).days
+                if age >= 2:
+                    if status == 'ok':
+                        status = 'partial'
+                    issues.append(f"resort_site_stale({lu[:10]}, {age}d old)")
+            except ValueError:
+                pass
+
+        # Field regression vs yesterday
+        prev = prev_data.get(resort, {})
+        prev_base = prev.get('base_depth')
+        if _is_numeric(prev_base) and float(prev_base) > 0:
+            regressions = []
+            for field in MONITORED_FIELDS:
+                prev_v = prev.get(field)
+                curr_v = resort_data.get(field)
+                if _is_numeric(prev_v) and not _is_numeric(curr_v):
+                    regressions.append(f"{field}({prev_v}→null)")
+            if regressions:
+                if status == 'ok':
+                    status = 'partial'
+                issues.append("regression: " + ", ".join(regressions))
+
+        # Upload failure
+        if not upload_results.get(resort, True):
+            status = 'error'
+            issues.append('upload_failed')
+
+        health[resort] = {'status': status, 'issues': issues, 'data_source': data_source}
+        if status != 'ok':
+            alerts.append(f"[{status.upper()}] {resort}: {'; '.join(issues)}")
+
+    health_doc = {
+        'run_date':      today,
+        'run_timestamp': datetime.now(LOCAL_TZ).isoformat(),
+        'resorts':       health,
+        'alerts':        alerts,
+        'has_issues':    len(alerts) > 0,
+    }
+    try:
+        db.collection('scraper_health').document(today).set(health_doc)
+        issue_word = "alert" if len(alerts) == 1 else "alerts"
+        print(f"✅ Health doc written for {today} — {len(alerts)} {issue_word}")
+    except Exception as e:
+        print(f"❌ Failed to write health doc: {e}")
+
+    return alerts
+
+
+def send_alert_email(alerts: List[str], run_date: str) -> None:
+    """
+    Send a plain-text alert email via Gmail API (same OAuth token as send_daily_report.py).
+    Only called when there are alerts. No-ops silently if credentials aren't present.
+    """
+    gmail_address = os.environ.get('GMAIL_ADDRESS')
+    token_path    = os.environ.get('GMAIL_TOKEN_PATH', 'token.json')
+
+    if not gmail_address:
+        print("⚠️  GMAIL_ADDRESS not set — skipping alert email")
+        return
+    if not os.path.exists(token_path):
+        print(f"⚠️  Gmail token not found at {token_path} — skipping alert email")
+        return
+
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+
+        creds = Credentials.from_authorized_user_file(token_path)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                print("⚠️  Gmail token invalid/expired — cannot send alert email")
+                return
+
+        service = build('gmail', 'v1', credentials=creds)
+
+        body_lines = [
+            f"Snow Report Scraper Alert — {run_date}",
+            "",
+            f"{len(alerts)} issue(s) detected in today's scraper run:",
+            "",
+        ] + [f"  • {a}" for a in alerts] + [
+            "",
+            f"Full details: Firestore > scraper_health > {run_date}",
+            "",
+            "— Northern Rockies Snow Report automation",
+        ]
+
+        msg = MIMEText("\n".join(body_lines), 'plain')
+        msg['Subject'] = f"⚠️ Snow Scraper Alert — {run_date}: {len(alerts)} issue(s)"
+        msg['From']    = gmail_address
+        msg['To']      = gmail_address
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')
+        service.users().messages().send(userId='me', body={'raw': raw}).execute()
+        print(f"✅ Alert email sent to {gmail_address}")
+
+    except Exception as e:
+        print(f"❌ Failed to send alert email: {e}")
+
+
 def upload_all_resorts(resort_data_list: List[Dict]) -> Dict[str, int]:
     """
     Upload multiple resorts' data to Firestore.
@@ -178,18 +363,27 @@ def upload_all_resorts(resort_data_list: List[Dict]) -> Dict[str, int]:
     
     success_count = 0
     failed_count = 0
-    
+    upload_results: Dict[str, bool] = {}
+
     print(f"\n📤 Uploading {len(resort_data_list)} resort(s) to Firestore...")
-    
+
     for resort_data in resort_data_list:
-        if save_resort_data_to_firestore(resort_data):
+        resort = resort_data.get('resort', 'unknown')
+        ok = save_resort_data_to_firestore(resort_data)
+        upload_results[resort] = ok
+        if ok:
             success_count += 1
         else:
             failed_count += 1
-    
+
     print(f"\n📊 Upload Summary: {success_count} succeeded, {failed_count} failed")
-    
-    # FIXED: return real counts, not zeros
+
+    # --- Scraper health doc + alert email ---
+    run_date = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+    alerts = write_scraper_health(resort_data_list, upload_results)
+    if alerts:
+        send_alert_email(alerts, run_date)
+
     return {'success': success_count, 'failed': failed_count}
 
 

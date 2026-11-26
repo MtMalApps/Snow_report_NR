@@ -191,6 +191,14 @@ body {
   color: var(--text);
   flex: 1;
   line-height: 1.3;
+  text-decoration: none;
+}
+a.resort-name:hover { text-decoration: underline; color: var(--accent); }
+.stale-dot {
+  display: inline-block; width: 7px; height: 7px;
+  background: #d97706; border-radius: 50%;
+  flex-shrink: 0; margin-top: 5px;
+  cursor: default;
 }
 .state-pill {
   font-size: 11px;
@@ -476,23 +484,23 @@ const FIREBASE_CONFIG = {
 
 /* Resort metadata — name, state, and sort key */
 const RESORT_META = [
-  { key:"BigSky",          name:"Big Sky",          state:"MT" },
-  { key:"BridgerBowl",     name:"Bridger Bowl",      state:"MT" },
-  { key:"Showdown",        name:"Showdown",           state:"MT" },
-  { key:"Snowbowl",        name:"Montana Snowbowl",  state:"MT" },
-  { key:"Discovery",       name:"Discovery",          state:"MT" },
-  { key:"LookoutPass",     name:"Lookout Pass",       state:"ID" },
-  { key:"LostTrail",       name:"Lost Trail",         state:"MT" },
-  { key:"TetonPass",       name:"Teton Pass Ski Area",state:"MT" },
-  { key:"Blacktail",       name:"Blacktail Mountain", state:"MT" },
-  { key:"BigMountain",     name:"Whitefish",           state:"MT" },
-  { key:"TurnerMountain",  name:"Turner Mountain",    state:"MT" },
-  { key:"Schweitzer",      name:"Schweitzer",         state:"ID" },
-  { key:"SilverMountain",  name:"Silver Mountain",    state:"ID" },
-  { key:"Maverick",        name:"Maverick Mountain",  state:"MT" },
-  { key:"RedLodge",        name:"Red Lodge",          state:"MT" },
-  { key:"GreatDivide",     name:"Great Divide",       state:"MT" },
-  { key:"Fernie",          name:"Fernie",             state:"BC" },
+  { key:"BigSky",          name:"Big Sky",           state:"MT", url:"https://www.bigskyresort.com/the-mountain/mountain-report" },
+  { key:"BridgerBowl",     name:"Bridger Bowl",       state:"MT", url:"https://www.bridgerbowl.com/snow-report" },
+  { key:"Showdown",        name:"Showdown",            state:"MT", url:"https://www.showdownmontana.com/snow-report" },
+  { key:"Snowbowl",        name:"Montana Snowbowl",   state:"MT", url:"https://www.montanasnowbowl.com/report.php" },
+  { key:"Discovery",       name:"Discovery",           state:"MT", url:"https://www.skidiscovery.com/snow-report/" },
+  { key:"LookoutPass",     name:"Lookout Pass",        state:"ID", url:"https://skilookout.com/snow-report" },
+  { key:"LostTrail",       name:"Lost Trail",          state:"MT", url:"https://losttrail.com/snow-report/" },
+  { key:"TetonPass",       name:"Teton Pass Ski Area", state:"MT", url:"https://www.skitetonmt.com/mountain-info/current-conditions" },
+  { key:"Blacktail",       name:"Blacktail Mountain",  state:"MT", url:"https://blacktailmountain.com/snow-report/" },
+  { key:"BigMountain",     name:"Whitefish",            state:"MT", url:"https://skiwhitefish.com/snowreport/" },
+  { key:"TurnerMountain",  name:"Turner Mountain",     state:"MT", url:"https://www.skiturnermountain.com/" },
+  { key:"Schweitzer",      name:"Schweitzer",          state:"ID", url:"https://www.schweitzer.com/the-mountain/mountain-report" },
+  { key:"SilverMountain",  name:"Silver Mountain",     state:"ID", url:"https://www.silvermt.com/snow-report/" },
+  { key:"Maverick",        name:"Maverick Mountain",   state:"MT", url:"https://www.skimaverick.com/weather" },
+  { key:"RedLodge",        name:"Red Lodge",           state:"MT", url:"https://www.redlodgemountain.com/mountain/snow-report/" },
+  { key:"GreatDivide",     name:"Great Divide",        state:"MT", url:"https://www.greatdivideski.com/conditions-and-lifts/" },
+  { key:"Fernie",          name:"Fernie",              state:"BC", url:"https://skifernie.com/conditions/snow-report/" },
 ];
 
 /* Mock data — shown when Firebase is not configured */
@@ -615,6 +623,7 @@ function normalizeFirestoreDoc(meta, raw) {
     key:             meta.key,
     name:            meta.name,
     state:           meta.state,
+    url:             meta.url || null,
     status,
     overnight:       num(raw.snow_overnight),
     h24:             num(raw.snow_24h_summit ?? raw.snow_24h_base),
@@ -669,6 +678,7 @@ function normalizeMockData(arr) {
     return {
       ...m,
       name:            meta.name || m.key,
+      url:             meta.url  || null,
       last_updated:    fmtDate(new Date()),
       snotel_depth:    m.base || null,
       snotel_name:     snotel.name || null,
@@ -754,9 +764,12 @@ function renderAll() {
 
 function renderCard(r) {
   if (r.noData) {
+    const nd = r.url
+      ? `<a class="resort-name" href="${r.url}" target="_blank" rel="noopener">${r.name}</a>`
+      : `<span class="resort-name">${r.name}</span>`;
     return `<div class="card" style="opacity:.45">
       <div class="card-head">
-        <span class="resort-name">${r.name}</span>
+        ${nd}
         <span class="state-pill">${r.state}</span>
         <span class="status-pill s-closed">No data</span>
       </div>
@@ -783,10 +796,17 @@ function renderCard(r) {
   const statusCls   = "s-" + (r.status || "pre");
 
   const tempStr = r.temp !== null ? `${r.temp}°F` : "—";
+  const today   = fmtDate(new Date());
+  const isStale = r.last_updated && r.last_updated < today;
+
+  const nameEl = r.url
+    ? `<a class="resort-name" href="${r.url}" target="_blank" rel="noopener">${r.name}</a>`
+    : `<span class="resort-name">${r.name}</span>`;
 
   return `<div class="card">
   <div class="card-head">
-    <span class="resort-name">${r.name}</span>
+    ${nameEl}
+    ${isStale ? `<span class="stale-dot" title="Last updated ${r.last_updated} — may be stale"></span>` : ''}
     <span class="state-pill">${r.state}</span>
     <span class="status-pill ${statusCls}">${statusLabel}</span>
   </div>
@@ -999,12 +1019,37 @@ function renderChart({ dates, data }) {
   renderChartLegend(dates);
 }
 
+/* ── URL state ─────────────────────────────────────────────── */
+function applyUrlState() {
+  const p = new URLSearchParams(window.location.search);
+  const sort   = p.get("sort");
+  const region = p.get("region");
+  if (sort && ["h24","base","pct","name"].includes(sort)) {
+    curSort = sort;
+    document.querySelectorAll("#sort-grp button").forEach(b =>
+      b.classList.toggle("active", b.dataset.sort === sort));
+  }
+  if (region && ["all","MT","ID","BC"].includes(region)) {
+    curFilter = region;
+    document.querySelectorAll("#filter-grp button").forEach(b =>
+      b.classList.toggle("active", b.dataset.filter === region));
+  }
+}
+function updateUrl() {
+  const p = new URLSearchParams();
+  if (curSort   !== "h24") p.set("sort",   curSort);
+  if (curFilter !== "all") p.set("region", curFilter);
+  const qs = p.toString();
+  history.replaceState(null, "", qs ? "?" + qs : window.location.pathname);
+}
+
 /* ── Wire controls ─────────────────────────────────────────── */
 document.querySelectorAll("#filter-grp button").forEach(btn => {
   btn.addEventListener("click", () => {
     document.querySelectorAll("#filter-grp button").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     curFilter = btn.dataset.filter;
+    updateUrl();
     renderAll();
     if (histData) renderChart(histData);
   });
@@ -1014,11 +1059,13 @@ document.querySelectorAll("#sort-grp button").forEach(btn => {
     document.querySelectorAll("#sort-grp button").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     curSort = btn.dataset.sort;
+    updateUrl();
     renderAll();
   });
 });
 
 /* ── Boot ──────────────────────────────────────────────────── */
+applyUrlState();
 loadData();
 </script>
 </body>
