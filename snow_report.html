@@ -723,7 +723,18 @@ function getSorted(arr) {
     const bv = b.pct == null ? -1 : b.pct;
     return bv - av;
   });
-  return copy.sort((a,b) => (b.h24||0) - (a.h24||0));  // h24 default
+  // Match chart order: today's snow first, 5-day total as tiebreaker
+  return copy.sort((a,b) => {
+    if (histData) {
+      const ad = histData.data[a.key] || {}, bd = histData.data[b.key] || {};
+      const aToday = ad[histData.dates[0]] || 0, bToday = bd[histData.dates[0]] || 0;
+      if (bToday !== aToday) return bToday - aToday;
+      const aTotal = histData.dates.reduce((s,d) => s+(ad[d]||0), 0);
+      const bTotal = histData.dates.reduce((s,d) => s+(bd[d]||0), 0);
+      return bTotal - aTotal;
+    }
+    return (b.h24||0) - (a.h24||0);
+  });
 }
 
 function renderAll() {
