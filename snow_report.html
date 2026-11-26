@@ -123,6 +123,35 @@ body {
 .banner-info { background: var(--accent-bg); border-color: rgba(56,189,248,.3); color: var(--accent-text); }
 .banner-ok   { background: var(--success-bg); border-color: rgba(74,222,128,.3); color: var(--success); }
 
+/* ── Powder banner ──────────────────────────────────────────── */
+.powder-banner {
+  display: none;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  background: linear-gradient(120deg, #1155cc 0%, #6622ee 100%);
+  color: #fff;
+  font-size: 13px;
+  margin-bottom: 14px;
+  border: 1px solid rgba(255,255,255,.15);
+}
+.powder-banner.show { display: flex; }
+.powder-icon { font-size: 20px; flex-shrink: 0; line-height: 1.4; }
+.powder-body { flex: 1; min-width: 0; }
+.powder-headline { font-weight: 700; font-size: 14px; letter-spacing: -.1px; }
+.powder-resorts { margin-top: 2px; font-size: 12px; opacity: .9; line-height: 1.6; }
+.powder-dismiss {
+  background: none; border: none; color: rgba(255,255,255,.65);
+  font-size: 20px; cursor: pointer; padding: 0; line-height: 1;
+  flex-shrink: 0; align-self: flex-start;
+}
+.powder-dismiss:hover { color: #fff; }
+.status-pill.s-powder {
+  background: rgba(102,34,238,.18); color: #a78bfa;
+  border: 1px solid rgba(102,34,238,.35);
+}
+
 /* ── Controls ────────────────────────────────────────────────── */
 .controls {
   display: flex;
@@ -401,6 +430,122 @@ a.resort-name:hover { text-decoration: underline; color: var(--accent); }
   .depth-item .val { font-size: 13px; }
 }
 
+/* ── Modal ───────────────────────────────────────────────────── */
+.modal-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.72);
+  z-index: 1000;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 32px 16px 48px;
+  overflow-y: auto;
+}
+.modal-backdrop.open { display: flex; }
+.modal-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--card-radius);
+  width: 100%;
+  max-width: 760px;
+  margin: auto;
+  flex-shrink: 0;
+}
+.modal-header {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 20px 20px 12px;
+}
+.modal-title-group { flex: 1; min-width: 0; }
+.modal-title { font-size: 20px; font-weight: 600; color: var(--text); line-height: 1.2; }
+.modal-subtitle { font-size: 13px; color: var(--text2); margin-top: 3px; }
+.modal-close {
+  background: none; border: none; font-size: 26px; color: var(--text2);
+  cursor: pointer; padding: 0 2px; line-height: 1; flex-shrink: 0;
+}
+.modal-close:hover { color: var(--text); }
+.modal-tabs {
+  display: flex; padding: 0 20px;
+  border-bottom: 1px solid var(--border); gap: 2px;
+}
+.modal-tab {
+  font-size: 13px; font-family: var(--font);
+  padding: 9px 14px; border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent; color: var(--text2);
+  cursor: pointer; margin-bottom: -1px;
+}
+.modal-tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 500; }
+.modal-tab:hover:not(.active) { color: var(--text); }
+.modal-body { padding: 18px 20px 24px; }
+
+/* Modal metrics */
+.modal-station-hdr { margin-bottom: 12px; }
+.modal-station-name { font-size: 15px; font-weight: 500; color: var(--text); }
+.modal-station-sub  { font-size: 12px; color: var(--text3); margin-top: 2px; }
+.modal-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px; margin-bottom: 14px;
+}
+.modal-metric { background: var(--surface2); border-radius: var(--radius); padding: 10px 12px; }
+.mm-lbl { display: block; font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 3px; }
+.mm-val { display: block; font-size: 20px; font-weight: 500; color: var(--text); line-height: 1.1; }
+.mm-val-sm { font-size: 14px !important; }
+.modal-detail { font-size: 13px; color: var(--text2); padding: 3px 0; }
+.modal-detail b { color: var(--text3); font-weight: 400; }
+.modal-comments { font-size: 12px; color: var(--text2); background: var(--surface2); border-radius: var(--radius); padding: 8px 12px; margin-top: 10px; }
+.modal-hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+
+/* NRCS chart */
+.nrcs-controls {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; flex-wrap: wrap; margin-bottom: 10px;
+}
+.nrcs-title { font-size: 13px; font-weight: 500; color: var(--text2); }
+.nrcs-year-row { display: flex; align-items: center; gap: 8px; }
+.nrcs-year-lbl { font-size: 12px; color: var(--text3); white-space: nowrap; }
+.nrcs-year-input {
+  font-size: 13px; font-family: var(--font);
+  padding: 5px 10px; width: 90px;
+  border-radius: var(--radius); border: 1px solid var(--border2);
+  background: var(--surface2); color: var(--text); outline: none;
+}
+.nrcs-year-input:focus { border-color: var(--accent); }
+.nrcs-year-btn {
+  font-size: 12px; font-family: var(--font);
+  padding: 5px 12px; border-radius: var(--radius);
+  border: 1px solid var(--border2); background: transparent;
+  color: var(--text2); cursor: pointer;
+}
+.nrcs-year-btn:hover { background: var(--surface2); color: var(--text); }
+.nrcs-frame-outer {
+  width: 100%; height: 440px; overflow: hidden;
+  border-radius: var(--radius); background: #fff;
+  position: relative;
+}
+.nrcs-frame-outer iframe {
+  width: 100%; height: 1200px; border: 0;
+  transform: translateY(-270px);
+  position: absolute; top: 0; left: 0;
+}
+.nrcs-fallback { font-size: 11px; color: var(--text3); text-align: right; margin-top: 4px; }
+.nrcs-fallback a { color: var(--text3); text-decoration: none; }
+.nrcs-fallback a:hover { color: var(--accent); text-decoration: underline; }
+.nrcs-unavail { font-size: 13px; color: var(--text3); padding: 20px 0; }
+
+/* Card clickable */
+.card.clickable { cursor: pointer; }
+.card.clickable:hover { border-color: var(--border2); box-shadow: 0 2px 12px rgba(0,0,0,.12); }
+
+@media (max-width: 600px) {
+  .modal-backdrop { padding: 0; }
+  .modal-box { border-radius: 0; min-height: 100dvh; max-width: 100%; }
+  .mm-val { font-size: 18px; }
+  .nrcs-frame-outer { height: 380px; }
+  .nrcs-frame-outer iframe { height: 1100px; transform: translateY(-240px); }
+}
+
 /* ── Footer ──────────────────────────────────────────────────── */
 .page-footer {
   margin-top: 40px;
@@ -429,6 +574,16 @@ a.resort-name:hover { text-decoration: underline; color: var(--accent); }
 
   <!-- Status banner -->
   <div id="status-banner" class="banner banner-info" style="display:none"></div>
+
+  <!-- Powder alert banner -->
+  <div id="powder-banner" class="powder-banner">
+    <span class="powder-icon">❄</span>
+    <div class="powder-body">
+      <div class="powder-headline" id="powder-headline"></div>
+      <div class="powder-resorts" id="powder-resorts"></div>
+    </div>
+    <button class="powder-dismiss" id="powder-dismiss" title="Dismiss">×</button>
+  </div>
 
   <!-- Controls -->
   <div class="controls">
@@ -464,6 +619,29 @@ a.resort-name:hover { text-decoration: underline; color: var(--accent); }
     <span>SNOTEL data: USDA NRCS. NWS forecasts: api.weather.gov. Scraper runs 5–11 AM MST.</span>
     <span id="footer-updated"></span>
   </footer>
+</div>
+
+<!-- Detail modal -->
+<div id="modal-backdrop" class="modal-backdrop">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div class="modal-title-group">
+        <div class="modal-title" id="modal-title"></div>
+        <div class="modal-subtitle" id="modal-subtitle"></div>
+      </div>
+      <button class="modal-close" onclick="closeModal()" aria-label="Close">×</button>
+    </div>
+    <div class="modal-tabs">
+      <button class="modal-tab active" data-tab="conditions" onclick="switchModalTab('conditions')">🎿 Conditions</button>
+      <button class="modal-tab" data-tab="snotel" onclick="switchModalTab('snotel')">🏔 SNOTEL</button>
+      <button class="modal-tab" data-tab="forecast" onclick="switchModalTab('forecast')">🌦 Forecast</button>
+    </div>
+    <div class="modal-body">
+      <div id="tab-conditions" class="tab-panel"></div>
+      <div id="tab-snotel"     class="tab-panel" style="display:none"></div>
+      <div id="tab-forecast"   class="tab-panel" style="display:none"></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -638,9 +816,12 @@ function normalizeFirestoreDoc(meta, raw) {
     snotel_new_snow: num(sno.snow_depth),
     snotel_swe:      num(sno.snotel_total_swe),
     snotel_obs:      sno.latest_observation || null,
+    snotel_triplet:  sno.triplet            || null,
     snotel_7d_min:   num(sno.nws_7d_min_in),
     snotel_7d_max:   num(sno.nws_7d_max_in),
     conditions:      raw.conditions_surface || null,
+    lifts_open:      raw.lifts_open         || null,
+    runs_open:       raw.runs_open          || null,
     nws_snow:        num(nws.total_snow_inches),
     nws_hi:          num(nws.temp_high_f),
     nws_lo:          num(nws.temp_low_f),
@@ -754,10 +935,39 @@ function getSorted(arr) {
   });
 }
 
+const POWDER_IN = 6;
+
+function checkPowderAlert() {
+  const powder = allData
+    .filter(r => !r.noData && (r.h24 || 0) >= POWDER_IN)
+    .sort((a, b) => (b.h24 || 0) - (a.h24 || 0));
+
+  const banner = document.getElementById("powder-banner");
+  if (!powder.length) { banner.classList.remove("show"); return; }
+
+  // Key based on resort+amount — re-shows if conditions change
+  const key = powder.map(r => `${r.key}:${r.h24}`).join(",");
+  try {
+    if (sessionStorage.getItem("powder_dismissed") === key) {
+      banner.classList.remove("show"); return;
+    }
+  } catch(e) { /* sessionStorage unavailable (data: URLs, private mode) */ }
+  banner.dataset.key = key;
+
+  const n = powder.length;
+  document.getElementById("powder-headline").textContent =
+    `Powder Alert — ${n} resort${n > 1 ? "s" : ""} reporting ${POWDER_IN}"+ of new snow`;
+  document.getElementById("powder-resorts").textContent =
+    powder.map(r => `${r.name} ${r.h24}"`).join("  ·  ");
+  banner.classList.add("show");
+}
+
 function renderAll() {
   const grid = document.getElementById("resort-grid");
   const data = getSorted(getFiltered());
   grid.innerHTML = data.map(renderCard).join("");
+
+  checkPowderAlert();
 
   const now = lastUpdated;
   const dateEl = document.getElementById("report-date");
@@ -810,12 +1020,13 @@ function renderCard(r) {
     ? `<a class="resort-name" href="${r.url}" target="_blank" rel="noopener">${r.name}</a>`
     : `<span class="resort-name">${r.name}</span>`;
 
-  return `<div class="card">
+  return `<div class="card clickable" onclick="onCardClick(event,'${r.key}')">
   <div class="card-head">
     ${nameEl}
     ${isStale ? `<span class="stale-dot" title="Last updated ${r.last_updated} — may be stale"></span>` : ''}
     <span class="state-pill">${r.state}</span>
     <span class="status-pill ${statusCls}">${statusLabel}</span>
+    ${(r.h24||0) >= 6 ? `<span class="status-pill s-powder">❄ POWDER</span>` : ''}
   </div>
   <hr class="divider">
   <div class="snow-row">
@@ -1050,6 +1261,13 @@ function updateUrl() {
   history.replaceState(null, "", qs ? "?" + qs : window.location.pathname);
 }
 
+/* ── Powder dismiss ────────────────────────────────────────── */
+document.getElementById("powder-dismiss").addEventListener("click", () => {
+  const banner = document.getElementById("powder-banner");
+  try { sessionStorage.setItem("powder_dismissed", banner.dataset.key || ""); } catch(e) {}
+  banner.classList.remove("show");
+});
+
 /* ── Wire controls ─────────────────────────────────────────── */
 document.querySelectorAll("#filter-grp button").forEach(btn => {
   btn.addEventListener("click", () => {
@@ -1070,6 +1288,171 @@ document.querySelectorAll("#sort-grp button").forEach(btn => {
     renderAll();
   });
 });
+
+/* ── Modal ─────────────────────────────────────────────────── */
+function onCardClick(event, key) {
+  if (event.target.closest('a.resort-name')) return;
+  openModal(key);
+}
+
+document.getElementById('modal-backdrop').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+function openModal(key) {
+  const r = allData.find(d => d.key === key);
+  if (!r || r.noData) return;
+
+  document.getElementById('modal-title').textContent = r.name;
+  const luStr = r.last_updated ? dateShort(r.last_updated) : '';
+  document.getElementById('modal-subtitle').textContent =
+    [r.state, luStr].filter(Boolean).join(' · ');
+
+  renderConditionsTab(r);
+  renderSnotelTab(r);
+  renderForecastTab(r);
+  switchModalTab('conditions');
+
+  document.getElementById('modal-backdrop').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeModal() {
+  document.getElementById('modal-backdrop').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+function switchModalTab(tab) {
+  document.querySelectorAll('.modal-tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tab-panel').forEach(p =>
+    p.style.display = p.id === 'tab-' + tab ? '' : 'none');
+}
+
+function renderConditionsTab(r) {
+  const fmtIn = v => v == null ? '—' : (v === 0 ? '0"' : (v%1===0?v:v.toFixed(1)) + '"');
+  const statusLabel = {open:'Open', pre:'Pre-season', closed:'Closed'}[r.status] || '?';
+
+  let html = `<div class="modal-metrics-grid">
+    <div class="modal-metric"><span class="mm-lbl">Overnight</span><span class="mm-val">${fmtIn(r.overnight)}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">24 hr</span><span class="mm-val">${fmtIn(r.h24)}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">48 hr</span><span class="mm-val">${fmtIn(r.h48)}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">Base</span><span class="mm-val">${fmtIn(r.base)}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">Summit</span><span class="mm-val">${r.summit != null ? fmtIn(r.summit) : '—'}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">Status</span><span class="mm-val mm-val-sm">${statusLabel}</span></div>
+  </div>`;
+
+  const details = [];
+  if (r.lifts_open != null) details.push(`<b>Lifts:</b> ${r.lifts_open}`);
+  if (r.runs_open  != null) details.push(`<b>Runs:</b>  ${r.runs_open}`);
+  if (r.conditions) details.push(`<b>Surface:</b> ${r.conditions}`);
+  details.forEach(d => { html += `<div class="modal-detail">${d}</div>`; });
+  if (r.comments) html += `<div class="modal-comments">📝 ${r.comments}</div>`;
+
+  document.getElementById('tab-conditions').innerHTML = html;
+}
+
+function renderSnotelTab(r) {
+  const fmtIn = v => v == null ? '—' : (v === 0 ? '0"' : (v%1===0?v:v.toFixed(1)) + '"');
+  const pct = r.pct;
+  const pctLabel = pct === null ? '—' : pct >= 110 ? '>110%' : pct + '%';
+
+  let html = '';
+  if (r.snotel_name) {
+    const elev = r.snotel_elev ? ` (${r.snotel_elev.toLocaleString()}')` : '';
+    const obs  = fmtSnotelObs(r.snotel_obs);
+    html += `<div class="modal-station-hdr">
+      <div class="modal-station-name">${r.snotel_name} SNOTEL${elev}</div>
+      ${obs ? `<div class="modal-station-sub">Observed: ${obs}</div>` : ''}
+    </div>`;
+  }
+
+  html += `<div class="modal-metrics-grid">
+    <div class="modal-metric"><span class="mm-lbl">24hr Snow</span><span class="mm-val">${fmtIn(r.snotel_new_snow)}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">Total Depth</span><span class="mm-val">${fmtIn(r.snotel_depth)}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">Total SWE</span><span class="mm-val">${r.snotel_swe != null ? r.snotel_swe.toFixed(1)+'"' : '—'}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">Temp</span><span class="mm-val">${r.temp != null ? r.temp+'°F' : '—'}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">% of Median</span><span class="mm-val mm-val-sm">${pctLabel}</span></div>
+  </div>`;
+
+  html += `<hr class="modal-hr">`;
+
+  if (r.snotel_triplet) {
+    const snoState = (r.snotel_triplet.split(':')[1] || '').toUpperCase();
+    if (snoState && snoState !== 'BC') {
+      const initUrl = buildNrcsUrl(r.snotel_triplet, r.snotel_name, '');
+      const enc = encodeURIComponent(r.snotel_name || '');
+      html += `<div class="nrcs-controls">
+        <span class="nrcs-title">Season-to-date SWE vs. historic</span>
+        <div class="nrcs-year-row">
+          <span class="nrcs-year-lbl">Compare year:</span>
+          <input class="nrcs-year-input" id="nrcs-year-input" type="text"
+            placeholder="e.g. 2023" maxlength="4"
+            data-triplet="${r.snotel_triplet}" data-station="${enc}"
+            onkeydown="if(event.key==='Enter')applyNrcsYear()">
+          <button class="nrcs-year-btn" onclick="applyNrcsYear()">Go</button>
+        </div>
+      </div>
+      <div class="nrcs-frame-outer">
+        <iframe id="nrcs-iframe" src="${initUrl}" scrolling="no"></iframe>
+      </div>
+      <div class="nrcs-fallback">
+        <a id="nrcs-link" href="${initUrl}" target="_blank" rel="noopener">↗ Open NRCS chart in new tab</a>
+      </div>`;
+    } else {
+      html += `<div class="nrcs-unavail">Season-to-date chart not available for Canadian stations (${snoState}).</div>`;
+    }
+  } else {
+    html += `<div class="nrcs-unavail">SNOTEL chart requires station triplet — available on live Firebase data.</div>`;
+  }
+
+  document.getElementById('tab-snotel').innerHTML = html;
+}
+
+function buildNrcsUrl(triplet, stationName, compareYear) {
+  if (!triplet || !stationName) return '';
+  const parts = triplet.split(':');
+  if (parts.length < 2) return '';
+  const state = parts[1].toUpperCase();
+  if (state === 'BC') return '';
+  let url = `https://nwcc-apps.sc.egov.usda.gov/awdb/site-plots/POR/WTEQ/${state}/${encodeURIComponent(stationName)}.html?hideAnno=true&hideControls=true&activeOnly=true`;
+  if (compareYear && /^\d{4}$/.test(compareYear.trim())) url += `&showYears=${compareYear.trim()}`;
+  return url;
+}
+
+function applyNrcsYear() {
+  const input  = document.getElementById('nrcs-year-input');
+  const iframe = document.getElementById('nrcs-iframe');
+  const link   = document.getElementById('nrcs-link');
+  if (!input || !iframe) return;
+  const triplet     = input.dataset.triplet;
+  const stationName = decodeURIComponent(input.dataset.station);
+  const url = buildNrcsUrl(triplet, stationName, input.value);
+  if (url) { iframe.src = url; if (link) link.href = url; }
+}
+
+function renderForecastTab(r) {
+  const fmtIn = v => v == null ? '—' : (v === 0 ? '0"' : (v%1===0?v:v.toFixed(1)) + '"');
+
+  let html = `<div class="modal-metrics-grid">
+    <div class="modal-metric"><span class="mm-lbl">48hr Snow</span><span class="mm-val">${fmtIn(r.nws_snow)}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">Hi / Lo</span><span class="mm-val mm-val-sm">${r.nws_hi!=null?r.nws_hi+'°':'—'} / ${r.nws_lo!=null?r.nws_lo+'°':'—'}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">Precip %</span><span class="mm-val">${r.nws_precip_prob!=null?r.nws_precip_prob+'%':'—'}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">Snow Level</span><span class="mm-val mm-val-sm">${r.nws_snow_level!=null?((r.nws_snow_level/1000).toFixed(1)+"k'"):'—'}</span></div>
+    <div class="modal-metric"><span class="mm-lbl">Wind Gusts</span><span class="mm-val mm-val-sm">${r.nws_wind_gust!=null?r.nws_wind_gust+' mph':'—'}</span></div>
+  </div>`;
+
+  if (r.nws_conditions) html += `<div class="modal-detail"><b>Forecast:</b> ${r.nws_conditions}</div>`;
+  if (r.snotel_7d_max != null) {
+    const lo = r.snotel_7d_min != null && r.snotel_7d_min !== r.snotel_7d_max
+      ? `${r.snotel_7d_min}"–` : '';
+    html += `<div class="modal-detail"><b>7-day SWE range:</b> ${lo}${r.snotel_7d_max}"</div>`;
+  }
+
+  document.getElementById('tab-forecast').innerHTML = html;
+}
 
 /* ── Boot ──────────────────────────────────────────────────── */
 applyUrlState();
