@@ -825,9 +825,9 @@ class DiscoveryScraper(BaseSnowReportScraper):
             if value_elem:
                 value = value_elem.text.strip()
                 
-                if label_text == 'New Snow (24 hours)':
+                if label_text in ('New Snow (24 hours)', 'New Snow, 24 hours'):
                     data['snow_24h_base'] = self.clean_numeric(value)
-                elif label_text == 'New Snow (48 hours)':
+                elif label_text in ('New Snow (48 hours)', 'New Snow, 48 hours'):
                     data['snow_48h_base'] = self._clean_numeric(value)
                 elif label_text == 'New Snow (since lifts closed)':
                     data['snow_overnight'] = self._clean_numeric(value)
