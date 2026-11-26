@@ -559,7 +559,7 @@ async function loadData() {
     setBanner("warn", "⚠ Mock data — add your Firebase config to snow_report.html to load live data.");
     lastUpdated = new Date();
     renderAll();
-    loadHistoricalData().then(hist => { histData = hist; renderChart(hist); });
+    loadHistoricalData().then(hist => { histData = hist; renderChart(hist); renderAll(); });
     return;
   }
 
@@ -596,7 +596,7 @@ async function loadData() {
     setBanner("ok", `✓ Live data loaded — ${Object.keys(byResort).length} resorts as of ${today}`);
     setTimeout(() => setBanner(null), 4000);
     renderAll();
-    loadHistoricalData().then(hist => { histData = hist; renderChart(hist); });
+    loadHistoricalData().then(hist => { histData = hist; renderChart(hist); renderAll(); });
 
   } catch(e) {
     console.error("Firestore load failed:", e);
@@ -605,7 +605,7 @@ async function loadData() {
     allData = normalizeMockData(MOCK);
     lastUpdated = new Date();
     renderAll();
-    loadHistoricalData().then(hist => { histData = hist; renderChart(hist); });
+    loadHistoricalData().then(hist => { histData = hist; renderChart(hist); renderAll(); });
   }
 }
 
@@ -733,17 +733,24 @@ function getSorted(arr) {
     const bv = b.pct == null ? -1 : b.pct;
     return bv - av;
   });
-  // Match chart order: today's snow first, 5-day total as tiebreaker
+  // Match chart: snow resorts by today + 5-day total; no-snow resorts alphabetically
   return copy.sort((a,b) => {
     if (histData) {
       const ad = histData.data[a.key] || {}, bd = histData.data[b.key] || {};
-      const aToday = ad[histData.dates[0]] || 0, bToday = bd[histData.dates[0]] || 0;
-      if (bToday !== aToday) return bToday - aToday;
       const aTotal = histData.dates.reduce((s,d) => s+(ad[d]||0), 0);
       const bTotal = histData.dates.reduce((s,d) => s+(bd[d]||0), 0);
-      return bTotal - aTotal;
+      const aHasSnow = aTotal > 0, bHasSnow = bTotal > 0;
+      if (aHasSnow && !bHasSnow) return -1;
+      if (!aHasSnow && bHasSnow) return  1;
+      if (aHasSnow && bHasSnow) {
+        const aToday = ad[histData.dates[0]] || 0, bToday = bd[histData.dates[0]] || 0;
+        if (bToday !== aToday) return bToday - aToday;
+        return bTotal - aTotal;
+      }
+    } else if ((b.h24||0) !== (a.h24||0)) {
+      return (b.h24||0) - (a.h24||0);
     }
-    return (b.h24||0) - (a.h24||0);
+    return a.name.localeCompare(b.name);
   });
 }
 
@@ -983,7 +990,7 @@ function renderChart({ dates, data }) {
   filtered.sort((a,b) => b.days[0]-a.days[0] || b.total-a.total);
 
   const snowRows   = filtered.filter(r => r.total > 0);
-  const noSnowRows = filtered.filter(r => r.total === 0);
+  const noSnowRows = filtered.filter(r => r.total === 0).sort((a,b) => a.name.localeCompare(b.name));
   const maxTotal   = Math.max(...snowRows.map(r=>r.total), 1);
 
   function snowRowHtml(r) {
